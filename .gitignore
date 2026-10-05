@@ -1,0 +1,15 @@
+.env
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+dist/
+build/
+.pytest_cache/
+.ruff_cache/
+data/reasoning_bank/*
+!data/reasoning_bank/.gitkeep
+logs/*
+!logs/.gitkeep
+skills/**/session_*.json
