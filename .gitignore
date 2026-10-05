@@ -13,3 +13,5 @@ data/reasoning_bank/*
 logs/*
 !logs/.gitkeep
 skills/**/session_*.json
+*.md
+!README.md
