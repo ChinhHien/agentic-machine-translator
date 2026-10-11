@@ -155,6 +155,98 @@ def test_plan_parses_probe_json(repo, monkeypatch):
     assert _manager(repo).plan(repo / "input" / "doc.md", 100)["chunks"] == 7
 
 
+# --- Task 6: status, stop, events -----------------------------------------
+
+
+def test_status_reports_no_events_when_log_is_absent(repo, planned):
+    """Review Focus 1: LOG_JSONL=0 ⇒ không có file log; phải nói ra, không đứng im."""
+    mgr = _manager(repo)
+    rec = mgr.start(file="doc.md", src="vi", tgt="en", domain="tech",
+                    glossary=None, max_tokens=None, mock=False)
+
+    st = mgr.status(rec.run_id)
+    assert mgr.has_events(rec.run_id) is False
+    assert mgr.events(rec.run_id, 0) == ([], 0, 0)
+    assert st.note  # có ghi chú giải thích vì sao không có sự kiện
+    assert st.note == mgr.store.read_record(rec.run_id).note  # và nó được ghi xuống đĩa
+
+
+def test_status_reconciles_a_dead_pid_after_a_server_restart(repo, planned, monkeypatch):
+    mgr = _manager(repo)
+    rec = mgr.start(file="doc.md", src="vi", tgt="en", domain="tech",
+                    glossary=None, max_tokens=None, mock=False)
+    mgr.procs.clear()  # như thể server vừa khởi động lại
+    monkeypatch.setattr("webui.runs.pid_alive", lambda pid: False)
+
+    st = mgr.status(rec.run_id)
+    assert st.status == "failed"
+    assert "khởi động lại" in st.note.lower()
+
+
+def test_status_folds_in_the_exit_code(repo, planned):
+    mgr = _manager(repo)
+    ok = mgr.start(file="doc.md", src="vi", tgt="en", domain="tech",
+                   glossary=None, max_tokens=None, mock=False)
+    bad = mgr.start(file="doc.md", src="vi", tgt="en", domain="tech",
+                    glossary=None, max_tokens=None, mock=False)
+    mgr.procs[ok.run_id].returncode = 0
+    mgr.procs[bad.run_id].returncode = 1
+
+    assert mgr.status(ok.run_id).status == "done"
+    assert mgr.status(bad.run_id).status == "failed"
+    assert mgr.status(bad.run_id).exit_code == 1
+    assert ok.run_id not in mgr.procs  # đã chốt thì không giữ handle nữa
+
+
+def test_status_of_an_unknown_run_raises(repo, planned):
+    with pytest.raises(KeyError):
+        _manager(repo).status("không-tồn-tại")
+
+
+def test_events_are_read_through_the_store(repo, planned):
+    mgr = _manager(repo)
+    rec = mgr.start(file="doc.md", src="vi", tgt="en", domain="tech",
+                    glossary=None, max_tokens=None, mock=False)
+    log = mgr.logs_dir(rec.run_id) / "run_20260101_000000.jsonl"
+    log.write_text('{"step": "ingest", "status": "ok"}\n{"step": "plan", "status": "ok"}\n',
+                   encoding="utf-8")
+
+    assert mgr.has_events(rec.run_id) is True
+    assert [e["step"] for e in mgr.events(rec.run_id, 0)[0]] == ["ingest", "plan"]
+    assert mgr.events(rec.run_id, 1) == ([{"step": "plan", "status": "ok"}], 2, 0)
+
+
+def test_stop_marks_stopped_and_kills_the_tree(repo, planned, monkeypatch):
+    killed = []
+    monkeypatch.setattr("webui.runs.kill_tree", lambda pid: killed.append(pid))
+    mgr = _manager(repo)
+    rec = mgr.start(file="doc.md", src="vi", tgt="en", domain="tech",
+                    glossary=None, max_tokens=None, mock=False)
+
+    st = mgr.stop(rec.run_id)
+    assert killed == [4242]
+    assert st.status == "stopped"
+    assert st.exit_code is None
+    assert mgr.store.read_record(rec.run_id).status == "stopped"
+    assert rec.run_id not in mgr.procs
+
+    with pytest.raises(RuntimeError):
+        mgr.stop(rec.run_id)  # đã dừng rồi
+    with pytest.raises(KeyError):
+        mgr.stop("không-tồn-tại")
+
+
+def test_pid_alive_recognises_this_process_and_rejects_nonsense():
+    """`pid_alive` is the only guard against signalling a recycled pid."""
+    import os
+
+    from webui.runs import pid_alive
+
+    assert pid_alive(os.getpid()) is True
+    assert pid_alive(-1) is False
+    assert pid_alive(999_999_999) is False
+
+
 def test_probe_command_uses_the_configured_interpreter(repo, monkeypatch):
     import subprocess
     import sys
