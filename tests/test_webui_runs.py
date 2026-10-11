@@ -249,14 +249,19 @@ def test_pid_alive_recognises_this_process_and_rejects_nonsense():
 
 
 def test_probe_command_uses_the_configured_interpreter(repo, monkeypatch):
+    """The probe runs on our interpreter, and both ends speak UTF-8."""
     import subprocess
     import sys
 
     seen: list = []
     monkeypatch.setattr(
         "webui.runs.subprocess.run",
-        lambda argv, **kw: (seen.append(argv), subprocess.CompletedProcess(
+        lambda argv, **kw: (seen.append((argv, kw)), subprocess.CompletedProcess(
             argv, 0, stdout='{"chunks": 1}', stderr=""))[1],
     )
     RunManager(repo, python=sys.executable).plan(repo / "input" / "doc.md", None)
-    assert seen[0][0] == sys.executable
+    argv, kw = seen[0]
+    assert argv[0] == sys.executable
+    assert kw["encoding"] == "utf-8"
+    assert kw["env"]["PYTHONIOENCODING"] == "utf-8"
+    assert kw["cwd"] == repo

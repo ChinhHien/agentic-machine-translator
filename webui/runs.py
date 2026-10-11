@@ -174,20 +174,24 @@ class RunManager:
             env["LLM_MOCK"] = "1"
         return env
 
-    # Planning ----------------------------------------------------------
-    def plan(self, file: Path, max_tokens: int | None = None) -> dict[str, Any]:
-        """Ask ``probe.py`` how the document would be split.
+    # Probing -----------------------------------------------------------
+    def probe(self, args: list[str]) -> dict[str, Any]:
+        """Run ``probe.py`` with *args* and return the JSON object it prints.
 
-        ``probe.py`` reports the default output path for its own default target
-        language; the caller writes to ``--out`` explicitly, so only ``chunks``
-        and ``title`` are consumed here.
+        The probe is the only thing that may observe the pipeline's real
+        configuration, so both planning and the settings screen go through
+        here; a failure becomes :class:`RunPlanError` carrying the reason the
+        probe printed, never a traceback.
         """
-        argv = [self.python, str(_PROBE), "--plan", str(file)]
-        if max_tokens:
-            argv += ["--max-tokens", str(max_tokens)]
+        argv = [self.python, str(_PROBE), *args]
+        # The probe prints non-ASCII (filenames, model ids) with
+        # `ensure_ascii=False`, so both ends are pinned to UTF-8 rather than
+        # left to whatever code page this console happens to use.
+        env = {**os.environ, "PYTHONIOENCODING": "utf-8"}
         try:
             proc = subprocess.run(
-                argv, capture_output=True, text=True, cwd=self.root, check=False
+                argv, capture_output=True, encoding="utf-8", cwd=self.root,
+                env=env, check=False,
             )
         except OSError as exc:  # interpreter missing, permissions, ...
             raise RunPlanError(f"cannot run the probe: {exc}") from exc
@@ -197,10 +201,23 @@ class RunManager:
         try:
             data = json.loads(proc.stdout)
         except ValueError as exc:
-            raise RunPlanError(f"probe returned no usable plan: {exc}") from exc
+            raise RunPlanError(f"probe returned no usable result: {exc}") from exc
         if not isinstance(data, dict):
-            raise RunPlanError("probe returned no usable plan: not an object")
+            raise RunPlanError("probe returned no usable result: not an object")
         return data
+
+    # Planning ----------------------------------------------------------
+    def plan(self, file: Path, max_tokens: int | None = None) -> dict[str, Any]:
+        """Ask ``probe.py`` how the document would be split.
+
+        ``probe.py`` reports the default output path for its own default target
+        language; the caller writes to ``--out`` explicitly, so only ``chunks``
+        is consumed here.
+        """
+        args = ["--plan", str(file)]
+        if max_tokens:
+            args += ["--max-tokens", str(max_tokens)]
+        return self.probe(args)
 
     # Launch ------------------------------------------------------------
     def start(
