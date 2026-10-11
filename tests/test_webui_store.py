@@ -190,3 +190,41 @@ def test_glossary_rejects_a_name_that_escapes(tmp_path):
     st = GlossaryStore(tmp_path)
     with pytest.raises(ValueError):
         st.read("../secrets.csv")
+
+
+# ------------------------------ secret status -------------------------------
+def test_every_credential_in_the_example_env_is_a_known_secret():
+    """`.env.example` is the project's own list of credentials that exist."""
+    import re
+
+    from webui.paths import REPO_ROOT
+    from webui.store import SECRET_KEYS
+
+    text = (REPO_ROOT / ".env.example").read_text(encoding="utf-8")
+    declared = {
+        match.group(1)
+        for line in text.splitlines()
+        if (match := re.match(r"^\s*#?\s*([A-Za-z_][A-Za-z0-9_]*)\s*=", line))
+    }
+    assert {name for name in declared if is_secret(name)} <= set(SECRET_KEYS)
+
+
+def test_secret_status_reports_set_and_unset_without_values(tmp_path, monkeypatch):
+    monkeypatch.delenv("TRANSLATOR_API_KEY", raising=False)
+    monkeypatch.delenv("EMBED_API_KEY", raising=False)
+    s = _store(tmp_path, "TRANSLATOR_API_KEY=sk-CANARY-DO-NOT-LEAK\nCHUNK_MAX_TOKENS=700\n")
+
+    status = s.secret_status()
+    assert status["TRANSLATOR_API_KEY"] == "set"
+    assert status["EMBED_API_KEY"] == "unset"
+    assert "CHUNK_MAX_TOKENS" not in status  # ngân sách token không phải credential
+    assert set(status.values()) <= {"set", "unset"}
+    assert not any("sk-CANARY" in value for value in status.values())
+
+
+def test_secret_status_sees_a_key_exported_in_the_environment(tmp_path, monkeypatch):
+    """An exported key really is in effect, so the UI must not call it unset."""
+    monkeypatch.setenv("VERIFIER_API_KEY", "sk-CANARY-DO-NOT-LEAK")
+    status = _store(tmp_path, "").secret_status()
+    assert status["VERIFIER_API_KEY"] == "set"
+    assert "sk-CANARY-DO-NOT-LEAK" not in repr(status)

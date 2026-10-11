@@ -48,6 +48,21 @@ READONLY_KEYS: tuple[str, ...] = (
     "CHECKPOINT_DIR",
 )
 
+#: Credentials the project documents in `.env.example`. The UI reports only
+#: whether each one is set, so a user can see why a run would fail while no
+#: value ever enters the server process. `tests/test_webui_store.py` fails when
+#: `.env.example` grows a credential this list does not know about.
+SECRET_KEYS: tuple[str, ...] = (
+    "TRANSLATOR_API_KEY",
+    "TRANSLATOR_BACKUP_API_KEY",
+    "PLANNER_API_KEY",
+    "VERIFIER_API_KEY",
+    "CRITIC_API_KEY",
+    "REFINER_API_KEY",
+    "SOURCE_GROUP_API_KEY",
+    "EMBED_API_KEY",
+)
+
 #: Name fragments marking a value the server must never read or return.
 _SECRET_MARKERS = ("KEY", "TOKEN", "SECRET", "PASSWORD")
 
@@ -109,6 +124,23 @@ class ConfigStore:
             match.group(1)
             for line in self._read_text().splitlines()
             if (match := _KEY_LINE_RE.match(line))
+        }
+
+    def secret_status(self) -> dict[str, str]:
+        """``"set"``/``"unset"`` per credential name — never a value.
+
+        Names come from :data:`SECRET_KEYS` plus anything secret-shaped already
+        in `.env`, so a credential the user added by hand also shows up. The
+        process environment is consulted **by name only**, which is why a key
+        exported in the shell reads "set" even when `.env` never mentions it —
+        exactly the priority order the UI has to explain to the user.
+        """
+        in_dotenv = self.env_keys()
+        in_env = set(os.environ)
+        names = set(SECRET_KEYS) | {name for name in in_dotenv if is_secret(name)}
+        return {
+            name: ("set" if name in in_dotenv or name in in_env else "unset")
+            for name in sorted(names)
         }
 
     @staticmethod
