@@ -16,3 +16,6 @@ logs/*
 skills/**/session_*.json
 *.md
 !README.md
+!docs/**/*.md
+
+.superpowers/
