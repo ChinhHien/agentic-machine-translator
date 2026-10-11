@@ -158,8 +158,18 @@ class RunManager:
         return safe_child(self.root / OUTPUT_DIR, run_id)
 
     def env_for(self, record: RunRecord) -> dict[str, str]:
-        """Environment overrides that keep a run's logs inside its own dir."""
-        env = {"LOGS_DIR": str(self.logs_dir(record.run_id)), "LOG_JSONL": "1"}
+        """Environment overrides that keep a run's logs inside its own dir.
+
+        ``PYTHONIOENCODING`` is not cosmetic: the child's stdout/stderr are
+        files we open as UTF-8, but Python would otherwise encode them with
+        the console locale (cp1252 on Windows) and die the first time a log
+        line contains Vietnamese text.
+        """
+        env = {
+            "LOGS_DIR": str(self.logs_dir(record.run_id)),
+            "LOG_JSONL": "1",
+            "PYTHONIOENCODING": "utf-8",
+        }
         if record.mock:
             env["LLM_MOCK"] = "1"
         return env

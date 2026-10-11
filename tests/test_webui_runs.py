@@ -71,6 +71,7 @@ def test_start_builds_the_command_and_the_run_dir(repo, planned):
     assert kw["env"]["LOGS_DIR"] == str(repo / "logs" / "webui" / rec.run_id)
     assert kw["env"]["LOG_JSONL"] == "1"
     assert kw["env"]["LLM_MOCK"] == "1"
+    assert kw["env"]["PYTHONIOENCODING"] == "utf-8"  # log tiếng Việt không làm chết con
     assert Path(rec.output_path).parent == repo / "output" / "webui" / rec.run_id
     assert (repo / "logs" / "webui" / rec.run_id / "run.json").is_file()
     assert rec.status == "running" and rec.chunks == 3 and rec.pid == 4242
