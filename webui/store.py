@@ -443,8 +443,13 @@ class GlossaryStore:
     def __init__(self, root: Path) -> None:
         self.root = root
 
-    def _path(self, name: str) -> Path:
-        """Resolve *name* to a CSV path, refusing anything that escapes *root*."""
+    def path_for(self, name: str) -> Path:
+        """Resolve *name* to a CSV path, refusing anything that escapes *root*.
+
+        Public because a caller must be able to tell "you may not name that"
+        (``ValueError``) from "that glossary does not exist" (a missing file) —
+        a 403 and a 404 are different messages to the user.
+        """
         filename = name if name.lower().endswith(GLOSSARY_SUFFIX) else f"{name}{GLOSSARY_SUFFIX}"
         return safe_child(self.root, filename)
 
@@ -464,7 +469,7 @@ class GlossaryStore:
         Reads with ``utf-8-sig`` so a byte-order mark written by a spreadsheet
         does not become part of the first term.
         """
-        path = self._path(name)
+        path = self.path_for(name)
         try:
             with path.open("r", encoding="utf-8-sig", newline="") as handle:
                 return [
@@ -477,7 +482,7 @@ class GlossaryStore:
 
     def write(self, name: str, pairs: list[list[str]]) -> None:
         """Replace a glossary with *pairs*, written atomically."""
-        path = self._path(name)
+        path = self.path_for(name)
         path.parent.mkdir(parents=True, exist_ok=True)
         tmp = path.with_name(path.name + ".tmp")
         with tmp.open("w", encoding="utf-8", newline="") as handle:
