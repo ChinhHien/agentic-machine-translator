@@ -489,11 +489,13 @@ async function loadSkills() {
 /* ---------------------------------------------------------------- config */
 
 const configInputs = new Map();
+const configLoaded = new Map(); // key -> value as loaded, to spot real edits
 
 function renderConfig(data) {
   const fields = byId("config-fields");
   fields.replaceChildren();
   configInputs.clear();
+  configLoaded.clear();
 
   for (const key of data.editable) {
     const value = data.values ? data.values[key] : undefined;
@@ -514,6 +516,7 @@ function renderConfig(data) {
     }
     input.id = `cfg-${key}`;
     configInputs.set(key, input);
+    configLoaded.set(key, input.type === "checkbox" ? input.checked : input.value);
     field.append(input);
     const source = data.sources ? data.sources[key] : "";
     if (source) {
@@ -547,10 +550,18 @@ async function loadConfig() {
 }
 
 async function saveConfig() {
+  // Only settings the user actually changed are sent. Rewriting every key
+  // would quietly persist values that come from the environment into `.env`
+  // and turn a one-line change into an eighteen-line edit.
   const values = {};
   for (const [key, input] of configInputs) {
-    const field = input.type === "checkbox" ? input.checked : input.value;
-    values[key] = input.type === "checkbox" ? field : interpret(field);
+    const current = input.type === "checkbox" ? input.checked : input.value;
+    if (current === configLoaded.get(key)) continue;
+    values[key] = input.type === "checkbox" ? current : interpret(current);
+  }
+  if (!Object.keys(values).length) {
+    renderBanner({ kind: "warn", text: "Không có thay đổi nào để lưu." });
+    return;
   }
   try {
     const result = await put("/api/config", { values: values });
