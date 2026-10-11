@@ -190,8 +190,9 @@ Upload không dùng multipart (mục 9). `pair` là `<src>-<tgt>`.
 `CHECKPOINT_DIR` — đổi đường dẫn từ UI có thể làm lượt chạy sau ghi ra ngoài dự kiến, mà lợi ích
 gần như bằng không.
 
-**Bí mật — không bao giờ chạm tới.** Với mọi biến khớp `*_API_KEY` (và mọi biến chứa `KEY`,
-`TOKEN`, `SECRET`, `PASSWORD` trong tên), server:
+**Bí mật — không bao giờ chạm tới.** Với mọi biến khớp `*_API_KEY`, và mọi biến có một
+thành phần tên (tách bởi `_`) **bằng** `KEY`/`TOKEN`/`SECRET`/`PASSWORD`, hoặc có tên đã bỏ
+`_` **kết thúc** bằng một trong các từ đó (`OPENAI_APIKEY`, `x_token`), server:
 
 - không đọc giá trị, kể cả để hiển thị hay che một phần;
 - không trả về trong bất kỳ response nào, kể cả `raw`;
@@ -326,10 +327,16 @@ Test nằm ở `tests/` (ràng buộc C5). Không test nào cần API key hay g�
 - ghi `.env`: comment, dòng trống và dòng ngoài whitelist được giữ nguyên; chỉ dòng của khoá cần
   đổi bị thay; khoá mới được thêm ở cuối.
 - `*_API_KEY` không bao giờ xuất hiện trong output của `ConfigStore` (đọc và ghi).
-- Phân loại `source`: giá trị khớp `.env` → `dotenv`; giá trị khác `.env` do biến môi trường
-  thắng → `env`; khoá không có ở `.env` lẫn môi trường → `default`.
+- Không tên nào trong whitelist bị coi là bí mật, và `*_TOKENS` (ngân sách token) không bị nhầm
+  thành credential.
+- Ghi `.env` giữ nguyên kiểu xuống dòng CRLF, không biến cả file thành LF.
 - CSV glossary round-trip, kể cả khi file có BOM.
 - `SkillsStore` đọc được `skills/<pair>/<domain>.json` và `*.history.jsonl`.
+
+**`tests/test_webui_probe.py`**
+- Phân loại `source`: giá trị khớp `.env` → `dotenv`; giá trị khác `.env` do biến môi trường
+  thắng → `env`; khoá không có ở `.env` lẫn môi trường → `default`.
+- `--plan` trả số chunk bằng `len(chunk_document(load_document(path)))`.
 
 **`tests/test_webui_server.py`**
 - `GET /` trả `index.html`; `GET /static/<file>` trả đúng content-type; đuôi lạ bị từ chối.
