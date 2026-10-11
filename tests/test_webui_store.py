@@ -2,7 +2,20 @@
 
 from __future__ import annotations
 
-from webui.store import EDITABLE_KEYS, READONLY_KEYS, ConfigStore, is_secret
+import json
+
+import pytest
+
+from webui.store import (
+    EDITABLE_KEYS,
+    READONLY_KEYS,
+    ConfigStore,
+    GlossaryStore,
+    RunRecord,
+    RunsStore,
+    SkillsStore,
+    is_secret,
+)
 
 ENV = (
     "# cấu hình mẫu\n"
@@ -19,6 +32,7 @@ def _store(tmp_path, text=ENV):
     return ConfigStore(tmp_path, p)
 
 
+# ------------------------------- config store -------------------------------
 def test_whitelist_never_exposes_a_secret_name():
     assert EDITABLE_KEYS and READONLY_KEYS
     for key in EDITABLE_KEYS + READONLY_KEYS:
@@ -91,3 +105,88 @@ def test_missing_env_file_is_treated_as_empty(tmp_path):
     saved, rejected = s.save({"RESUME": True})
     assert saved == ["RESUME"] and rejected == []
     assert (tmp_path / "nope.env").read_text(encoding="utf-8").strip() == "RESUME=1"
+
+
+# --------------------------------- run store --------------------------------
+def test_run_record_round_trip_and_order(tmp_path):
+    s = RunsStore(tmp_path)
+    for rid, ts in (("b", 2.0), ("a", 1.0)):
+        s.write_record(RunRecord(run_id=rid, started=ts, status="done", file="f.md",
+                                 src="en", tgt="vi", domain="tech", chunks=3,
+                                 exit_code=0, output_path="o.md", mock=True, pid=None,
+                                 command=["x"], note=""))
+    assert [r.run_id for r in s.list_records()] == ["b", "a"]
+    assert s.read_record("a").chunks == 3
+    assert s.read_record("missing") is None
+
+
+def test_read_events_counts_malformed_lines(tmp_path):
+    s = RunsStore(tmp_path)
+    d = s.dir_for("r1")
+    d.mkdir(parents=True)
+    (d / "run_20260101_000000.jsonl").write_text(
+        '{"step": "ingest", "status": "ok"}\n'
+        "not json\n"
+        '{"step": "plan", "status": "ok"}\n',
+        encoding="utf-8",
+    )
+    events, nxt, malformed = s.read_events("r1", 0)
+    assert [e["step"] for e in events] == ["ingest", "plan"]
+    assert nxt == 2 and malformed == 1
+    assert s.read_events("r1", 2) == ([], 2, 1)
+
+
+def test_run_without_a_log_has_no_events(tmp_path):
+    s = RunsStore(tmp_path)
+    s.write_record(RunRecord(run_id="r2", started=1.0, status="running", file="f.md",
+                             src="en", tgt="vi", domain="tech", chunks=1,
+                             exit_code=None, output_path="o.md", mock=True, pid=1,
+                             command=[], note=""))
+    assert s.log_path("r2") is None
+    assert s.read_events("r2", 0) == ([], 0, 0)
+
+
+# -------------------------------- skill store -------------------------------
+def test_list_skills_skips_directories_and_bad_json(tmp_path):
+    (tmp_path / "en-vi").mkdir(parents=True)
+    (tmp_path / "en-vi" / "general.json").write_text(
+        json.dumps({"instruction": "i", "mean_score": 8.5, "domain": "general",
+                    "src_lang": "en", "tgt_lang": "vi"}), encoding="utf-8")
+    (tmp_path / "en-vi" / "broken.json").write_text("{not json", encoding="utf-8")
+    (tmp_path / "en-vi" / "session_abc.json").write_text("{}", encoding="utf-8")
+    (tmp_path / "en-vi" / "a-directory.json").mkdir()
+
+    st = SkillsStore(tmp_path)
+    names = [(s["pair"], s["domain"]) for s in st.list_skills()]
+    assert names == [("en-vi", "general")]
+    assert st.get_skill("en-vi", "general")["mean_score"] == 8.5
+    assert st.get_skill("en-vi", "broken") is None
+
+
+def test_skill_history_is_read(tmp_path):
+    (tmp_path / "en-vi").mkdir(parents=True)
+    (tmp_path / "en-vi" / "general.json").write_text("{}", encoding="utf-8")
+    (tmp_path / "en-vi" / "general.history.jsonl").write_text(
+        '{"score": 7.0, "ts": 1}\n{"score": 9.0, "ts": 2}\n', encoding="utf-8")
+    assert [h["score"] for h in SkillsStore(tmp_path).history("en-vi", "general")] == [7.0, 9.0]
+
+
+def test_skill_history_tolerates_a_missing_file(tmp_path):
+    (tmp_path / "en-vi").mkdir(parents=True)
+    assert SkillsStore(tmp_path).history("en-vi", "general") == []
+
+
+# ------------------------------ glossary store ------------------------------
+def test_glossary_round_trip_with_bom(tmp_path):
+    (tmp_path / "g.csv").write_bytes("\ufeffsource,target\nNMT, dịch máy\n".encode("utf-8"))
+    st = GlossaryStore(tmp_path)
+    assert st.read("g.csv")[1] == ["NMT", "dịch máy"]
+    st.write("h.csv", [["a", "b"]])
+    assert st.read("h.csv") == [["a", "b"]]
+    assert {f["name"] for f in st.list_files()} == {"g.csv", "h.csv"}
+
+
+def test_glossary_rejects_a_name_that_escapes(tmp_path):
+    st = GlossaryStore(tmp_path)
+    with pytest.raises(ValueError):
+        st.read("../secrets.csv")
