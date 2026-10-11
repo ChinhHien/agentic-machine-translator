@@ -313,7 +313,7 @@ Dưới 900px thì cột trái thu thành thanh ngang trên cùng.
 | Chưa cài `.venv` | Server vẫn chạy; `POST /api/runs` trả `503` kèm hướng dẫn tạo virtualenv |
 | `LOG_JSONL=0` trong `.env` | UI cảnh báo lượt chạy sẽ không có sự kiện, và đề nghị bật; lượt chạy vẫn chạy được |
 | `probe.py --plan` lỗi (file hỏng, thiếu thư viện, **hoặc file input không tồn tại**) | `POST /api/runs` trả `422` kèm stderr của probe; **không** khởi động lượt chạy, không tạo thư mục lượt chạy nào |
-| Tên file input chứa `..`, `/` hoặc trỏ ra ngoài `input/` | `400`; tên sai bị từ chối trước khi ghép đường dẫn |
+| Tên file input chứa `..`, `/`, `\` hoặc trỏ ra ngoài `input/` | `403`; tên sai bị từ chối **sau khi `unquote`**, trước khi ghép đường dẫn |
 | File log bị ghi dở một dòng | Bỏ qua dòng JSON hỏng, giữ các dòng còn lại, đếm số dòng hỏng |
 | Server khởi động lại khi một lượt đang chạy | `run.json` có `pid`; nếu pid không còn sống thì `status = "failed"` với ghi chú "server đã khởi động lại khi lượt chạy đang chạy" |
 | `stop` khi tiến trình đã xong | `409`, không kill PID đã được tái sử dụng |
