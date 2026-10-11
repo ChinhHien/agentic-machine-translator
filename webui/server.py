@@ -335,6 +335,9 @@ class Api:
             "status": record.status,
             "exit_code": record.exit_code,
             "malformed": malformed,
+            # Without this the UI cannot tell "nothing has happened yet" from
+            # "this run will never report anything", and would sit silent.
+            "has_events": self.manager.has_events(run_id),
         })
 
     def _start_run(self, body: bytes) -> Response:
