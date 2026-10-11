@@ -48,6 +48,9 @@ packages = ["src/polyglot_lc"]
 testpaths = ["tests"]
 addopts = "-q"
 timeout = 120
+# The `webui` app lives at the repo root, which the editable install does not
+# put on sys.path (it exposes `<root>/src` only), so tests could not import it.
+pythonpath = ["."]
 
 [tool.ruff]
 line-length = 100
