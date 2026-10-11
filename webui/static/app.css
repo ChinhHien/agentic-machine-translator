@@ -1,0 +1,438 @@
+/* polyglot-lc web UI — design system.
+ *
+ * The subject is ink on paper and the hardest thing the pipeline does is put
+ * two inks in exactly the same place: one term, one translation, across every
+ * chunk. So the palette is registration ink (cyan, magenta) on cold paper, a
+ * misregistration is what a broken chunk looks like, and every number is set
+ * in a tabular mono face because a machine produced it.
+ *
+ * Class contract, set by app.js:
+ *   .stage[data-state=wait|running|ok|fail]
+ *   .cell[data-state=wait|fast|standard|deep|retry|fail]
+ *   .event[data-status=start|ok|fail|retry|info]
+ *   .run[data-state=running|done|failed|stopped]
+ *   #banner[data-kind=warn|error]
+ */
+
+:root {
+  --paper: #F2F3F5;
+  --panel: #FFFFFF;
+  --ink: #14161A;
+  --rule: #D7DAE0;
+  --cyan: #0E6E7D;
+  --magenta: #B3247A;
+  --amber: #A96A11;
+  --red: #B4232F;
+
+  /* Three type roles. No webfont, no CDN: the page has to work offline. */
+  --font-doc: ui-serif, Georgia, "Iowan Old Style", "Times New Roman", serif;
+  --font-ui: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+  --font-data: ui-monospace, "Cascadia Mono", Consolas, monospace;
+
+  --rail: 280px;
+  --gap: 14px;
+  --tint: #E7EFF0;   /* cyan at 10% on white */
+  --tint-deep: #C9DFE2;
+}
+
+* { box-sizing: border-box; }
+
+html { -webkit-text-size-adjust: 100%; }
+
+body {
+  margin: 0;
+  background: var(--paper);
+  color: var(--ink);
+  font-family: var(--font-ui);
+  font-size: 14px;
+  line-height: 1.5;
+}
+
+h1, h2, p, ol, ul, figure { margin: 0; }
+ol, ul { list-style: none; padding: 0; }
+
+code {
+  font-family: var(--font-data);
+  font-size: 0.92em;
+}
+
+/* Visible focus, everywhere, always. */
+:focus-visible {
+  outline: 2px solid var(--cyan);
+  outline-offset: 2px;
+}
+
+/* ---------------------------------------------------------------- layout */
+
+.app {
+  display: grid;
+  grid-template-columns: var(--rail) minmax(0, 1fr);
+  gap: var(--gap);
+  padding: var(--gap);
+  min-height: 100vh;
+}
+
+.rail {
+  display: flex;
+  flex-direction: column;
+  gap: var(--gap);
+  /* The rail sticks while the main column scrolls, and must not be stretched
+     to the full row height for that to look right. */
+  align-self: start;
+  position: sticky;
+  top: var(--gap);
+}
+
+.main {
+  display: flex;
+  flex-direction: column;
+  gap: var(--gap);
+  min-width: 0;
+  /* Fills the viewport so the last band takes the remaining height. */
+  min-height: calc(100vh - 2 * var(--gap));
+}
+
+.panel {
+  background: var(--panel);
+  border: 1px solid var(--rule);
+}
+
+.panel--fold > summary {
+  padding: 10px 12px;
+  cursor: pointer;
+  font-weight: 600;
+}
+
+.panel--fold > summary::marker { color: var(--cyan); }
+
+.panel--fold > *:not(summary) { padding: 0 12px 12px; }
+
+.band {
+  background: var(--panel);
+  border: 1px solid var(--rule);
+  padding: 12px;
+}
+
+.band-title {
+  font-size: 13px;
+  font-weight: 600;
+  letter-spacing: 0.01em;
+  padding-bottom: 6px;
+  border-bottom: 1px solid var(--rule);
+}
+
+/* --------------------------------------------------------------- launcher */
+
+.wordmark {
+  font-size: 17px;
+  font-weight: 650;
+  letter-spacing: -0.01em;
+}
+
+.subtitle {
+  color: #4A4F58;
+  margin-top: 2px;
+  margin-bottom: 12px;
+}
+
+.field { margin-bottom: 10px; }
+
+.field > label {
+  display: block;
+  font-size: 12px;
+  color: #4A4F58;
+  margin-bottom: 3px;
+}
+
+.pair {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 8px;
+}
+
+input, select, textarea, button {
+  font: inherit;
+  color: inherit;
+  background: var(--panel);
+  border: 1px solid var(--rule);
+  border-radius: 2px;
+  padding: 6px 8px;
+  width: 100%;
+}
+
+textarea { font-family: var(--font-data); font-size: 12px; resize: vertical; }
+
+input:hover, select:hover, textarea:hover { border-color: #B6BBC4; }
+
+.check {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin: 12px 0;
+}
+
+.check input { width: auto; }
+
+.actions { display: flex; gap: 8px; }
+
+button {
+  cursor: pointer;
+  width: auto;
+  padding: 7px 14px;
+  border-color: #B6BBC4;
+}
+
+button:hover:not(:disabled) { border-color: var(--ink); }
+
+button:disabled { color: #9AA0A9; cursor: not-allowed; }
+
+button.primary {
+  background: var(--ink);
+  color: var(--panel);
+  border-color: var(--ink);
+}
+
+button.primary:hover:not(:disabled) { background: #24272E; }
+
+.hint {
+  margin-top: 10px;
+  font-size: 12px;
+  color: #4A4F58;
+}
+
+/* ---------------------------------------------------------------- history */
+
+.panel-title {
+  font-size: 13px;
+  font-weight: 600;
+  padding: 10px 12px;
+  border-bottom: 1px solid var(--rule);
+}
+
+.runs { padding: 4px 0; }
+
+.run {
+  display: grid;
+  grid-template-columns: auto 1fr auto;
+  gap: 8px;
+  align-items: baseline;
+  padding: 6px 12px;
+  cursor: pointer;
+  border: 0;
+  border-left: 2px solid transparent;
+  background: none;
+  text-align: left;
+  width: 100%;
+}
+
+.run:hover { background: #FAFBFC; }
+.run[data-state="running"] { border-left-color: var(--cyan); }
+.run[data-state="done"] { border-left-color: var(--cyan); }
+.run[data-state="failed"] { border-left-color: var(--red); }
+.run[data-state="stopped"] { border-left-color: var(--amber); }
+.run[aria-current="true"] { background: var(--tint); }
+
+.run-time, .run-meta { font-family: var(--font-data); font-size: 12px; font-variant-numeric: tabular-nums; }
+.run-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+
+.plain { padding: 0 12px 12px; font-size: 12px; }
+.plain li { padding: 3px 0; border-bottom: 1px solid #EFF1F4; }
+
+/* ----------------------------------------------------------- stage rail */
+
+.stages {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px 12px;
+  font-size: 12px;
+  padding-top: 8px;
+}
+
+/* An empty band still says what it is waiting for, instead of showing a rule. */
+.stages:empty::before,
+.events:empty::before,
+.runs:empty::before {
+  content: "Chưa có gì để hiển thị.";
+  color: #6B717A;
+  font-family: var(--font-ui);
+  font-size: 12px;
+}
+
+#run-list:empty::before { content: "Chưa có lượt chạy nào."; }
+#stage-rail:empty::before { content: "Chưa có lượt chạy nào."; }
+#events:empty::before { content: "Sự kiện sẽ hiện ra khi lượt chạy bắt đầu."; }
+
+.stage {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  color: #6B717A;
+}
+
+.stage::before {
+  content: "";
+  width: 7px;
+  height: 7px;
+  border: 1px solid var(--rule);
+  background: var(--panel);
+}
+
+.stage[data-state="running"] { color: var(--ink); }
+.stage[data-state="running"]::before { border-color: var(--cyan); background: var(--tint); }
+.stage[data-state="ok"] { color: var(--ink); }
+.stage[data-state="ok"]::before { border-color: var(--cyan); background: var(--cyan); }
+.stage[data-state="fail"] { color: var(--red); }
+.stage[data-state="fail"]::before { border-color: var(--red); background: var(--red); }
+
+/* --------------------------------------------------------- chunk matrix */
+
+.count {
+  font-family: var(--font-data);
+  font-variant-numeric: tabular-nums;
+  color: #4A4F58;
+  font-weight: 400;
+}
+
+.matrix {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(20px, 1fr));
+  gap: 3px;
+  padding: 10px 0 8px;
+}
+
+.matrix:empty::before {
+  content: "Chưa có chunk nào. Số ô hiện ra sau khi lượt chạy bắt đầu.";
+  grid-column: 1 / -1;
+  font-size: 12px;
+  color: #6B717A;
+}
+
+.cell {
+  aspect-ratio: 1 / 1;
+  border: 1px solid var(--rule);
+  background: var(--panel);
+}
+
+.cell[data-state="fast"] { background: var(--tint); border-color: var(--tint-deep); }
+.cell[data-state="standard"] { background: var(--cyan); border-color: var(--cyan); }
+.cell[data-state="deep"] { background: #083F49; border-color: #083F49; }
+.cell[data-state="retry"] { background: var(--amber); border-color: var(--amber); }
+.cell[data-state="fail"] { background: var(--red); border-color: var(--red); }
+.cell[data-state="patched"] { background: var(--magenta); border-color: var(--magenta); }
+
+/* The one motion in the interface: a chunk fills when its event arrives. */
+@keyframes cell-fill {
+  from { transform: scale(0.72); opacity: 0.4; }
+  to { transform: scale(1); opacity: 1; }
+}
+
+.cell[data-state="standard"],
+.cell[data-state="deep"],
+.cell[data-state="retry"],
+.cell[data-state="fail"] {
+  animation: cell-fill 180ms ease-out;
+}
+
+.legend {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px 14px;
+  font-size: 12px;
+  color: #4A4F58;
+}
+
+.legend li { display: inline-flex; align-items: center; gap: 6px; }
+
+.swatch {
+  width: 10px;
+  height: 10px;
+  border: 1px solid var(--rule);
+}
+
+.swatch--fast { background: var(--tint); border-color: var(--tint-deep); }
+.swatch--standard { background: var(--cyan); border-color: var(--cyan); }
+.swatch--deep { background: #083F49; border-color: #083F49; }
+.swatch--retry { background: var(--amber); border-color: var(--amber); }
+.swatch--fail { background: var(--red); border-color: var(--red); }
+.swatch--wait { background: var(--panel); }
+
+/* ----------------------------------------------------------------- proof */
+
+.path {
+  font-family: var(--font-data);
+  font-size: 12px;
+  color: #4A4F58;
+  padding: 8px 0;
+  overflow-wrap: anywhere;
+}
+
+.proof {
+  font-family: var(--font-doc);
+  font-size: 16px;
+  line-height: 1.62;
+  max-width: 68ch;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  border-left: 1px solid var(--rule);
+  padding-left: 16px;
+  max-height: 46vh;
+  overflow-y: auto;
+}
+
+.proof .empty { color: #6B717A; font-size: 14px; }
+.proof[data-state="done"] { border-left-color: var(--cyan); }
+
+/* ---------------------------------------------------------------- events */
+
+.band--events { flex: 1; }
+
+.events {
+  font-family: var(--font-data);
+  font-size: 12px;
+  font-variant-numeric: tabular-nums;
+  max-height: 30vh;
+  overflow-y: auto;
+  padding-top: 6px;
+}
+
+.event {
+  display: grid;
+  grid-template-columns: 5.5rem 1fr auto;
+  gap: 10px;
+  padding: 2px 0;
+  border-bottom: 1px solid #F3F4F6;
+}
+
+.event-step { color: #4A4F58; }
+.event-id { color: #6B717A; }
+.event-note { color: var(--magenta); }
+.event-latency { color: #6B717A; text-align: right; }
+
+.event[data-status="fail"] .event-step { color: var(--red); }
+.event[data-status="retry"] .event-step { color: var(--amber); }
+.event[data-status="info"] .event-step { color: #6B717A; }
+
+/* ---------------------------------------------------------------- banner */
+
+.banner {
+  margin: var(--gap) var(--gap) 0;
+  padding: 10px 12px;
+  border: 1px solid var(--rule);
+  border-left: 3px solid var(--amber);
+  background: var(--panel);
+}
+
+.banner[data-kind="error"] { border-left-color: var(--red); }
+
+/* ------------------------------------------------------------ responsive */
+
+@media (max-width: 900px) {
+  .app { grid-template-columns: minmax(0, 1fr); }
+  .rail { position: static; }
+  .proof { max-height: none; }
+  .events { max-height: 40vh; }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  * { animation: none !important; transition: none !important; }
+}

@@ -354,6 +354,90 @@ def test_glossary_names_and_bodies_are_validated(api, tmp_path):
     assert (tmp_path / ".env").read_text(encoding="utf-8").startswith("CHUNK_MAX_TOKENS")
 
 
+# --- Task 10: page shell and design system --------------------------------
+
+
+def repo_api():
+    """An Api over the real repository, for tests that read the shipped page."""
+    from pathlib import Path
+
+    root = Path(__file__).resolve().parents[1]
+    return Api(root=root, manager=RunManager(root, python="PY"),
+               runs=RunsStore(root / "logs" / "webui"), skills=SkillsStore(root / "skills"),
+               glossaries=GlossaryStore(root / "glossaries"),
+               config=ConfigStore(root, root / ".env"), port=8787)
+
+
+def test_index_has_the_elements_the_frontend_binds_to():
+    html = call(repo_api(), "GET", "/").body.decode("utf-8")
+    for element_id in ("launcher", "file", "src", "tgt", "domain", "glossary",
+                       "max-tokens", "mock", "run-button", "stage-rail", "chunk-matrix",
+                       "proof", "events", "history", "config-panel", "glossary-panel",
+                       "skills-panel", "banner"):
+        assert f'id="{element_id}"' in html, element_id
+
+
+def test_stylesheet_defines_the_design_tokens():
+    """Read the real sheet: the `api` fixture serves a stand-in of its own."""
+    css = call(repo_api(), "GET", "/static/app.css").body.decode("utf-8")
+    for token, value in (("--paper", "#F2F3F5"), ("--panel", "#FFFFFF"),
+                         ("--ink", "#14161A"), ("--rule", "#D7DAE0"),
+                         ("--cyan", "#0E6E7D"), ("--magenta", "#B3247A"),
+                         ("--amber", "#A96A11"), ("--red", "#B4232F")):
+        assert f"{token}: {value}" in css, token
+
+
+def test_the_page_needs_nothing_from_the_network():
+    """The UI must work offline: no webfont, no CDN, no remote asset."""
+    page = call(repo_api(), "GET", "/")
+    html = page.body.decode("utf-8")
+    css = call(repo_api(), "GET", "/static/app.css").body.decode("utf-8")
+    for remote in ("http://", "https://", "//cdn"):
+        assert remote not in html, remote
+        assert remote not in css, remote
+    assert "@import" not in css
+
+
+def test_the_three_type_roles_and_reduced_motion_are_declared():
+    css = call(repo_api(), "GET", "/static/app.css").body.decode("utf-8")
+    for role, family in (("--font-doc", "ui-serif"), ("--font-ui", "system-ui"),
+                         ("--font-data", "ui-monospace")):
+        assert f"{role}: {family}" in css, role
+    assert "font-variant-numeric: tabular-nums" in css
+    assert "prefers-reduced-motion" in css
+
+
+def test_every_control_has_a_label_and_live_regions_are_marked():
+    from html.parser import HTMLParser
+
+    class Scan(HTMLParser):
+        def __init__(self):
+            super().__init__()
+            self.controls: list[str] = []
+            self.labels: set[str] = set()
+            self.live: set[str] = set()
+            self.ids: list[str] = []
+
+        def handle_starttag(self, tag, attrs):
+            found = dict(attrs)
+            if found.get("id"):
+                self.ids.append(found["id"])
+            if tag in {"input", "select", "textarea"}:
+                self.controls.append(found.get("id") or "")
+            if tag == "label" and found.get("for"):
+                self.labels.add(found["for"])
+            if found.get("aria-live"):
+                self.live.add(found.get("id") or "")
+
+    scan = Scan()
+    scan.feed(call(repo_api(), "GET", "/").body.decode("utf-8"))
+    assert scan.controls, "the launcher should offer controls"
+    for control in scan.controls:
+        assert control in scan.labels, f"control without a label: {control}"
+    assert {"stage-rail", "events"} <= scan.live
+    assert len(scan.ids) == len(set(scan.ids)), "duplicate element id"
+
+
 def test_inputs_listing_reports_size_and_tolerates_a_missing_dir(api, tmp_path):
     assert json.loads(call(api, "GET", "/api/inputs").body)["files"] == []
 

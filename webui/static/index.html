@@ -1,0 +1,139 @@
+<!doctype html>
+<html lang="vi">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>polyglot-lc — bàn điều khiển dịch</title>
+<link rel="stylesheet" href="/static/app.css">
+</head>
+<body>
+
+<p id="banner" class="banner" role="status" hidden></p>
+
+<div class="app">
+
+  <aside class="rail">
+
+    <section id="launcher" class="panel" aria-labelledby="launcher-title">
+      <h1 id="launcher-title" class="wordmark">polyglot-lc</h1>
+      <p class="subtitle">Dịch tài liệu dài bằng nhiều agent, theo dõi từng chunk.</p>
+
+      <div class="field">
+        <label for="file">Tài liệu trong <code>input/</code></label>
+        <select id="file"></select>
+      </div>
+
+      <div class="pair">
+        <div class="field">
+          <label for="src">Ngôn ngữ nguồn</label>
+          <input id="src" name="src" value="auto" autocomplete="off" spellcheck="false">
+        </div>
+        <div class="field">
+          <label for="tgt">Ngôn ngữ đích</label>
+          <input id="tgt" name="tgt" value="vi" autocomplete="off" spellcheck="false">
+        </div>
+      </div>
+
+      <div class="field">
+        <label for="domain">Lĩnh vực</label>
+        <input id="domain" name="domain" value="general" autocomplete="off" spellcheck="false">
+      </div>
+
+      <div class="field">
+        <label for="glossary">Glossary</label>
+        <select id="glossary"></select>
+      </div>
+
+      <div class="field">
+        <label for="max-tokens">Token mỗi chunk</label>
+        <input id="max-tokens" name="max-tokens" type="number" min="64" step="16"
+               placeholder="theo cấu hình" inputmode="numeric">
+      </div>
+
+      <label class="check" for="mock">
+        <input id="mock" name="mock" type="checkbox">
+        <span>Chạy thử, không cần API key</span>
+      </label>
+
+      <div class="actions">
+        <button id="run-button" type="button" class="primary">Chạy</button>
+        <button id="stop-button" type="button" disabled>Dừng</button>
+      </div>
+      <p id="run-hint" class="hint">Chưa có lượt chạy nào được chọn.</p>
+    </section>
+
+    <section id="history" class="panel" aria-labelledby="history-title">
+      <h2 id="history-title" class="panel-title">Lịch sử</h2>
+      <ol id="run-list" class="runs" aria-label="Các lượt chạy gần đây"></ol>
+    </section>
+
+    <details id="config-panel" class="panel panel--fold">
+      <summary>Tùy chọn dịch</summary>
+      <p id="config-note" class="hint"></p>
+      <div id="config-fields"></div>
+      <div class="actions">
+        <button id="config-save" type="button">Lưu thay đổi</button>
+      </div>
+    </details>
+
+    <details id="glossary-panel" class="panel panel--fold">
+      <summary>Glossary</summary>
+      <div class="field">
+        <label for="glossary-name">Tên file</label>
+        <input id="glossary-name" name="glossary-name" placeholder="legal.csv" autocomplete="off">
+      </div>
+      <div class="field">
+        <label for="glossary-pairs">Từng cặp, mỗi dòng <code>nguồn, đích</code></label>
+        <textarea id="glossary-pairs" name="glossary-pairs" rows="5" spellcheck="false"></textarea>
+      </div>
+      <div class="actions">
+        <button id="glossary-save" type="button">Lưu glossary</button>
+      </div>
+      <ul id="glossary-list" class="plain"></ul>
+    </details>
+
+    <details id="skills-panel" class="panel panel--fold">
+      <summary>Skill đã học</summary>
+      <ul id="skills-list" class="plain"></ul>
+    </details>
+
+  </aside>
+
+  <main class="main">
+
+    <section class="band band--stages" aria-labelledby="stages-title">
+      <h2 id="stages-title" class="band-title">Giai đoạn</h2>
+      <ol id="stage-rail" class="stages" aria-live="polite"></ol>
+    </section>
+
+    <section class="band" aria-labelledby="matrix-title">
+      <h2 id="matrix-title" class="band-title">
+        Chunk <span id="chunk-summary" class="count"></span>
+      </h2>
+      <div id="chunk-matrix" class="matrix" role="list" aria-label="Trạng thái từng chunk"></div>
+      <ul id="matrix-legend" class="legend">
+        <li><span class="swatch swatch--fast"></span>fast</li>
+        <li><span class="swatch swatch--standard"></span>standard</li>
+        <li><span class="swatch swatch--deep"></span>deep</li>
+        <li><span class="swatch swatch--retry"></span>retry</li>
+        <li><span class="swatch swatch--fail"></span>fail</li>
+        <li><span class="swatch swatch--wait"></span>chờ</li>
+      </ul>
+    </section>
+
+    <section class="band band--proof" aria-labelledby="proof-title">
+      <h2 id="proof-title" class="band-title">Bản dịch</h2>
+      <p id="proof-path" class="path"></p>
+      <article id="proof" class="proof"><p class="empty">Chưa có bản dịch. Chọn một tài liệu rồi bấm Chạy.</p></article>
+    </section>
+
+    <section class="band band--events" aria-labelledby="events-title">
+      <h2 id="events-title" class="band-title">Sự kiện</h2>
+      <ol id="events" class="events" aria-live="polite"></ol>
+    </section>
+
+  </main>
+</div>
+
+</body>
+</html>
