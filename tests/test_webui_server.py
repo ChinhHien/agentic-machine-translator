@@ -232,6 +232,8 @@ def test_runs_endpoints_with_a_stubbed_manager(api, monkeypatch):
     assert started["chunks"] == 3 and started["output_path"] == "/tmp/o.md"
     events = json.loads(call(api, "GET", "/api/runs/r1/events?after=0").body)
     assert events["next"] == 1 and events["status"] == "running" and events["exit_code"] is None
+    assert events["malformed"] == 0 and events["has_events"] is False
+    assert call(api, "GET", "/api/runs/r1/events?after=nope").status == 400
     detail = json.loads(call(api, "GET", "/api/runs/r1").body)
     assert detail["run"]["file"] == "doc.md"
 
@@ -436,6 +438,45 @@ def test_every_control_has_a_label_and_live_regions_are_marked():
         assert control in scan.labels, f"control without a label: {control}"
     assert {"stage-rail", "events"} <= scan.live
     assert len(scan.ids) == len(set(scan.ids)), "duplicate element id"
+
+
+# --- Task 11: front-end behaviour -----------------------------------------
+
+
+def test_index_loads_app_js_and_js_names_the_polling_endpoint():
+    api = repo_api()
+    html = call(api, "GET", "/").body.decode("utf-8")
+    assert '/static/app.js' in html
+
+    js = call(api, "GET", "/static/app.js").body.decode("utf-8")
+    assert "/events?after=" in js
+    assert "/api/runs" in js
+    assert "700" in js
+
+
+def test_app_js_never_renders_html_from_server_text():
+    """Nội dung đến từ log và tên file người dùng nhập, nên phải là text."""
+    from pathlib import Path
+
+    js = (Path(__file__).resolve().parents[1] / "webui" / "static" / "app.js").read_text(
+        encoding="utf-8")
+    assert "innerHTML" not in js
+    assert "textContent" in js
+    assert "insertAdjacentHTML" not in js and "document.write" not in js
+
+
+def test_app_js_covers_the_steps_the_page_promises():
+    """A promise in the UI that no code implements is worse than no promise."""
+    from pathlib import Path
+
+    js = (Path(__file__).resolve().parents[1] / "webui" / "static" / "app.js").read_text(
+        encoding="utf-8")
+    for call in ("pollRun", "renderStages", "renderChunks", "renderEvents", "renderBanner",
+                 "loadInputs", "loadHistory", "loadConfig", "loadGlossaries", "loadSkills"):
+        assert call in js, call
+    # The banner must be able to explain a run with no event log at all.
+    assert "/api/runs/" in js and "/output" in js
+    assert "LOG_JSONL" in js
 
 
 def test_inputs_listing_reports_size_and_tolerates_a_missing_dir(api, tmp_path):

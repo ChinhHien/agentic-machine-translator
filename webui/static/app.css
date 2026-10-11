@@ -8,7 +8,7 @@
  *
  * Class contract, set by app.js:
  *   .stage[data-state=wait|running|ok|fail]
- *   .cell[data-state=wait|fast|standard|deep|retry|fail]
+ *   .cell[data-state=wait|running|ok|patched|retry|fail]
  *   .event[data-status=start|ok|fail|retry|info]
  *   .run[data-state=running|done|failed|stopped]
  *   #banner[data-kind=warn|error]
@@ -198,7 +198,10 @@ button.primary:hover:not(:disabled) { background: #24272E; }
   margin-top: 10px;
   font-size: 12px;
   color: #4A4F58;
+  display: block;
 }
+
+.field .hint { margin-top: 4px; }
 
 /* ---------------------------------------------------------------- history */
 
@@ -313,12 +316,11 @@ button.primary:hover:not(:disabled) { background: #24272E; }
   background: var(--panel);
 }
 
-.cell[data-state="fast"] { background: var(--tint); border-color: var(--tint-deep); }
-.cell[data-state="standard"] { background: var(--cyan); border-color: var(--cyan); }
-.cell[data-state="deep"] { background: #083F49; border-color: #083F49; }
+.cell[data-state="running"] { background: var(--tint-deep); border-color: var(--cyan); }
+.cell[data-state="ok"] { background: var(--cyan); border-color: var(--cyan); }
+.cell[data-state="patched"] { background: var(--magenta); border-color: var(--magenta); }
 .cell[data-state="retry"] { background: var(--amber); border-color: var(--amber); }
 .cell[data-state="fail"] { background: var(--red); border-color: var(--red); }
-.cell[data-state="patched"] { background: var(--magenta); border-color: var(--magenta); }
 
 /* The one motion in the interface: a chunk fills when its event arrives. */
 @keyframes cell-fill {
@@ -326,8 +328,8 @@ button.primary:hover:not(:disabled) { background: #24272E; }
   to { transform: scale(1); opacity: 1; }
 }
 
-.cell[data-state="standard"],
-.cell[data-state="deep"],
+.cell[data-state="ok"],
+.cell[data-state="patched"],
 .cell[data-state="retry"],
 .cell[data-state="fail"] {
   animation: cell-fill 180ms ease-out;
@@ -349,9 +351,9 @@ button.primary:hover:not(:disabled) { background: #24272E; }
   border: 1px solid var(--rule);
 }
 
-.swatch--fast { background: var(--tint); border-color: var(--tint-deep); }
-.swatch--standard { background: var(--cyan); border-color: var(--cyan); }
-.swatch--deep { background: #083F49; border-color: #083F49; }
+.swatch--running { background: var(--tint-deep); border-color: var(--cyan); }
+.swatch--ok { background: var(--cyan); border-color: var(--cyan); }
+.swatch--patched { background: var(--magenta); border-color: var(--magenta); }
 .swatch--retry { background: var(--amber); border-color: var(--amber); }
 .swatch--fail { background: var(--red); border-color: var(--red); }
 .swatch--wait { background: var(--panel); }
@@ -397,15 +399,20 @@ button.primary:hover:not(:disabled) { background: #24272E; }
 
 .event {
   display: grid;
-  grid-template-columns: 5.5rem 1fr auto;
+  grid-template-columns: 5.5rem 4.5rem minmax(0, auto) minmax(0, 1fr) auto;
   gap: 10px;
   padding: 2px 0;
   border-bottom: 1px solid #F3F4F6;
 }
 
-.event-step { color: #4A4F58; }
+.event-time { color: #9AA0A9; }
+.event-state { color: #6B717A; }
+.event-step { color: #4A4F58; overflow-wrap: anywhere; }
+.event[data-status="ok"] .event-state { color: var(--cyan); }
+.event[data-status="fail"] .event-state { color: var(--red); }
+.event[data-status="retry"] .event-state { color: var(--amber); }
 .event-id { color: #6B717A; }
-.event-note { color: var(--magenta); }
+.event-note { color: var(--magenta); overflow-wrap: anywhere; }
 .event-latency { color: #6B717A; text-align: right; }
 
 .event[data-status="fail"] .event-step { color: var(--red); }
