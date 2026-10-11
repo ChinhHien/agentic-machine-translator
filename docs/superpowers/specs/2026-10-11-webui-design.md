@@ -383,3 +383,12 @@ Test nằm ở `tests/` (ràng buộc C5). Không test nào cần API key hay g�
   chạy một lần khi bắt đầu lượt.
 - **Chunk matrix cần biết `N` trước**; lấy từ `probe.py --plan`. Nếu probe lỗi thì không có lượt
   chạy, nên không có trạng thái "matrix thiếu dữ liệu".
+- **Mục 10.4 nói ô matrix đổi màu theo `path` (`fast`/`standard`/`deep`), nhưng log không có
+  trường đó.** `polyglot_lc.ui.events.Event` chỉ mang `ts, step, chunk_id, status, latency,
+  error` — router và độ phức tạp không ghi `path` vào sự kiện. Vì vậy UI hiện tô màu theo những
+  gì log **thật sự** có: `đang chạy` / `xong` / `có ghi chú thuật ngữ` (từ sự kiện `info` của
+  consistency pass) / `phải thử lại` / `lỗi` / `chờ`. Muốn có đúng ba mức `fast/standard/deep`
+  thì phải thêm một trường vào `Event` và cho router phát nó — đó là thay đổi ở `polyglot_lc`,
+  ngoài phạm vi plan này. Ghi lại ở đây để không ai tưởng ô màu là ngẫu nhiên.
+- **`stop` giết tiến trình nhưng không thu hồi được công đã gọi provider**; một lượt bị dừng vẫn
+  tính tiền cho các request đã gửi. UI nói "đã dừng", không nói "đã hoàn tác".
