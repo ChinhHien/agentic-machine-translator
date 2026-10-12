@@ -329,6 +329,29 @@ def test_a_cell_that_cannot_fit_keeps_its_source_text(tmp_path, unicode_font):
         assert "Đặc điểm" in text
 
 
+def test_an_empty_source_cell_that_cannot_take_the_translation_is_not_a_failure(unicode_font):
+    """A cell the source left empty has nothing to lose.
+
+    pdfplumber reports a sliver box (1.4 pt wide) where a merged column
+    collapsed, so a translation that cannot be printed there would otherwise be
+    reported as a cell the rebuild dropped — while the source never had any text
+    in it to drop.
+    """
+    pymupdf = pytest.importorskip("pymupdf")
+    page = pymupdf.open().new_page()
+    item = pdf_output._Placement(
+        page=0,
+        redact=[(147.9, 73.4, 149.3, 94.0)],
+        box=(147.9, 73.4, 149.3, 94.0),
+        size=10.0,
+        text="VI:",
+        kind="cell",
+        align="left",
+        source_text="",
+    )
+    assert pdf_output._insert_cell(page, item, pymupdf, unicode_font) == "source"
+
+
 def test_a_cell_does_not_spill_below_the_page(tmp_path, unicode_font):
     """Không có nhánh 'dùng nốt chỗ tới lề dưới' cho ô: chữ phải nằm trong ô."""
     pymupdf = pytest.importorskip("pymupdf")
@@ -555,3 +578,59 @@ def test_the_rebuilt_pdf_prints_markers_and_contents_leaders(tmp_path, unicode_f
     toc = next(block for block in doc.blocks if (block.meta.get("pdf") or {}).get("kind") == "toc")
     right = toc.meta["pdf"]["rects"][0][3]
     assert lines[entry]["bbox"][2] >= right - 12  # the number sits at the margin
+
+
+# --------------------------- a whole table page -----------------------------
+
+
+def test_a_real_table_page_is_rebuilt_with_its_cells_translated(tmp_path, unicode_font):
+    """The end-to-end shape of the feature: a ruled table page, rebuilt.
+
+    Every cell of this table fits its translation, so nothing falls back — the
+    fallback is `test_a_cell_that_cannot_fit_keeps_its_source_text`'s subject.
+    What is checked here is that the grid survives (the rules are not redacted,
+    and no glyph lands outside a cell) and that the source words are gone.
+    """
+    from pdfdoc import write_table_pdf
+
+    pymupdf = pytest.importorskip("pymupdf")
+    src = write_table_pdf(
+        tmp_path / "table.pdf",
+        [["Feature", "State"], ["Servers", "5"], ["Backup", "Yes"]],
+        col_widths=[220.0, 120.0],
+    )
+    doc = load_document(src)
+    table = next(block for block in doc.blocks if block.meta.get("table"))
+    cells = table.meta["pdf"]["cells"]
+    assert [len(row) for row in cells] == [2, 2, 2]
+
+    # A stand-in translation: every cell prefixed, the shape of the grid kept.
+    source_rows = [line for line in table.text.splitlines() if not set(line) <= set("|- ")]
+    translated = "\n".join(
+        "| " + " | ".join(f"VI:{cell}" for cell in row.strip("|").split(" | ")) + " |"
+        for row in source_rows
+    )
+    texts = {
+        index: (translated if block is table else block.text)
+        for index, block in enumerate(doc.blocks)
+    }
+
+    out = tmp_path / "out.pdf"
+    stats = rebuild_pdf(src, doc, texts, out, font_path=unicode_font)
+    assert stats.cells == 6 and stats.cells_kept == 0 and stats.failures == []
+
+    with pymupdf.open(src) as original, pymupdf.open(out) as rebuilt:
+        assert len(rebuilt[0].get_drawings()) == len(original[0].get_drawings()), "lưới còn nguyên"
+        # The embedded font's encoder writes a non-breaking space for a space and
+        # the extractor breaks some cells after the colon; both are choices of the
+        # extraction, not text on the page, so normalise them before comparing.
+        text = rebuilt[0].get_text().replace("\xa0", " ").replace("VI: ", "VI:")
+        assert "VI:Feature" in text and "VI:Yes" in text
+        assert "Feature" not in text.replace("VI:Feature", "")
+        boxes = [cell[:4] for row in cells for cell in row]
+        for word in rebuilt[0].get_text("words"):
+            x0, top, x1, bottom = word[:4]
+            assert any(
+                x0 >= bx0 - 1 and x1 <= bx2 + 1 and top >= btop - 1 and bottom <= bbottom + 1
+                for bx0, btop, bx2, bbottom in boxes
+            ), f"chữ nằm ngoài ô: {word[4]!r}"

@@ -5,8 +5,9 @@
 prompt dịch bằng "textual gradient").
 
 Đầu vào là **PDF có lớp văn bản** (không OCR). Đầu ra chọn được: **Markdown** như
-trước, **PDF dựng lại giữ nguyên định dạng** (bố cục, ảnh, đồ hoạ, bảng biểu của
-trang gốc được giữ; chỉ chữ đã dịch được thay tại chỗ), hoặc **cả hai**.
+trước, **PDF dựng lại giữ nguyên định dạng** (bố cục, ảnh, đồ hoạ và lưới bảng của
+trang gốc được giữ; chữ đã dịch — kể cả chữ trong ô bảng — được thay tại chỗ),
+hoặc **cả hai**.
 
 Mỗi giai đoạn đều có một chủ sở hữu rõ ràng: prompt nào nằm cùng file với bộ
 parse của nó, nhờ vậy sửa một prompt không thể âm thầm làm lệch một parser ở
@@ -110,12 +111,20 @@ lại bản Markdown đã dịch xong.
   Mỗi block còn mang **toạ độ trang** nơi nó được đọc ra, nên cùng một bản dịch có
   thể được dựng lại thành PDF đúng bố cục mà không phải trích xuất lần hai.
 - **Ba kiểu đầu ra**: `md` (mặc định, như trước), `pdf` — dựng lại trang gốc với
-  chữ đã dịch, giữ nguyên khổ trang, ảnh, đồ hoạ vector và đường kẻ bảng, nhúng
-  font Unicode có dấu tiếng Việt và tự thu nhỏ cỡ chữ cho vừa khung — và `both`.
-  Chọn bằng `--format` trên CLI, một lựa chọn ba chiều trong web UI, hay `OUTPUT_FORMAT`
-  trong `.env`. Bảng và code được **giữ nguyên bản gốc** trong PDF (ý nghĩa của
-  bảng nằm ở lưới cột, còn code vốn không được dịch); hai loại đó vẫn được dịch
-  đầy đủ trong đầu ra Markdown.
+  chữ đã dịch, giữ nguyên khổ trang, ảnh, đồ hoạ vector và đường kẻ bảng — và
+  `both`. Bản dịch được in **đúng kiểu chữ của trang nguồn**: cùng họ font, cùng
+  độ đậm/nghiêng và cùng màu, dò từ danh sách font đã cài trên máy và chỉ nhận
+  font có dấu tiếng Việt (không khớp thì lấy một font cùng loại serif/sans/mono,
+  cuối cùng mới tới font mặc định). Cỡ chữ cũng giữ nguyên: một dòng nguồn ngắn
+  được nới ra hết bề ngang cột nếu chỗ đó còn trống, nên bản dịch dài hơn bản gốc
+  hiếm khi phải thu nhỏ. Dấu đầu dòng của danh sách và dãy chấm dẫn của mục lục
+  (kèm số trang canh phải) được **vẽ lại**, vì đó là bố cục chứ không phải chữ.
+  Chọn bằng `--format` trên CLI, một lựa chọn ba chiều trong web UI, hay
+  `OUTPUT_FORMAT` trong `.env`. Chữ trong **ô bảng** được dịch và in lại vào đúng
+  ô của lưới gốc, giữ nguyên đường kẻ, cỡ chữ, canh lề và độ đậm của ô đó; cỡ chữ
+  trong ô chỉ được thu nhỏ tới 70% cỡ gốc, và ô nào bản dịch vẫn không vừa thì giữ
+  nguyên tiếng gốc của chính ô đó — không tràn sang ô bên cạnh. Code vẫn là loại
+  duy nhất **không được dịch** trong PDF.
 - **Chia đoạn theo ngữ cảnh dài**: chunk theo token (tiktoken, ngân sách lấy từ
   `TRANSLATOR_MODEL`) tại ranh giới đoạn/tiêu đề, có overlap và `block_refs` để
   hợp nhất khử trùng.
@@ -356,8 +365,11 @@ python -m webui.server               # rồi mở http://127.0.0.1:8787
 python -m webui.server --port 9000   # đổi cổng, vẫn chỉ bind loopback
 ```
 
-Chọn một tài liệu trong `input/` — hoặc kéo thả một file PDF mới vào ô đầu hộp
-thoại — đặt ngôn ngữ, rồi bấm **Bắt đầu dịch**. Trang hiện thanh tiến độ theo
+Kéo thả một file PDF vào ô đầu hộp thoại (file được tải lên `input/` — thư mục
+này chỉ để chạy thử và chứa tài liệu mẫu), chọn ngôn ngữ ở hai đầu, rồi bấm
+**Bắt đầu dịch**. Danh sách ngôn ngữ viết đủ tên chứ không viết tắt (`vi` là
+"Tiếng Việt"); nguồn có thêm **Tự động nhận diện**, đích có **Tiếng Anh** như
+mọi ngôn ngữ khác. Trang hiện thanh tiến độ theo
 khối cùng dải giai đoạn của pipeline, và khi xong thì mở hai khung cạnh nhau:
 bản gốc đã trích xuất (đúng văn bản mà bộ dịch đã đọc) và bản dịch. Lịch sử nằm ở
 cột trái, đọc từ `logs/webui/<run_id>/run.json` — sống sót qua lần khởi động lại
@@ -373,8 +385,10 @@ gói cả hai khi lượt chạy viết ra cả hai.
 
 **Trang này không có bề mặt cấu hình nào.** Không màn hình cài đặt, không trạng
 thái API key, không công tắc chạy thử. Lượt chạy thừa hưởng môi trường của tiến
-trình server, còn những gì trang gửi chỉ là những gì thuộc về **một lượt chạy**:
-ngôn ngữ, lĩnh vực, glossary, ngân sách token, định dạng kết quả, và cờ tiếp tục.
+trình server, còn những gì trang gửi chỉ là tài liệu, hai ngôn ngữ và định dạng
+kết quả. Lĩnh vực, glossary và ngân sách token không có ô nhập nào: lượt chạy
+mặc định `general`, từ điển thuật ngữ do pipeline tự luận ra từ chính văn bản, và
+ngân sách token lấy từ `.env` (`CHUNK_MAX_TOKENS`).
 Muốn đổi thiết lập thì sửa `.env` rồi chạy lại server; `python webui/probe.py
 --config` cho biết cấu hình hiệu lực cùng nguồn của từng giá trị (`env` /
 `dotenv` / `default`).
@@ -386,8 +400,8 @@ Muốn đổi thiết lập thì sửa `.env` rồi chạy lại server; `python
   checkpoint, nên **Tiếp tục** ngay cạnh đó là đường quay lại, không mất việc.
 - Upgrade file vào `input/` chỉ nhận PDF thật (thiếu `%PDF-` là bị từ chối trước
   khi ghi), và một tên đã tồn tại phải được xác nhận ghi đè.
-- Ngăn kéo **Công cụ** quản lý glossary CSV, xem bộ nhớ dịch (chỉ đọc) và các skill
-  đã promote cùng lịch sử điểm.
+- Không có màn hình nào để nhập glossary hay sửa skill: chúng chỉ được sinh ra
+  và cập nhật qua chính các lượt dịch, còn bộ nhớ dịch chỉ được ghi theo cách đó.
 - Test của UI nằm ở `tests/test_webui_*.py`, không cần API key và không mở cổng.
 
 ## 8. Kiểm thử
@@ -398,9 +412,11 @@ python -m ruff check .         # lint
 python -m ruff format --check .  # định dạng (ruff format . để sửa)
 ```
 
-403 test, bao phủ: ingest (registry chỉ nhận PDF, che code, NFC, kiểu chữ →
-Markdown, gán toạ độ trang cho từng block), dựng lại PDF (map chunk → block, cắt
-overlap, chọn font, rebuild thật rồi đọc lại văn bản), ngân sách & overlap của
+461 test, bao phủ: ingest (registry chỉ nhận PDF, che code, NFC, kiểu chữ →
+Markdown, gán toạ độ trang *và kiểu chữ* cho từng block), dựng lại PDF (map chunk
+→ block, cắt overlap, chọn font theo họ nguồn, **nới khung một dòng ra hết cột**,
+**vẽ lại đầu dòng và chấm dẫn mục lục**, rebuild thật rồi đọc lại văn bản), ngân
+sách & overlap của
 chunker, glossary, validate config, LLM client trên HTTP giả lập (`respx`),
 deadline wall-clock, hàng đợi theo provider, Reasoning Bank
 (retrieve/gate/persistence), SkillOpt, TM, luật router, và một pipeline end-to-end
@@ -408,7 +424,7 @@ deadline wall-clock, hàng đợi theo provider, Reasoning Bank
 định tuyến thích ứng, checkpoint/resume (kể cả vô hiệu hoá và ghi từng phần), sửa
 placeholder, và nhất quán xuyên chunk.
 
-Trong đó 105 test thuộc `tests/test_webui_*.py`: phân giải đường dẫn an toàn, vòng
+Trong đó 114 test thuộc `tests/test_webui_*.py`: phân giải đường dẫn an toàn, vòng
 đời lượt chạy (kể cả dừng theo cây tiến trình, và ghi chú "chưa có log" được rút
 lại khi log xuất hiện), HTTP API và an toàn (Origin, traversal, che credential,
 nhận dạng upload), cộng một nhóm đọc **chính trang đã phát hành**: mọi id script
@@ -465,9 +481,17 @@ webui/                     # ứng dụng UI web (chạy polyglot_lc như tiến
 - **PDF dựng lại ở mức block, không phải mức content-stream.** Bản dịch được in
   vào đúng khung của block nguồn (PyMuPDF: redaction rồi chèn chữ, nhúng font
   Unicode), chứ không viết lại từng glyph trong content stream như PDFMathTranslate/
-  pdf2zh. Văn xuôi một cột gần như trùng khít; cột báo, công thức và bảng phức tạp
-  có thể lệch khung — vì vậy **bảng được giữ nguyên bản gốc** thay vì bị dàn lại,
-  và block không có bản dịch (chunk hết lượt thử lại) giữ nguyên chữ nguồn.
+  pdf2zh. Văn xuôi một cột gần như trùng khít; cột báo và công thức có thể lệch
+  khung — vì vậy **bảng được dựng lại theo từng ô trong đúng lưới của trang gốc**
+  thay vì dàn lại cột, ô nào không đủ chỗ thì in lại chữ nguồn của ô đó, và block
+  không có bản dịch (chunk hết lượt thử lại) giữ nguyên chữ nguồn.
+- **Một block chỉ có một kiểu chữ.** Dòng nguồn trộn kiểu (ví dụ “**Eocortex ST**
+  được thiết kế…”) được in bằng kiểu chiếm phần lớn ký tự; phần đậm lẻ trong một
+  câu không được tái tạo.
+- **Chép chữ ra khỏi PDF dựng lại có thể gặp U+00A0 thay cho dấu cách và U+00AD
+  thay cho gạch nối** — đó là cách PyMuPDF mã hoá glyph của font nhúng, không
+  phải lỗi bản dịch; trên trang in ra thì không thấy khác biệt. `polyglot trace`
+  và đầu ra Markdown không bị ảnh hưởng.
 - **PDF quét ảnh không được hỗ trợ** (không OCR): một trang không có lớp văn bản
   làm bộ trích xuất báo lỗi rõ ràng chứ không tạo ra tài liệu rỗng.
 - PDF đầu ra cần một font `.ttf` có dấu tiếng Việt. Chương trình tự dò Times/Arial/
