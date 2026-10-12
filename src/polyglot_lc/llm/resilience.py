@@ -17,6 +17,7 @@ endpoint (see :meth:`LLMClient.chat`).
 
 from __future__ import annotations
 
+import os
 import random
 import re
 import threading
@@ -26,6 +27,9 @@ from typing import Any
 from loguru import logger
 
 from polyglot_lc.config import RetryConfig
+
+# Enable verbose resilience logging via env var
+VERBOSE_RESILIENCE = os.getenv("LLM_VERBOSE_RESILIENCE", "0").lower() in {"1", "true", "yes", "on"}
 
 #: HTTP status codes worth retrying (transient server/network trouble).
 RETRYABLE_STATUS = frozenset({408, 409, 425, 500, 502, 503, 504})
@@ -38,8 +42,9 @@ class LLMError(RuntimeError):
 class RateLimitError(LLMError):
     """HTTP 429 / rate_limit_exceeded; ``retry_after`` is seconds when known."""
 
-    def __init__(self, message: str, retry_after: float | None = None,
-                 status: int | None = None) -> None:
+    def __init__(
+        self, message: str, retry_after: float | None = None, status: int | None = None
+    ) -> None:
         super().__init__(message)
         self.retry_after = retry_after
         self.status = status
@@ -79,6 +84,23 @@ _RATE_LIMIT_HINTS = (
     "tokens per minute",
     "requests per minute",
 )
+
+#: Phrases that mean "you already have a request in flight", which is a
+#: different problem from "you are sending too many". Exponential backoff does
+#: not fix it: a 2 s retry collides with the request that is still running, and
+#: the run burns its whole retry budget on collisions.
+_CONCURRENCY_HINTS = (
+    "concurrency",
+    "concurrent request",
+    "simultaneous",
+    "parallel request",
+)
+
+
+def is_concurrency_limit(err: LLMError) -> bool:
+    """True when *err* says another request from this process is still in flight."""
+    text = str(err).lower()
+    return any(hint in text for hint in _CONCURRENCY_HINTS)
 
 
 def _extract_status(text: str) -> int | None:
@@ -128,8 +150,9 @@ def normalize_provider_error(exc: BaseException) -> LLMError:
 
     name = type(exc).__name__.lower()
     if "ratelimit" in name or "rate_limit" in name:
-        return RateLimitError(text, retry_after=parse_retry_seconds(text),
-                              status=int(status) if status else 429)
+        return RateLimitError(
+            text, retry_after=parse_retry_seconds(text), status=int(status) if status else 429
+        )
     if "timeout" in name:
         return TransientError(text, status=int(status) if status else None)
     if "connection" in name or isinstance(exc, ConnectionError):
@@ -139,14 +162,14 @@ def normalize_provider_error(exc: BaseException) -> LLMError:
     if status is not None:
         status = int(status)
         if status == 429:
-            return RateLimitError(text, retry_after=parse_retry_seconds(text),
-                                  status=status)
+            return RateLimitError(text, retry_after=parse_retry_seconds(text), status=status)
         if status in RETRYABLE_STATUS:
             return TransientError(text, status=status)
         return PermanentError(text, status=status)
     if _looks_like_rate_limit(text):
-        return RateLimitError(text, retry_after=parse_retry_seconds(text),
-                              status=_extract_status(text))
+        return RateLimitError(
+            text, retry_after=parse_retry_seconds(text), status=_extract_status(text)
+        )
     if "timed out" in text.lower() or "timeout" in text.lower():
         return TransientError(text)
     if "connection" in text.lower() or "unreachable" in text.lower():
@@ -173,12 +196,19 @@ def jittered_delay(retry_cfg: RetryConfig, attempt: int) -> float:
     return max(0.0, delay * (1.0 - retry_cfg.jitter * random.random()))
 
 
-def log_retry(err: LLMError, attempt: int, max_retries: int, wait: float,
-              reason: str, *, provider: str, model: str) -> None:
+def log_retry(
+    err: LLMError,
+    attempt: int,
+    max_retries: int,
+    wait: float,
+    reason: str,
+    *,
+    provider: str,
+    model: str,
+) -> None:
     """One structured log line per retry: who, what status, how long, why."""
     logger.warning(
-        "LLM retry | provider={} model={} status={} attempt={}/{} "
-        "wait={:.1f}s reason={} ({})",
+        "LLM retry | provider={} model={} status={} attempt={}/{} wait={:.1f}s reason={} ({})",
         provider,
         model,
         getattr(err, "status", None) or "?",
@@ -188,6 +218,18 @@ def log_retry(err: LLMError, attempt: int, max_retries: int, wait: float,
         reason,
         type(err).__name__,
     )
+    if VERBOSE_RESILIENCE:
+        logger.debug(
+            "LLM retry detail | provider={} model={} err_type={} err_msg={} "
+            "retry_after={} buffer={} jitter={}",
+            provider,
+            model,
+            type(err).__name__,
+            str(err)[:200],
+            getattr(err, "retry_after", None),
+            RetryConfig().buffer_seconds,
+            RetryConfig().jitter,
+        )
 
 
 class RetryStats:
@@ -264,15 +306,15 @@ def call_with_resilience(
         return fn(*args, **kwargs)
 
     def _log(err: LLMError, attempt: int, wait: float, reason: str) -> None:
-        log_retry(err, attempt, cfg.max_retries, wait, reason,
-                  provider=provider, model=model)
+        log_retry(err, attempt, cfg.max_retries, wait, reason, provider=provider, model=model)
 
     try:
         return _call(primary)
     except RateLimitError as err:
         if cfg.max_retries == 0:
-            return _fallback_or_raise(backup, args, kwargs, err, provider,
-                                      model, backup_provider, backup_model)
+            return _fallback_or_raise(
+                backup, args, kwargs, err, provider, model, backup_provider, backup_model
+            )
         last: LLMError = err
         for attempt in range(cfg.max_retries):
             hinted = err.retry_after
@@ -281,9 +323,22 @@ def call_with_resilience(
                 if hinted is not None
                 else jittered_delay(cfg, attempt)
             )
-            _log(err, attempt, wait,
-                 "rate limit: provider hint" if hinted is not None
-                 else "rate limit: exponential backoff")
+            reason = (
+                "rate limit: provider hint"
+                if hinted is not None
+                else "rate limit: exponential backoff"
+            )
+            if is_concurrency_limit(err):
+                # Our own earlier request may still be running server side (an
+                # abandoned deadline leaves it going), so a short backoff only
+                # collides again. Wait for the slot to clear, then retry.
+                floor = min(cfg.max_delay, max(wait, cfg.concurrency_wait))
+                # Callers that collided together would otherwise retry in the
+                # same instant and collide again, so jitter is *added* above the
+                # floor — subtracting would break the minimum this exists for.
+                wait = min(cfg.max_delay, floor * (1.0 + cfg.jitter * random.random()))
+                reason = "rate limit: another request still holds the slot"
+            _log(err, attempt, wait, reason)
             RetryStats.add_rate_limit_retry()
             if on_retry is not None:
                 on_retry(str(err))
@@ -297,12 +352,14 @@ def call_with_resilience(
                 if not isinstance(retry_err, RateLimitError):
                     break
                 err = retry_err  # refresh the retry-after hint for next wait
-        return _fallback_or_raise(backup, args, kwargs, last, provider,
-                                  model, backup_provider, backup_model)
+        return _fallback_or_raise(
+            backup, args, kwargs, last, provider, model, backup_provider, backup_model
+        )
     except TransientError as err:
         if cfg.max_retries == 0:
-            return _fallback_or_raise(backup, args, kwargs, err, provider,
-                                      model, backup_provider, backup_model)
+            return _fallback_or_raise(
+                backup, args, kwargs, err, provider, model, backup_provider, backup_model
+            )
         last = err
         for attempt in range(cfg.max_retries):
             wait = jittered_delay(cfg, attempt)
@@ -317,8 +374,9 @@ def call_with_resilience(
                 last = retry_err
                 if not isinstance(retry_err, TransientError):
                     break
-        return _fallback_or_raise(backup, args, kwargs, last, provider,
-                                  model, backup_provider, backup_model)
+        return _fallback_or_raise(
+            backup, args, kwargs, last, provider, model, backup_provider, backup_model
+        )
     except PermanentError as err:
         # Application/business-level failure: a different endpoint cannot fix
         # it, so fail fast (caller surfaces it on the Errors panel).

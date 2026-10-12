@@ -1,15 +1,13 @@
 {
-  "instruction": "Translate the input text from English to Vietnamese while strictly preserving the original capitalization, line breaks, and formatting. Do not alter the casing of proper nouns, titles, or headers; maintain Title Case exactly as provided in the source. Ensure accurate terminology for academic and environmental contexts without normalizing stylistic choices.",
+  "instruction": "mock: improved instruction",
   "few_shot": [
-    "Input: TẠP CHÍ KHOA HỌC MÔI TRƯỜNG & QUY HOẠCH ĐÔ THỊ | SỐ 14/2026\nNghiên Cứu Ảnh Hưởng Của Mật Độ Cây Xanh Đến Giảm\nThiểu Hiệu Ứng Đảo Nhiệt Đô Thị Tại TP. Hồ Chí Minh\nTS. Nguyễn Văn Hoàng, ThS. Trần Lê Min\nOutput: TẠP CHÍ KHOA HỌC MÔI TRƯỜNG & QUY HOẠCH ĐÔ THỊ | SỐ 14/2026\nNghiên Cứu Ảnh Hưởng Của Mật Độ Cây Xanh Đến Giảm\nThiểu Hiệu Ứng Đảo Nhiệt Đô Thị Tại TP. Hồ Chí Minh\nTS. Nguyễn Văn Hoàng, ThS. Trần Lê Min",
-    "Input: Environmental Science Journal | Issue 14/2026\nResearch on the Impact of Tree Density on Reducing\nUrban Heat Island Effect in Ho Chi Minh City\nAssoc. Prof. Nguyen Van Hoang, MSc. Tran Le Min\nOutput: TẠP CHÍ KHOA HỌC MÔI TRƯỜNG & QUY HOẠCH ĐÔ THỊ | SỐ 14/2026\nNghiên Cứu Ảnh Hưởng Của Mật Độ Cây Xanh Đến Giảm\nThiểu Hiệu Ứng Đảo Nhiệt Đô Thị Tại TP. Hồ Chí Minh\nTS. Nguyễn Văn Hoàng, ThS. Trần Lê Min",
-    "Input: The study analyzes data.\nOutput: Nghiên cứu phân tích dữ liệu."
+    "mock -> mock"
   ],
-  "rationale": "The critic scores indicate a failure mode where the model incorrectly normalizes capitalization (e.g., converting 'Nghiên Cứu' to 'Nghiên cứu') despite the source being already translated or mixed-case. The improved instruction explicitly mandates preserving original casing and formatting, and the few-shot examples demonstrate strict adherence to this constraint, including cases where the output matches the input's specific capitalization style.",
-  "mean_score": 8.875,
-  "promoted_at": 1790764508.124913,
+  "rationale": "mock rationale",
+  "mean_score": 8.5,
+  "promoted_at": 1791623869.6938593,
   "domain": "general",
   "src_lang": "en",
   "tgt_lang": "vi",
-  "updated_at": 1790764508.1254125
+  "updated_at": 1791623869.6938593
 }

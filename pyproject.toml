@@ -16,9 +16,8 @@ dependencies = [
     "pydantic>=2.7",
     "pydantic-settings>=2.3",
     "python-dotenv>=1.0",
-    "pypdf>=4.2",
+    "pymupdf>=1.24",
     "pdfplumber>=0.11",
-    "markitdown[pdf]>=0.1.0",
     "markdown-it-py>=3.0",
     "tiktoken>=0.7",
     "langgraph>=0.2",
@@ -55,3 +54,9 @@ pythonpath = ["."]
 [tool.ruff]
 line-length = 100
 target-version = "py311"
+
+[tool.ruff.lint]
+# The codebase annotates every deliberate blanket ``except Exception`` with
+# ``# noqa: BLE001`` and a reason. Enabling the rule makes those annotations
+# meaningful instead of "unused noqa" noise, and keeps new ones honest.
+extend-select = ["BLE001"]

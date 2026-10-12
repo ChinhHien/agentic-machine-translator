@@ -2,19 +2,34 @@
 
 from __future__ import annotations
 
+import threading
+import time
+
 import httpx
 import pytest
 import respx
 
 from polyglot_lc.config import AgentConfig, EmbedConfig
-from polyglot_lc.llm.client import LLMClient, LLMError, TokenUsage, parse_json_reply
+from polyglot_lc.llm.client import (
+    LLMClient,
+    LLMError,
+    TokenUsage,
+    parse_json_reply,
+    reset_provider_gates,
+)
 
 BASE = "http://mockapi.test/v1"
 
 
 def make_agent_config(**kw) -> AgentConfig:
-    return AgentConfig(name="TRANSLATOR", base_url=BASE, model="test-model",
-                       api_key="sk-test", temperature=0.1, **kw)
+    return AgentConfig(
+        name="TRANSLATOR",
+        base_url=BASE,
+        model="test-model",
+        api_key="sk-test",
+        temperature=0.1,
+        **kw,
+    )
 
 
 CHAT_URL = BASE + "/chat/completions"
@@ -23,9 +38,13 @@ EMBED_URL = BASE + "/embeddings"
 
 def chat_payload(text: str) -> dict:
     return {
-        "id": "c1", "object": "chat.completion", "created": 1, "model": "test-model",
-        "choices": [{"index": 0, "message": {"role": "assistant", "content": text},
-                     "finish_reason": "stop"}],
+        "id": "c1",
+        "object": "chat.completion",
+        "created": 1,
+        "model": "test-model",
+        "choices": [
+            {"index": 0, "message": {"role": "assistant", "content": text}, "finish_reason": "stop"}
+        ],
         "usage": {"prompt_tokens": 5, "completion_tokens": 7, "total_tokens": 12},
     }
 
@@ -57,6 +76,94 @@ def _fast_resilience(monkeypatch):
 
 
 @respx.mock
+def test_concurrent_calls_never_overlap_on_a_single_request_provider(monkeypatch):
+    """The queue is what stops a 1-concurrency provider rejecting our calls.
+
+    A free tier answers the second simultaneous request with 429
+    ``concurrency_limit_exceeded``; a chunk lost to that 429 is how a whole
+    section disappears from the output.
+    """
+    monkeypatch.delenv("LLM_PROVIDER_CONCURRENCY", raising=False)
+    reset_provider_gates()
+    state = {"active": 0, "peak": 0, "rejected": 0}
+    lock = threading.Lock()
+
+    def handler(_request: httpx.Request) -> httpx.Response:
+        with lock:
+            state["active"] += 1
+            state["peak"] = max(state["peak"], state["active"])
+            overlap = state["active"] > 1
+        time.sleep(0.03)
+        with lock:
+            state["active"] -= 1
+        if overlap:
+            state["rejected"] += 1
+            return httpx.Response(
+                429,
+                json={
+                    "error": {
+                        "code": "concurrency_limit_exceeded",
+                        "message": "Too many concurrent requests (limit: 1)",
+                    }
+                },
+            )
+        return httpx.Response(200, json=chat_payload("ok"))
+
+    route = respx.post(CHAT_URL)
+    route.side_effect = handler
+    client = LLMClient(make_agent_config())
+    errors: list[BaseException] = []
+    results: list[str] = []
+
+    def call() -> None:
+        try:
+            results.append(client.chat([{"role": "user", "content": "hi"}]).text)
+        except BaseException as exc:  # noqa: BLE001 - asserted below
+            errors.append(exc)
+
+    threads = [threading.Thread(target=call) for _ in range(4)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(10.0)
+
+    assert not errors, errors
+    assert results == ["ok"] * 4
+    assert state["peak"] == 1  # the provider never saw two at once
+    assert state["rejected"] == 0  # so it never had to reject one
+
+
+@respx.mock
+def test_a_concurrency_429_is_survived(monkeypatch):
+    """When the queue is widened past the provider's limit, the 429 is retried."""
+    monkeypatch.setenv("LLM_PROVIDER_CONCURRENCY", "4")
+    monkeypatch.setenv("LLM_RETRY_CONCURRENCY_WAIT", "6")
+    reset_provider_gates()
+    waits: list[float] = []
+    monkeypatch.setattr("polyglot_lc.llm.resilience._sleep", waits.append)
+    route = respx.post(CHAT_URL)
+    route.side_effect = [
+        httpx.Response(
+            429,
+            json={
+                "error": {
+                    "code": "concurrency_limit_exceeded",
+                    "message": "Too many concurrent requests (limit: 1)",
+                }
+            },
+        ),
+        httpx.Response(200, json=chat_payload("ok")),
+    ]
+    client = LLMClient(make_agent_config())
+
+    assert client.chat([{"role": "user", "content": "hi"}]).text == "ok"
+    # Waited for the slot to clear instead of the ~2s exponential value. Jitter
+    # is added above the floor (production default 0.2), never below it.
+    assert waits and 6.0 <= waits[0] <= 7.2
+    assert route.call_count == 2
+
+
+@respx.mock
 def test_chat_retries_on_500_then_succeeds():
     route = respx.post(CHAT_URL)
     route.side_effect = [
@@ -84,14 +191,17 @@ def test_chat_fails_after_retries():
 
 @respx.mock
 def test_embed_success():
-    respx.post(EMBED_URL).respond(json={
-        "object": "list", "model": "embed-1",
-        "data": [
-            {"object": "embedding", "index": 0, "embedding": [0.1, 0.2]},
-            {"object": "embedding", "index": 1, "embedding": [0.3, 0.4]},
-        ],
-        "usage": {"prompt_tokens": 2, "total_tokens": 2},
-    })
+    respx.post(EMBED_URL).respond(
+        json={
+            "object": "list",
+            "model": "embed-1",
+            "data": [
+                {"object": "embedding", "index": 0, "embedding": [0.1, 0.2]},
+                {"object": "embedding", "index": 1, "embedding": [0.3, 0.4]},
+            ],
+            "usage": {"prompt_tokens": 2, "total_tokens": 2},
+        }
+    )
     client = LLMClient(EmbedConfig(base_url=BASE, model="embed-1", api_key="k"))
     resp = client.embed(["a", "b"])
     assert resp.vectors == [[0.1, 0.2], [0.3, 0.4]]
@@ -123,8 +233,9 @@ def test_mock_mode_short_circuits(mock_env):
 def test_token_usage_totals_and_per_agent():
     TokenUsage.reset()
     TokenUsage.add(100, 50, agent="PLANNER")
-    TokenUsage.add(200, 25, agent="TRANSLATOR", cached_tokens=120, model="m",
-                   provider="http://p/v1")
+    TokenUsage.add(
+        200, 25, agent="TRANSLATOR", cached_tokens=120, model="m", provider="http://p/v1"
+    )
     TokenUsage.add(10, 5, agent="PLANNER")
     TokenUsage.add(7, 3)  # unattributed call still hits the totals
     snap = TokenUsage.snapshot()
@@ -134,13 +245,9 @@ def test_token_usage_totals_and_per_agent():
     assert snap["cached"] == 120
     by_agent = TokenUsage.snapshot_by_agent()
     assert by_agent["PLANNER"] == {"sent": 110, "received": 55, "cached": 0, "calls": 2}
-    assert by_agent["TRANSLATOR"] == {
-        "sent": 200, "received": 25, "cached": 120, "calls": 1
-    }
+    assert by_agent["TRANSLATOR"] == {"sent": 200, "received": 25, "cached": 120, "calls": 1}
     by_model = TokenUsage.snapshot_by_model()
-    assert by_model["http://p/v1 / m"] == {
-        "sent": 200, "received": 25, "cached": 120, "calls": 1
-    }
+    assert by_model["http://p/v1 / m"] == {"sent": 200, "received": 25, "cached": 120, "calls": 1}
     TokenUsage.reset()
     assert TokenUsage.snapshot()["sent"] == 0
     assert TokenUsage.snapshot_by_agent() == {}
@@ -172,8 +279,10 @@ def test_chat_parses_openai_cached_tokens():
 def test_chat_parses_deepseek_cache_hit_tokens():
     payload = chat_payload("ok")
     payload["usage"] = {
-        "prompt_tokens": 100, "completion_tokens": 7,
-        "prompt_cache_hit_tokens": 70, "prompt_cache_miss_tokens": 30,
+        "prompt_tokens": 100,
+        "completion_tokens": 7,
+        "prompt_cache_hit_tokens": 70,
+        "prompt_cache_miss_tokens": 30,
     }
     respx.post(CHAT_URL).respond(json=payload)
     client = LLMClient(make_agent_config())
@@ -186,8 +295,10 @@ def test_chat_parses_deepseek_cache_hit_tokens():
 def test_chat_parses_anthropic_style_cache_usage():
     payload = chat_payload("ok")
     payload["usage"] = {
-        "input_tokens": 10, "cache_read_input_tokens": 90,
-        "cache_creation_input_tokens": 0, "completion_tokens": 7,
+        "input_tokens": 10,
+        "cache_read_input_tokens": 90,
+        "cache_creation_input_tokens": 0,
+        "completion_tokens": 7,
     }
     respx.post(CHAT_URL).respond(json=payload)
     client = LLMClient(make_agent_config())
@@ -244,8 +355,7 @@ def test_explicit_cache_control_marker(monkeypatch):
     route = respx.post(CHAT_URL).respond(json=chat_payload("ok"))
     client = LLMClient(make_agent_config())
     client.chat(
-        [{"role": "system", "content": "stable prefix"},
-         {"role": "user", "content": "dynamic"}],
+        [{"role": "system", "content": "stable prefix"}, {"role": "user", "content": "dynamic"}],
         cache_prefix=True,
     )
     body = route.calls.last.request.read()
@@ -258,8 +368,7 @@ def test_auto_cache_mode_sends_no_marker(monkeypatch):
     route = respx.post(CHAT_URL).respond(json=chat_payload("ok"))
     client = LLMClient(make_agent_config())
     client.chat(
-        [{"role": "system", "content": "stable prefix"},
-         {"role": "user", "content": "dynamic"}],
+        [{"role": "system", "content": "stable prefix"}, {"role": "user", "content": "dynamic"}],
         cache_prefix=True,
     )
     body = route.calls.last.request.read()

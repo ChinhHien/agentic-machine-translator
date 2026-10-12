@@ -29,10 +29,24 @@ def test_boundary_score_accepted(bank):
 
 
 def test_retrieve_returns_similar_first(bank):
-    bank.upsert(ReasoningTrace(domain="tech", src_lang="en", tgt_lang="vi",
-                               strategy="Keep product names unchanged", score=0.95))
-    bank.upsert(ReasoningTrace(domain="legal", src_lang="en", tgt_lang="vi",
-                               strategy="Use formal register for contracts", score=0.9))
+    bank.upsert(
+        ReasoningTrace(
+            domain="tech",
+            src_lang="en",
+            tgt_lang="vi",
+            strategy="Keep product names unchanged",
+            score=0.95,
+        )
+    )
+    bank.upsert(
+        ReasoningTrace(
+            domain="legal",
+            src_lang="en",
+            tgt_lang="vi",
+            strategy="Use formal register for contracts",
+            score=0.9,
+        )
+    )
     hits = bank.retrieve("product names in tech manuals", top_k=1)
     assert len(hits) == 1
     assert hits[0].domain == "tech"
@@ -44,7 +58,9 @@ def test_retrieve_empty_bank(bank):
 
 def test_trace_metadata_roundtrip(bank):
     t = ReasoningTrace(
-        domain="tech", src_lang="en", tgt_lang="vi",
+        domain="tech",
+        src_lang="en",
+        tgt_lang="vi",
         strategy="strategy text",
         few_shot=["a -> b", "c -> d"],
         pitfalls=["p1", "p2"],
@@ -69,7 +85,6 @@ def test_persistence_across_instances(rb_dir, mock_env):
 
 
 def test_embedder_hash_fallback_deterministic(mock_env):
-    emb = Embedder(get_embed_config())
     v1 = Embedder._hash_vector("same text")
     v2 = Embedder._hash_vector("same text")
     assert v1 == v2

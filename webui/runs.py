@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 import signal
 import subprocess
 import time
@@ -27,7 +28,9 @@ INPUT_DIR = "input"
 
 #: Per-run directories for artefacts and for metadata + logs, under the repo.
 OUTPUT_DIR = Path("output") / "webui"
-LOGS_DIR = Path("logs") / "webui"#: The probe script, resolved from this file so a caller-provided root cannot
+LOGS_DIR = Path("logs") / "webui"
+
+#: The probe script, resolved from this file so a caller-provided root cannot
 #: redirect it: the script ships with the package, the data does not.
 _PROBE = Path(__file__).with_name("probe.py")
 
@@ -37,9 +40,20 @@ EXIT_OK = 0
 #: How long a stopped run may take to die before we escalate once.
 STOP_TIMEOUT = 5.0
 
-#: Explained in the record when there is no event log to read.
-NO_LOG_NOTE = (
-    "lượt chạy không có file sự kiện (LOG_JSONL=0?): không có tiến độ để hiển thị"
+#: Explained in the record when there is no event log to read. Written in the
+#: present tense on purpose: the log appears a moment after the child starts, so
+#: "chưa có" (not yet) is true while "không có" would be a claim we cannot make.
+#: :meth:`RunManager.status` takes the note back once a log does appear.
+NO_LOG_NOTE = "chưa thấy file sự kiện của lượt chạy (LOG_JSONL=0?): chưa có tiến độ để hiển thị"
+
+#: Every wording this note has had. A record written by an older server keeps its
+#: sentence in `run.json` forever, and once a log exists that sentence is false on
+#: screen — the history would go on claiming a finished run reports no progress
+#: while its own step rail is full of ticks. Matching the old text too is what lets
+#: an upgrade clean up the records it inherited.
+NO_LOG_NOTES = (
+    NO_LOG_NOTE,
+    "lượt chạy không có file sự kiện (LOG_JSONL=0?): không có tiến độ để hiển thị",
 )
 
 
@@ -51,6 +65,21 @@ def _note(record: RunRecord, text: str) -> None:
     """Append an explanation, without repeating one a previous poll wrote."""
     if text and text not in record.note:
         record.note = f"{record.note}; {text}" if record.note else text
+
+
+def _un_note(record: RunRecord, text: str) -> None:
+    """Take an explanation back once it has stopped being true.
+
+    A note is written to disk on the first poll that cannot find the run's log,
+    and the log then appears a moment later. Leaving the sentence behind would
+    keep a healthy run looking broken for the rest of its life.
+    """
+    if not text or text not in record.note:
+        return
+    parts = [
+        part.strip() for part in record.note.split(";") if part.strip() and part.strip() != text
+    ]
+    record.note = "; ".join(parts)
 
 
 def pid_alive(pid: int) -> bool:
@@ -98,7 +127,8 @@ def kill_tree(pid: int) -> None:
     if os.name == "nt":  # pragma: no cover - platform branch
         subprocess.run(
             ["taskkill", "/T", "/F", "/PID", str(pid)],
-            check=False, capture_output=True,
+            check=False,
+            capture_output=True,
         )
         return
     try:
@@ -130,6 +160,26 @@ def _reap(proc: Any | None) -> None:
             pass
 
 
+def _remove_tree(path: Path) -> None:
+    """Remove a run's directory, retrying over a transient lock.
+
+    On Windows a *brief* handle to the directory (an antivirus scan, a lingering
+    child) can make ``shutil.rmtree`` fail on the final ``rmdir``; ignoring that
+    failure would leave an empty run directory behind and the deleted run would
+    keep a ghost entry on disk. Retrying a few times clears such a lock.
+    """
+    if not path.is_dir():
+        return
+    # A held handle can keep the final rmdir failing for a second or two, so
+    # retry on a 2s window; the common case (no lock) returns on the first try.
+    for _ in range(20):
+        try:
+            shutil.rmtree(path)
+            return
+        except OSError:
+            time.sleep(0.1)
+
+
 class RunManager:
     """Starts, tracks and stops CLI runs, one directory per run."""
 
@@ -157,6 +207,10 @@ class RunManager:
         """The run's artefact directory; ``ValueError`` if the id escapes."""
         return safe_child(self.root / OUTPUT_DIR, run_id)
 
+    def input_path(self, name: str) -> Path:
+        """The input file *name* refers to; ``ValueError`` if it escapes ``input/``."""
+        return safe_child(self.root / INPUT_DIR, name)
+
     def env_for(self, record: RunRecord) -> dict[str, str]:
         """Environment overrides that keep a run's logs inside its own dir.
 
@@ -169,6 +223,9 @@ class RunManager:
             "LOGS_DIR": str(self.logs_dir(record.run_id)),
             "LOG_JSONL": "1",
             "PYTHONIOENCODING": "utf-8",
+            # The id the run's own trace records carry, so ``run.json`` here and
+            # the trace on disk name the same run instead of two parallel ids.
+            "RUN_ID": record.run_id,
         }
         if record.mock:
             env["LLM_MOCK"] = "1"
@@ -190,8 +247,12 @@ class RunManager:
         env = {**os.environ, "PYTHONIOENCODING": "utf-8"}
         try:
             proc = subprocess.run(
-                argv, capture_output=True, encoding="utf-8", cwd=self.root,
-                env=env, check=False,
+                argv,
+                capture_output=True,
+                encoding="utf-8",
+                cwd=self.root,
+                env=env,
+                check=False,
             )
         except OSError as exc:  # interpreter missing, permissions, ...
             raise RunPlanError(f"cannot run the probe: {exc}") from exc
@@ -230,10 +291,14 @@ class RunManager:
         glossary: str | None,
         max_tokens: int | None,
         mock: bool,
+        output_format: str = "md",
+        resume: bool = False,
     ) -> RunRecord:
         """Plan, then launch one CLI run and return its record.
 
-        Raises ``ValueError`` for a path outside ``input/`` and
+        *resume* continues an interrupted document from its per-chunk
+        checkpoints (``--resume``): the chunks that already finished are not
+        paid for twice. Raises ``ValueError`` for a path outside ``input/`` and
         :class:`RunPlanError` when the document cannot be read or planned — in
         both cases nothing is created and no process is started.
         """
@@ -248,9 +313,14 @@ class RunManager:
         logs_dir, out_dir = self.logs_dir(run_id), self.output_dir(run_id)
         out_dir.mkdir(parents=True, exist_ok=True)
         logs_dir.mkdir(parents=True, exist_ok=True)
+        # The Markdown path is always the base name: a run asked for the PDF
+        # alone writes `<stem>.<tgt>.pdf` right next to it (see
+        # `polyglot_lc.pipeline.assembler.output_paths`).
         output_path = out_dir / f"{source.stem}.{tgt}.md"
 
-        argv = self._argv(source, src, tgt, domain, glossary, max_tokens, output_path)
+        argv = self._argv(
+            source, src, tgt, domain, glossary, max_tokens, output_path, output_format, resume
+        )
         record = RunRecord(
             run_id=run_id,
             started=time.time(),
@@ -267,11 +337,16 @@ class RunManager:
             command=argv,
         )
         env = {**os.environ, **self.env_for(record)}
-        with (logs_dir / "stdout.log").open("w", encoding="utf-8") as out, (
-            logs_dir / "stderr.log"
-        ).open("w", encoding="utf-8") as err:
+        with (
+            (logs_dir / "stdout.log").open("w", encoding="utf-8") as out,
+            (logs_dir / "stderr.log").open("w", encoding="utf-8") as err,
+        ):
             proc = self._popen(
-                argv, cwd=self.root, env=env, stdout=out, stderr=err,
+                argv,
+                cwd=self.root,
+                env=env,
+                stdout=out,
+                stderr=err,
                 **_detach_kwargs(),
             )
         record.pid = proc.pid
@@ -288,21 +363,35 @@ class RunManager:
         glossary: str | None,
         max_tokens: int | None,
         output_path: Path,
+        output_format: str = "md",
+        resume: bool = False,
     ) -> list[str]:
         """The exact CLI command line, also stored in the record for auditing."""
         argv = [
-            self.python, "-m", "polyglot_lc.cli", "translate",
-            "--file", str(source),
-            "--src", src,
-            "--tgt", tgt,
-            "--domain", domain,
-            "--out", str(output_path),
+            self.python,
+            "-m",
+            "polyglot_lc.cli",
+            "translate",
+            "--file",
+            str(source),
+            "--src",
+            src,
+            "--tgt",
+            tgt,
+            "--domain",
+            domain,
+            "--out",
+            str(output_path),
+            "--format",
+            output_format,
             "--quiet",
         ]
         if glossary:
             argv += ["--glossary", str(glossary)]
         if max_tokens:
             argv += ["--max-tokens", str(max_tokens)]
+        if resume:
+            argv += ["--resume"]
         return argv
 
     # Observation and control -------------------------------------------
@@ -336,7 +425,13 @@ class RunManager:
             elif record.pid is not None and not pid_alive(record.pid):
                 record.status = "failed"
                 _note(record, "server đã khởi động lại khi lượt chạy đang chạy")
-        if not self.has_events(run_id):
+        if self.has_events(run_id):
+            # The log exists after all: a note written in the first second, when
+            # the child had not opened it yet, is no longer true — and neither is
+            # the same sentence written by an earlier version of this server.
+            for wording in NO_LOG_NOTES:
+                _un_note(record, wording)
+        else:
             _note(record, NO_LOG_NOTE)
         if (record.status, record.exit_code, record.note) != before:
             self.store.write_record(record)
@@ -360,6 +455,29 @@ class RunManager:
         _note(record, f"đã dừng từ web UI (pid {pid})" if pid else "đã dừng từ web UI")
         self.store.write_record(record)
         return record
+
+    def delete(self, run_id: str) -> None:
+        """Erase a run's history and its output entirely.
+
+        A running run is stopped first (best effort), then both the run's log
+        directory and its artefact directory are removed, so a deleted run
+        leaves no record, no events and no translated files. ``KeyError`` for
+        an unknown run. Deleting the *input* PDF is deliberately out of scope:
+        that document may be wanted by another run or re-translated later.
+        """
+        record = self.store.read_record(run_id)
+        if record is None:
+            raise KeyError(run_id)
+        # A live run cannot leave a child holding its output open behind the
+        # rmtree; stop is best effort — a record already final just skips it.
+        if record.status == "running" or run_id in self.procs:
+            try:
+                self.stop(run_id)
+            except (KeyError, RuntimeError):
+                pass
+        for dirname in (self.logs_dir(run_id), self.output_dir(run_id)):
+            _remove_tree(dirname)
+        self.procs.pop(run_id, None)
 
 
 def _new_run_id() -> str:

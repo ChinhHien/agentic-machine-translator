@@ -1,4 +1,4 @@
-"""Child-process probe: effective configuration and per-file chunk planning.
+"""Child-process probe: everything the web UI needs to ask the pipeline.
 
 Runs as a **separate process** so the server never imports :mod:`polyglot_lc`
 (see the package docstring in :mod:`webui`). It prints exactly one JSON object to
@@ -10,6 +10,13 @@ Usage::
 
     python webui/probe.py --config
     python webui/probe.py --plan FILE --src en --tgt vi [--max-tokens 700]
+    python webui/probe.py --text FILE
+    python webui/probe.py --memory
+
+``--config`` is a terminal diagnostic and is **not** used by the web UI: the
+application has no view of `.env`, so nothing in this file's output ever reaches
+a browser. It reports which of the known settings is in effect and where each
+value came from, and never a credential's value.
 """
 
 from __future__ import annotations
@@ -44,7 +51,6 @@ EDITABLE_FIELDS: dict[str, str] = {
     "CONSISTENCY_MAX_PATCHES": "consistency_max_patches",
     "PARTIAL_OUTPUT": "partial_output",
     "RESUME": "resume",
-    "PDF_EXTRACTOR": "pdf_extractor",
 }
 
 #: Settings the UI only displays.
@@ -206,25 +212,146 @@ def plan_file(file_path: Path, *, tgt: str, max_tokens: int | None) -> dict[str,
     }
 
 
+def document_text(file_path: Path) -> dict[str, Any]:
+    """The document's extracted text, for the side-by-side source pane.
+
+    This is the very same extraction a run performs before chunking, so the
+    text a reader compares against is the text the translator actually saw —
+    not a second, subtly different reading of the PDF.
+    """
+    from polyglot_lc.ingest import load_document
+
+    if not file_path.is_file():
+        raise FileNotFoundError(f"input file not found: {file_path}")
+    doc = load_document(file_path)
+    text = doc.plain_text()
+    return {
+        "text": text,
+        "chars": len(text),
+        "blocks": len(doc.blocks),
+        "title": Path(str(doc.metadata.get("filename") or file_path.name)).name,
+    }
+
+
+#: How many traces a memory report samples. The bank is a vector store with no
+#: ordering guarantee, so a large one is reported as a sample of its total
+#: rather than pretending to list everything.
+MEMORY_SAMPLE = 500
+
+
+def memory_summary(sample: int = MEMORY_SAMPLE) -> dict[str, Any]:
+    """What the Reasoning Bank holds, read without ever touching it.
+
+    The bank's own store class *recreates* the collection when the embedding
+    dimension no longer matches; a read-only panel must never be able to do
+    that. So this opens the ChromaDB collection directly and only ever calls
+    ``get()``: no embedding is computed, nothing is written, and nothing can be
+    deleted — and a missing collection is reported as empty instead of being
+    created.
+    """
+    from polyglot_lc.config import get_app_config
+
+    path = Path(get_app_config().reasoning_bank_path)
+    empty = {"path": str(path), "total": 0, "sampled": 0, "pairs": []}
+    if not path.is_dir():
+        return empty
+    # Opening a ChromaDB client writes its sqlite file into the directory, so a
+    # bank that was never created is reported as empty *without* being opened.
+    # That is what keeps "read-only" literally true.
+    if not (path / "chroma.sqlite3").is_file():
+        return empty
+    import chromadb
+
+    client = chromadb.PersistentClient(path=str(path))
+    try:
+        collection = client.get_collection("reasoning_traces")
+    except Exception:  # noqa: BLE001 - absent collection is simply an empty bank
+        return empty
+
+    total = int(collection.count())
+    if not total:
+        return empty
+    got = collection.get(include=["metadatas", "documents"], limit=sample)
+    ids = got.get("ids") or []
+    metas = got.get("metadatas") or []
+    docs = got.get("documents") or []
+
+    buckets: dict[tuple[str, str], dict[str, Any]] = {}
+    for index in range(len(ids)):
+        meta = metas[index] if index < len(metas) and metas[index] else {}
+        pair = f"{meta.get('src_lang', '?')}-{meta.get('tgt_lang', '?')}"
+        domain = str(meta.get("domain") or "general")
+        bucket = buckets.setdefault(
+            (pair, domain),
+            {
+                "pair": pair,
+                "domain": domain,
+                "traces": 0,
+                "score_total": 0.0,
+                "recent": [],
+            },
+        )
+        score = float(meta.get("score") or 0.0)
+        bucket["traces"] += 1
+        bucket["score_total"] += score
+        strategy = str(docs[index] if index < len(docs) else "")[:300]
+        bucket["recent"].append(
+            {
+                "strategy": strategy,
+                "score": round(score, 3),
+                "ts": float(meta.get("ts") or 0.0),
+            }
+        )
+
+    pairs = []
+    for bucket in buckets.values():
+        bucket["recent"].sort(key=lambda row: row["ts"], reverse=True)
+        pairs.append(
+            {
+                "pair": bucket["pair"],
+                "domain": bucket["domain"],
+                "traces": bucket["traces"],
+                "mean_score": round(bucket["score_total"] / bucket["traces"], 3),
+                "recent": bucket["recent"][:5],
+            }
+        )
+    pairs.sort(key=lambda row: (-row["traces"], row["pair"], row["domain"]))
+    return {"path": str(path), "total": total, "sampled": len(ids), "pairs": pairs}
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         prog="webui-probe",
-        description="Report effective settings or a file's chunk plan as JSON.",
+        description="Report effective settings, a chunk plan, a document's text "
+        "or the reasoning bank as JSON.",
     )
     group = parser.add_mutually_exclusive_group(required=True)
     group.add_argument("--config", action="store_true", help="Print effective settings.")
     group.add_argument("--plan", metavar="FILE", help="Print a file's chunk plan.")
+    group.add_argument("--text", metavar="FILE", help="Print a document's text.")
+    group.add_argument(
+        "--memory", action="store_true", help="Print what the reasoning bank holds (read-only)."
+    )
     # --src is accepted for interface symmetry with the CLI; planning depends
     # only on the target language, because the tokenizer does not read the text.
     parser.add_argument("--src", default="auto", help="Source language (informational).")
     parser.add_argument("--tgt", default="vi", help="Target language.")
-    parser.add_argument("--max-tokens", type=int, dest="max_tokens", default=None,
-                        help="Chunk token budget (default: CHUNK_MAX_TOKENS).")
+    parser.add_argument(
+        "--max-tokens",
+        type=int,
+        dest="max_tokens",
+        default=None,
+        help="Chunk token budget (default: CHUNK_MAX_TOKENS).",
+    )
     args = parser.parse_args(argv)
 
     try:
         if args.config:
             payload = effective_config()
+        elif args.text:
+            payload = document_text(Path(args.text))
+        elif args.memory:
+            payload = memory_summary()
         else:
             payload = plan_file(Path(args.plan), tgt=args.tgt, max_tokens=args.max_tokens)
     except Exception as exc:  # noqa: BLE001 - the contract is JSON on stdout, a

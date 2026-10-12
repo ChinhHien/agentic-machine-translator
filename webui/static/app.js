@@ -1,605 +1,1748 @@
-/* polyglot-lc web UI.
+/* polyglot-lc web UI — one page, no framework, nothing fetched from a CDN.
  *
- * Everything here is built with `fetch` and `document.createElement` plus
- * `textContent`. Nothing from the server is ever interpolated into markup:
- * step names, document names and error text all come from the user's own
- * files and logs, so they are text, never HTML.
+ * Everything here is built with `fetch` and `document.createElement`, and every
+ * value from the server is written with `textContent`. Document names, step
+ * names and provider errors are text a user typed or a log produced; none of it
+ * is ever parsed as markup.
  *
- * Event shape (see polyglot_lc.ui.events.Event): {ts, step, chunk_id, status,
- * latency, error}. A step with a chunk_id belongs to one chunk and fills a
- * cell in the matrix; a step without one advances the stage rail.
+ * Event shape (polyglot_lc.ui.events.Event): {ts, step, chunk_id, status,
+ * latency, error}. Each step reports twice — `start`, then `ok`/`fail` — so the
+ * step rail keeps the strongest state it has seen for a step name rather than
+ * the last one.
+ *
+ * The page has no view of the server's configuration: it sends per-run
+ * preferences (languages, domain, glossary, chunk budget, output format) and
+ * nothing else. There is no settings screen and no key status, because the
+ * application does not know them.
+ *
+ * State attributes written here, and styled in app.css:
+ *   .job[data-state]  .job-row[data-state]  .badge[data-state]
+ *   .bar[data-state]  .step[data-state]     .pane[data-state]
+ *   .alert[data-kind] .drop[data-state]
  */
 "use strict";
 
 const POLL_MS = 700;
+const LIST_MS = 5000;
 const FINAL_STATUSES = ["done", "failed", "stopped"];
 
-/* Chunk cells never go "backwards": a later ok must not erase an earlier fail. */
-const CELL_RANK = { wait: 0, running: 1, ok: 2, patched: 3, retry: 4, fail: 5 };
-const CELL_WORDS = {
-  wait: "chờ",
-  running: "đang chạy",
-  ok: "xong",
-  patched: "đã vá thuật ngữ",
-  retry: "phải thử lại",
-  fail: "lỗi",
-};
 const STATUS_WORDS = {
-  running: "đang chạy",
+  empty: "chưa mở",
+  running: "đang dịch",
   done: "xong",
   failed: "lỗi",
   stopped: "đã dừng",
 };
 
-/* Every step reports twice — once when it starts, once when it ends — so the
- * row has to say which of the two it is, or the log reads as duplicates. */
-const EVENT_WORDS = {
-  start: "bắt đầu",
-  ok: "xong",
-  fail: "lỗi",
-  retry: "thử lại",
-  info: "ghi chú",
+/* A stage's state only ever moves up this ladder: a later `start` must not
+   erase the `fail` a step already reported. */
+const STEP_RANK = { wait: 0, running: 1, ok: 2, fail: 3 };
+
+/* Stage names are the pipeline's own (`ui.step("segment")`); the words are only
+   a courtesy. An unknown name is shown as it is. */
+const STEP_WORDS = {
+  ingest: "đọc tài liệu",
+  detect_lang: "nhận ngôn ngữ",
+  segment: "chia chunk",
+  glossary: "áp từ điển",
+  summary_tree: "tóm tắt",
+  plan: "lập kế hoạch",
+  analyse_chunks: "phân tích chunk",
+  translate: "dịch",
+  critic: "phản biện",
+  refine: "tinh chỉnh",
+  verify: "kiểm tra",
+  retranslate: "dịch lại",
+  save_trace: "lưu kinh nghiệm",
+  consistency: "nhất quán",
+  assemble_output: "ghép kết quả",
+  skillopt_update: "cập nhật skill",
+  run: "lượt chạy",
 };
+
+/* The pipeline's own closed set of error causes, in one word each. A cause the
+   pipeline adds later shows as its raw name rather than as a blank badge. */
+const CAUSE_WORDS = {
+  rate_limit: "hết hạn mức",
+  concurrency: "vượt song song",
+  timeout: "quá thời gian",
+  auth: "sai khoá",
+  provider: "lỗi nhà cung cấp",
+  parse: "phản hồi sai định dạng",
+  verify: "không đạt kiểm tra",
+  placeholder: "mất mốc mã",
+  config: "sai cấu hình",
+  input: "lỗi tài liệu",
+  unknown: "chưa rõ",
+};
+
+const FILTERS = [
+  ["all", "Tất cả"],
+  ["running", "Đang dịch"],
+  ["done", "Xong"],
+  ["failed", "Lỗi"],
+  ["stopped", "Đã dừng"],
+];
 
 const state = {
-  runId: null,
-  after: 0,
-  total: 0,
-  polling: false,
-  positions: new Map(), // chunk id -> cell index
-  used: [],
-  cells: [],
-  stages: new Map(), // stage step -> element
-  seenStages: [],
+  runs: [],
+  filter: "all",
+  open: null, // run_id
+  detail: null,
+  events: [], // every event seen for the open run, in order
+  seenStatus: null,
+  next: 0,
+  timer: null,
+  listTimer: null,
+  view: "split",
+  hadEvents: false,
+  panesFor: null, // run_id the pane states below belong to
+  source: "idle", // idle | loading | done | failed
+  target: "idle",
+  sourceText: "",
+  targetText: "",
+  sourceNote: "",
+  targetNote: "",
+  sourceMeta: "",
+  targetMeta: "",
+  selectedFile: "",
+  pendingOverwrite: "",
+  uploaded: "", // a file just written to input/, to select after reloading the list
 };
 
-const byId = (id) => document.getElementById(id);
+/* ------------------------------------------------------------------ helpers */
 
-/* ------------------------------------------------------------------ utils */
+function byId(id) {
+  return document.getElementById(id);
+}
 
-async function api(path, options) {
-  const response = await fetch(path, options);
-  let payload = null;
+function element(tag, className, content) {
+  const node = document.createElement(tag);
+  if (className) {
+    node.className = className;
+  }
+  if (content !== undefined) {
+    node.textContent = content;
+  }
+  return node;
+}
+
+function clear(node) {
+  while (node.firstChild) {
+    node.removeChild(node.firstChild);
+  }
+  return node;
+}
+
+function show(node, visible) {
+  node.hidden = !visible;
+  return node;
+}
+
+function setText(node, value) {
+  node.textContent = value === undefined || value === null ? "" : String(value);
+  return node;
+}
+
+function fill(node, values) {
+  clear(node);
+  for (const value of values) {
+    if (value !== undefined && value !== null && value !== "") {
+      node.append(value);
+    }
+  }
+  return node;
+}
+
+function formatSize(bytes) {
+  const value = Number(bytes) || 0;
+  if (value < 1024) {
+    return `${value} B`;
+  }
+  if (value < 1024 * 1024) {
+    return `${(value / 1024).toFixed(1)} kB`;
+  }
+  return `${(value / (1024 * 1024)).toFixed(1)} MB`;
+}
+
+function formatCount(value) {
+  return Number(value).toLocaleString("vi-VN");
+}
+
+function formatClock(seconds) {
+  const total = Math.max(0, Math.round(seconds));
+  const minutes = Math.floor(total / 60);
+  const rest = total % 60;
+  if (minutes < 60) {
+    return `${minutes}:${String(rest).padStart(2, "0")}`;
+  }
+  return `${Math.floor(minutes / 60)}:${String(minutes % 60).padStart(2, "0")}:${String(rest).padStart(2, "0")}`;
+}
+
+function formatTime(epochSeconds) {
+  const when = new Date((Number(epochSeconds) || 0) * 1000);
+  const now = new Date();
+  const minutes = (now.getTime() - when.getTime()) / 60000;
+  const clock = `${String(when.getHours()).padStart(2, "0")}:${String(when.getMinutes()).padStart(2, "0")}`;
+  if (minutes < 1) {
+    return "vừa xong";
+  }
+  if (minutes < 60) {
+    return `${Math.floor(minutes)} phút trước`;
+  }
+  if (when.toDateString() === now.toDateString()) {
+    return clock;
+  }
+  return `${when.getDate()}/${when.getMonth() + 1} ${clock}`;
+}
+
+function isFinal(status) {
+  return FINAL_STATUSES.indexOf(status) >= 0;
+}
+
+/* ---------------------------------------------------------------------- api */
+
+async function request(method, path, body) {
+  const init = { method: method };
+  if (body !== undefined) {
+    init.headers = { "Content-Type": "application/json" };
+    init.body = JSON.stringify(body);
+  }
+  let response;
   try {
-    payload = await response.json();
+    response = await fetch(path, init);
   } catch (error) {
-    payload = null;
+    throw new Error("không kết nối được máy chủ");
+  }
+  const raw = await response.text();
+  let payload = null;
+  if (raw) {
+    try {
+      payload = JSON.parse(raw);
+    } catch (error) {
+      payload = null;
+    }
   }
   if (!response.ok) {
-    const reason = (payload && payload.error) || response.statusText;
-    throw new Error(reason);
+    const message =
+      payload && payload.error
+        ? payload.error
+        : `máy chủ trả về ${response.status}`;
+    const failure = new Error(message);
+    failure.status = response.status;
+    throw failure;
   }
   return payload;
 }
 
+function api(path) {
+  return request("GET", path);
+}
+
 function post(path, body) {
-  return api(path, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(body || {}),
-  });
+  return request("POST", path, body === undefined ? {} : body);
 }
 
 function put(path, body) {
-  return api(path, {
-    method: "PUT",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(body || {}),
+  return request("PUT", path, body === undefined ? {} : body);
+}
+
+async function readText(path) {
+  const response = await fetch(path);
+  if (!response.ok) {
+    let message = `máy chủ trả về ${response.status}`;
+    try {
+      const payload = JSON.parse(await response.text());
+      if (payload && payload.error) {
+        message = payload.error;
+      }
+    } catch (error) {
+      message = `máy chủ trả về ${response.status}`;
+    }
+    const failure = new Error(message);
+    failure.status = response.status;
+    throw failure;
+  }
+  return response.text();
+}
+
+/* An upload with a progress bar, which `fetch` cannot report. */
+function sendFile(path, file, onProgress) {
+  return new Promise((resolve, reject) => {
+    const request = new XMLHttpRequest();
+    request.open("PUT", path, true);
+    request.setRequestHeader("Content-Type", "application/pdf");
+    request.upload.addEventListener("progress", (event) => {
+      if (onProgress && event.lengthComputable) {
+        onProgress(event.loaded / event.total);
+      }
+    });
+    request.addEventListener("load", () => {
+      let payload = null;
+      try {
+        payload = JSON.parse(request.responseText);
+      } catch (error) {
+        payload = null;
+      }
+      if (request.status >= 200 && request.status < 300) {
+        resolve(payload);
+        return;
+      }
+      const failure = new Error(
+        payload && payload.error
+          ? payload.error
+          : `máy chủ trả về ${request.status}`,
+      );
+      failure.status = request.status;
+      reject(failure);
+    });
+    request.addEventListener("error", () =>
+      reject(new Error("không tải lên được")),
+    );
+    request.send(file);
   });
 }
 
-function element(tag, className, text) {
-  const node = document.createElement(tag);
-  if (className) node.className = className;
-  if (text !== undefined && text !== null) node.textContent = String(text);
-  return node;
-}
+/* --------------------------------------------------------------- the banner */
 
-function clock(seconds) {
-  const when = seconds ? new Date(seconds * 1000) : new Date();
-  return when.toTimeString().slice(0, 8);
-}
-
-function duration(milliseconds) {
-  const ms = Number(milliseconds) || 0;
-  return ms >= 1000 ? `${(ms / 1000).toFixed(1)}s` : `${Math.round(ms)}ms`;
-}
-
-function bytes(size) {
-  const kb = Number(size) / 1024;
-  return kb >= 1024 ? `${(kb / 1024).toFixed(1)}MB` : `${Math.max(1, Math.round(kb))}KB`;
-}
-
-/* ----------------------------------------------------------------- banner */
-
-function renderBanner(payload) {
+function renderBanner(kind, message) {
   const banner = byId("banner");
-  if (!payload || !payload.text) {
-    banner.hidden = true;
-    banner.textContent = "";
+  if (!message) {
+    hideBanner();
     return;
   }
-  banner.className = "banner";
-  banner.dataset.kind = payload.kind || "warn";
-  banner.textContent = payload.text;
-  banner.hidden = false;
+  banner.dataset.kind = kind;
+  setText(banner, message);
+  show(banner, true);
 }
 
-/* ------------------------------------------------------------ stage rail */
-
-/** Stages are shown in the order the run reached them, not a guessed list:
- *  the pipeline's own step names are the only truth available here. */
-function stageFor(step) {
-  if (state.stages.has(step)) return state.stages.get(step);
-  const item = element("li", "stage", step);
-  item.dataset.state = "wait";
-  state.stages.set(step, item);
-  state.seenStages.push(step);
-  byId("stage-rail").append(item);
-  return item;
+function hideBanner() {
+  const banner = byId("banner");
+  show(banner, false);
+  setText(banner, "");
 }
 
-function renderStages(events) {
-  for (const event of events) {
-    if (event.chunk_id) continue;
-    const item = stageFor(event.step);
-    if (event.status === "fail") {
-      item.dataset.state = "fail";
-    } else if (event.status === "ok") {
-      item.dataset.state = "ok";
-    } else if (event.status === "start") {
-      item.dataset.state = "running";
-    }
-  }
-}
+/* ------------------------------------------------------------ the job list */
 
-/* ---------------------------------------------------------- chunk matrix */
-
-function positionFor(chunkId) {
-  if (state.positions.has(chunkId)) return state.positions.get(chunkId);
-  const match = /(\d+)\s*$/.exec(chunkId);
-  let index = match ? Number(match[1]) - 1 : -1;
-  if (index < 0 || index >= state.used.length || state.used[index]) {
-    index = state.used.indexOf(false);
-    if (index < 0) index = state.used.push(false) - 1;
-  }
-  state.used[index] = true;
-  state.positions.set(chunkId, index);
-  return index;
-}
-
-function cellAt(index) {
-  const matrix = byId("chunk-matrix");
-  while (state.cells.length <= index) {
-    const cell = element("span", "cell");
-    cell.dataset.state = "wait";
-    cell.dataset.index = String(state.cells.length + 1);
-    cell.setAttribute("role", "listitem");
-    cell.title = `chunk ${state.cells.length + 1}: chờ`;
-    state.cells.push(cell);
-    state.used.push(false);
-    matrix.append(cell);
-  }
-  return state.cells[index];
-}
-
-function setCell(index, next) {
-  const cell = cellAt(index);
-  const current = cell.dataset.state;
-  if (CELL_RANK[next] < CELL_RANK[current]) return;
-  cell.dataset.state = next;
-  const name = `chunk ${index + 1}: ${CELL_WORDS[next]}`;
-  cell.title = name;
-  cell.setAttribute("aria-label", name);
-}
-
-function renderChunks(events, total) {
-  state.total = Math.max(state.total, Number(total) || 0);
-  for (const event of events) {
-    if (!event.chunk_id) continue;
-    const index = positionFor(event.chunk_id);
-    if (event.status === "start") setCell(index, "running");
-    else if (event.status === "ok") setCell(index, "ok");
-    else if (event.status === "retry") setCell(index, "retry");
-    else if (event.status === "fail") setCell(index, "fail");
-    else if (event.status === "info") setCell(index, "patched");
-  }
-  const done = state.cells.filter((cell) => cell.dataset.state !== "wait").length;
-  const planned = Math.max(state.total, state.cells.length);
-  byId("chunk-summary").textContent = planned ? `${done}/${planned}` : "";
-}
-
-/* ---------------------------------------------------------------- events */
-
-function eventRow(event) {
-  const status = event.status || "info";
-  const row = element("li", "event");
-  row.dataset.status = status;
-  row.append(
-    element("span", "event-time", clock(event.ts)),
-    element("span", "event-state", EVENT_WORDS[status] || status),
-    element("span", "event-step", event.chunk_id ? `${event.step} ${event.chunk_id}` : event.step),
+/* The trash glyph is static markup, not server text, so it is built node by
+   node: the page never splices an HTML string (server-derived content must stay
+   plain text — a hard rule the web UI tests enforce). */
+function trashIcon() {
+  const NS = "http://www.w3.org/2000/svg";
+  const svg = document.createElementNS(NS, "svg");
+  svg.setAttribute("viewBox", "0 0 24 24");
+  svg.setAttribute("width", "14");
+  svg.setAttribute("height", "14");
+  svg.setAttribute("fill", "none");
+  svg.setAttribute("stroke", "currentColor");
+  svg.setAttribute("stroke-width", "2");
+  svg.setAttribute("stroke-linecap", "round");
+  svg.setAttribute("stroke-linejoin", "round");
+  svg.setAttribute("aria-hidden", "true");
+  const path = document.createElementNS(NS, "path");
+  path.setAttribute(
+    "d",
+    "M3 6h18M8 6V4a1 1 0 0 1 1-1h6a1 1 0 0 1 1 1v2M6 6l1 14a1 1 0 0 0 1 1h8a1 1 0 0 0 1-1l1-14M10 11v6M14 11v6",
   );
-  row.append(element("span", event.error ? "event-note" : "event-id", event.error || ""));
-  row.append(element("span", "event-latency", event.latency ? duration(event.latency) : ""));
-  return row;
+  svg.appendChild(path);
+  return svg;
 }
 
-function renderEvents(events) {
-  if (!events.length) return;
-  const list = byId("events");
-  for (const event of events) list.append(eventRow(event));
-  list.scrollTop = list.scrollHeight;
-}
-
-/* ------------------------------------------------------------------- runs */
-
-async function loadHistory() {
-  const data = await api("/api/runs");
-  const list = byId("run-list");
-  list.replaceChildren();
-  for (const run of data.runs) {
-    const item = element("li");
-    const button = element("button", "run");
+function renderJobs() {
+  const list = clear(byId("jobs"));
+  const rows = state.runs.filter(
+    (run) => state.filter === "all" || run.status === state.filter,
+  );
+  for (const run of rows) {
+    const item = element("li", "job-item");
+    const button = element("button", "job-row");
     button.type = "button";
     button.dataset.state = run.status;
-    if (run.run_id === state.runId) button.setAttribute("aria-current", "true");
-    button.append(
-      element("span", "run-time", clock(run.started)),
-      element("span", "run-name", run.file || run.run_id),
-      element("span", "run-meta", run.chunks ? String(run.chunks) : ""),
-    );
-    button.title = `${STATUS_WORDS[run.status] || run.status} · ${run.run_id}`;
-    button.addEventListener("click", () => selectRun(run.run_id));
+    if (run.run_id === state.open) {
+      button.setAttribute("aria-current", "true");
+    }
+    button.append(element("span", "job-row-name", run.file || run.run_id));
+    button.append(element("span", "job-row-time", formatTime(run.started)));
+    const sub = element("span", "job-row-sub");
+    sub.append(element("span", null, `${run.src || "?"} → ${run.tgt || "?"}`));
+    if (run.domain) {
+      sub.append(element("span", null, run.domain));
+    }
+    if (run.chunks) {
+      sub.append(element("span", null, `${formatCount(run.chunks)} chunk`));
+    }
+    sub.append(element("span", null, STATUS_WORDS[run.status] || run.status));
+    button.append(sub);
+    button.addEventListener("click", () => openJob(run.run_id));
     item.append(button);
+    /* Erasing a run's history is destructive, so it asks first and it is the
+       row's own action: a trash button that overlays the row's corner, hidden
+       until hover. A delete can't be undone, so the confirm stays. */
+    const del = element("button", "job-delete");
+    del.type = "button";
+    del.setAttribute("aria-label", `Xóa lượt dịch ${run.file || run.run_id}`);
+    del.appendChild(trashIcon());
+    del.addEventListener("click", () => deleteRun(run.run_id));
+    item.append(del);
+    list.append(item);
+  }
+
+  setText(
+    byId("jobs-count"),
+    `${formatCount(rows.length)} / ${formatCount(state.runs.length)}`,
+  );
+  const empty = byId("jobs-empty");
+  if (rows.length) {
+    show(empty, false);
+  } else {
+    setText(
+      empty,
+      state.runs.length
+        ? "Không có lượt nào ở trạng thái này."
+        : "Chưa có lượt dịch nào. Bấm “Dịch tài liệu mới” để bắt đầu.",
+    );
+    show(empty, true);
+  }
+}
+
+function renderFilters() {
+  const box = clear(byId("jobs-filter"));
+  for (const entry of FILTERS) {
+    const value = entry[0];
+    const count =
+      value === "all"
+        ? state.runs.length
+        : state.runs.filter((run) => run.status === value).length;
+    const button = element(
+      "button",
+      "chip",
+      `${entry[1]} ${formatCount(count)}`,
+    );
+    button.type = "button";
+    button.setAttribute(
+      "aria-pressed",
+      value === state.filter ? "true" : "false",
+    );
+    button.addEventListener("click", () => {
+      state.filter = value;
+      renderFilters();
+      renderJobs();
+    });
+    box.append(button);
+  }
+}
+
+async function loadRuns() {
+  clearTimeout(state.listTimer);
+  let payload;
+  try {
+    payload = await api("/api/runs");
+  } catch (error) {
+    renderBanner(
+      "error",
+      `Không đọc được danh sách lượt dịch: ${error.message}`,
+    );
+    return;
+  }
+  state.runs = payload.runs || [];
+  renderFilters();
+  renderJobs();
+  /* A finished run's status is only known from the list; when the open job's
+     own status has moved on, the detail view has to catch up too. */
+  if (state.open) {
+    const summary = state.runs.filter((run) => run.run_id === state.open)[0];
+    if (summary && state.detail && summary.status !== state.detail.run.status) {
+      await loadDetail(state.open);
+    }
+  }
+  if (state.runs.some((run) => run.status === "running")) {
+    state.listTimer = setTimeout(loadRuns, LIST_MS);
+  }
+}
+
+/* --------------------------------------------------------------- one job */
+
+function actionLink(route, label, extra) {
+  const link = element("a", "btn", label);
+  link.href = route;
+  if (extra) {
+    link.title = extra;
+  }
+  return link;
+}
+
+function renderActions(detail) {
+  const box = clear(byId("job-actions"));
+  const run = detail.run;
+  const base = `/api/runs/${encodeURIComponent(run.run_id)}`;
+  for (const artifact of detail.artifacts || []) {
+    const route = artifact.kind === "pdf" ? `${base}/pdf` : `${base}/output`;
+    const label = artifact.kind === "pdf" ? "Tải PDF" : "Tải Markdown";
+    const link = actionLink(
+      `${route}?download=1`,
+      `${label} (${formatSize(artifact.size)})`,
+      artifact.name,
+    );
+    link.setAttribute("download", "");
+    box.append(link);
+  }
+  if ((detail.artifacts || []).length > 1) {
+    const bundle = actionLink(`${base}/bundle`, "Tải tất cả (.zip)");
+    bundle.setAttribute("download", "");
+    box.append(bundle);
+  }
+  if (detail.pdf) {
+    const view = actionLink(`${base}/pdf`, "Mở bản PDF");
+    view.target = "_blank";
+    view.rel = "noreferrer";
+    box.append(view);
+  }
+  if (run.status === "running") {
+    const stop = element("button", "btn", "Dừng");
+    stop.type = "button";
+    stop.addEventListener("click", () => stopRun(run.run_id));
+    box.append(stop);
+  }
+  if (run.status === "failed" || run.status === "stopped") {
+    const resume = element("button", "btn", "Tiếp tục");
+    resume.type = "button";
+    resume.addEventListener("click", () => resumeRun(run.run_id));
+    box.append(resume);
+  }
+  if (!box.childElementCount) {
+    box.append(
+      element(
+        "p",
+        "note",
+        run.status === "running"
+          ? "Bản dịch sẽ xuất hiện ở đây khi lượt dịch xong."
+          : "Lượt dịch này không viết ra file nào.",
+      ),
+    );
+  }
+}
+
+function renderJob(detail) {
+  const run = detail.run;
+  const job = byId("job");
+  job.dataset.state = run.status;
+  setText(byId("job-title"), run.file || run.run_id);
+  const meta = clear(byId("job-meta"));
+  const tags = [`${run.src || "?"} → ${run.tgt || "?"}`];
+  if (run.domain) {
+    tags.push(run.domain);
+  }
+  if (run.chunks) {
+    tags.push(`${formatCount(run.chunks)} chunk`);
+  }
+  tags.push(formatTime(run.started));
+  if (isFinal(run.status)) {
+    tags.push(
+      run.exit_code === 0 || run.exit_code === null
+        ? STATUS_WORDS[run.status]
+        : `mã thoát ${run.exit_code}`,
+    );
+  }
+  for (const tag of tags) {
+    meta.append(element("span", "tag", tag));
+  }
+  const badge = show(byId("job-status"), true);
+  badge.dataset.state = run.status;
+  setText(badge, STATUS_WORDS[run.status] || run.status);
+  renderActions(detail);
+  if (run.note) {
+    const alert = byId("job-alert");
+    alert.dataset.kind = run.status === "failed" ? "error" : "warn";
+    setText(alert, run.note);
+    show(alert, true);
+  } else {
+    show(byId("job-alert"), false);
+  }
+}
+
+function renderEmptyJob() {
+  const job = byId("job");
+  job.dataset.state = "empty";
+  setText(byId("job-title"), "Chưa mở lượt dịch nào");
+  setText(
+    byId("job-meta"),
+    "Chọn một lượt ở cột bên trái, hoặc bắt đầu một lượt mới.",
+  );
+  /* No job open means no state to name: an empty badge is a blob, not a word. */
+  const badge = show(byId("job-status"), false);
+  badge.dataset.state = "empty";
+  setText(badge, "");
+  clear(byId("job-actions"));
+  show(byId("job-alert"), false);
+  show(byId("progress"), false);
+  show(byId("problems"), false);
+  paintPane(
+    "pane-source",
+    "source-text",
+    "source-note",
+    "source-meta",
+    "empty",
+    "Bản gốc của lượt dịch sẽ hiện ở đây.",
+    "",
+    "",
+  );
+  paintPane(
+    "pane-target",
+    "target-text",
+    "target-note",
+    "target-meta",
+    "empty",
+    "Bản dịch sẽ hiện ở đây.",
+    "",
+    "",
+  );
+}
+
+/* --------------------------------------------------------------- progress */
+
+function stepStateFor(status) {
+  if (status === "start") {
+    return "running";
+  }
+  if (status === "ok" || status === "patched") {
+    return "ok";
+  }
+  if (status === "fail") {
+    return "fail";
+  }
+  if (status === "retry") {
+    return "running";
+  }
+  return ""; // `info` says something; it does not advance a step
+}
+
+function stepStates(events) {
+  const order = [];
+  const seen = new Map();
+  for (const event of events) {
+    const name = String(event.step || "");
+    if (!name) {
+      continue;
+    }
+    if (!seen.has(name)) {
+      seen.set(name, "wait");
+      order.push(name);
+    }
+    const mapped = stepStateFor(event.status);
+    if (mapped && STEP_RANK[mapped] > STEP_RANK[seen.get(name)]) {
+      seen.set(name, mapped);
+    }
+  }
+  return order.map((name) => [name, seen.get(name)]);
+}
+
+function renderSteps(events) {
+  const list = clear(byId("steps"));
+  for (const entry of stepStates(events)) {
+    const name = entry[0];
+    const item = element("li", "step", STEP_WORDS[name] || name);
+    item.dataset.state = entry[1];
+    item.title = name;
     list.append(item);
   }
 }
 
-function newRunPanes(runId, total) {
-  state.runId = runId;
-  state.after = 0;
-  state.total = Number(total) || 0;
-  state.positions = new Map();
-  state.used = [];
-  state.cells = [];
-  state.stages = new Map();
-  state.seenStages = [];
-  byId("stage-rail").replaceChildren();
-  byId("chunk-matrix").replaceChildren();
-  byId("events").replaceChildren();
-  byId("chunk-summary").textContent = "";
-  byId("stop-button").disabled = false;
-  byId("run-hint").textContent = `Lượt chạy ${runId} đang chạy.`;
-  renderBanner(null);
+/* A chunk is finished once anything about it reached a terminal state, whether
+   that was `ok` or `fail`: a failed chunk is not going to be retried by a later
+   poll, so counting it as unfinished would freeze the bar forever. */
+function chunksDone(events) {
+  const done = new Set();
+  for (const event of events) {
+    if (!event.chunk_id) {
+      continue;
+    }
+    if (
+      event.status === "ok" ||
+      event.status === "fail" ||
+      event.status === "patched"
+    ) {
+      done.add(String(event.chunk_id));
+    }
+  }
+  return done.size;
 }
 
-async function selectRun(runId) {
-  state.polling = false; // a new selection takes over the single poll loop
-  const detail = await api(`/api/runs/${encodeURIComponent(runId)}`);
+function renderProgress(detail) {
   const run = detail.run;
-  state.runId = runId;
-  state.after = 0;
-  state.total = run.chunks;
-  state.positions = new Map();
-  state.used = [];
-  state.cells = [];
-  state.stages = new Map();
-  byId("stage-rail").replaceChildren();
-  byId("chunk-matrix").replaceChildren();
-  byId("events").replaceChildren();
+  const box = byId("progress");
+  show(box, true);
 
-  await showOutput(runId);
-  const data = await api(`/api/runs/${encodeURIComponent(runId)}/events?after=0`);
-  renderStages(data.events);
-  renderChunks(data.events, run.chunks);
-  renderEvents(data.events);
-  state.after = data.next;
-  byId("run-hint").textContent =
-    `Lượt chạy ${runId}: ${STATUS_WORDS[data.status] || data.status}`;
-  byId("stop-button").disabled = data.status !== "running";
-  announceEvents(data);
-  if (data.status === "running") {
-    state.polling = true;
-    setTimeout(() => pollRun(runId), POLL_MS);
+  const bar = byId("bar");
+  const fill = byId("bar-fill");
+  const total = Number(run.chunks) || 0;
+  const done = chunksDone(state.events);
+  const percent = total ? Math.min(100, Math.round((done / total) * 100)) : 0;
+  /* `stopped` is not a failure, so its bar keeps the unfinished look and the
+     text says what happened; `running` is the only state still moving. */
+  const barState =
+    run.status === "running"
+      ? "running"
+      : run.status === "done"
+        ? "ok"
+        : run.status === "failed"
+          ? "fail"
+          : "wait";
+  bar.dataset.state = barState;
+  fill.style.width = `${run.status === "done" ? 100 : percent}%`;
+  bar.setAttribute(
+    "aria-valuenow",
+    String(run.status === "done" ? 100 : percent),
+  );
+
+  setText(
+    byId("progress-count"),
+    total
+      ? `${formatCount(done)} / ${formatCount(total)} chunk`
+      : `${formatCount(state.events.length)} sự kiện`,
+  );
+
+  const last = state.events.length
+    ? state.events[state.events.length - 1]
+    : null;
+  const until =
+    run.status === "running"
+      ? Date.now() / 1000
+      : last && last.ts
+        ? Number(last.ts)
+        : null;
+  setText(
+    byId("progress-elapsed"),
+    until && run.started ? `đã chạy ${formatClock(until - run.started)}` : "",
+  );
+
+  setText(byId("progress-step"), progressWord(run, last));
+  renderRoutes(detail);
+  renderSteps(state.events);
+}
+
+/* The route mix, which is the answer to "why did this run cost so much": the
+   server tallies it from the decisions the pipeline recorded. */
+function renderRoutes(detail) {
+  const routes = detail.routes || {};
+  const total =
+    (routes.fast || 0) + (routes.standard || 0) + (routes.deep || 0);
+  setText(
+    byId("progress-routes"),
+    total
+      ? `Đường đi: nhanh ${formatCount(routes.fast || 0)}` +
+          ` · chuẩn ${formatCount(routes.standard || 0)}` +
+          ` · sâu ${formatCount(routes.deep || 0)}`
+      : "",
+  );
+}
+
+function progressWord(run, last) {
+  if (run.status === "running") {
+    const step = last ? String(last.step || "") : "";
+    return step ? `Đang chạy: ${STEP_WORDS[step] || step}` : "Đang chuẩn bị…";
+  }
+  if (run.status === "done") {
+    return "Đã dịch xong.";
+  }
+  if (run.status === "failed") {
+    return run.exit_code === null || run.exit_code === undefined
+      ? "Lượt dịch đã lỗi."
+      : `Lượt dịch đã lỗi (mã thoát ${run.exit_code}).`;
+  }
+  if (run.status === "stopped") {
+    return "Đã dừng theo yêu cầu.";
+  }
+  return "";
+}
+
+/* The server only reports problems once per detail load; the page keeps its
+   own copy from the events already polled, so a failing run shows its Vấn đề
+   as they happen — the same feed that fills the progress bar. */
+function problemsFromEvents(events) {
+  const seen = new Map();
+  for (const event of events) {
+    const status = String(event.status || "");
+    if (status !== "fail" && status !== "retry") {
+      continue;
+    }
+    const step = String(event.step || "");
+    const chunk = String(event.chunk_id || "");
+    const key = `${step}::${chunk}`;
+    const message = String(event.error || event.message || "");
+    const existing = seen.get(key);
+    if (!existing) {
+      seen.set(key, {
+        step: step,
+        chunk_id: chunk,
+        cause: String(event.cause || ""),
+        message: message,
+      });
+    } else if (!existing.message && message) {
+      existing.message = message;
+    }
+  }
+  return Array.from(seen.values());
+}
+
+function renderProblems() {
+  const card = byId("problems");
+  const list = clear(byId("problems-list"));
+  const byKey = new Map();
+  for (const problem of problemsFromEvents(state.events)) {
+    byKey.set(`${problem.step}::${problem.chunk_id}`, problem);
+  }
+  /* Server-side problems the event feed does not carry — chiefly the child's
+     own message after a run dies before writing any event. */
+  for (const problem of (state.detail && state.detail.problems) || []) {
+    const key = `${problem.step}::${problem.chunk_id}`;
+    if (!byKey.has(key)) {
+      byKey.set(key, problem);
+    }
+  }
+  for (const problem of byKey.values()) {
+    const row = element("li", "problem");
+    const where = problem.chunk_id
+      ? `${problem.step} · ${problem.chunk_id}`
+      : problem.step;
+    row.append(element("span", "problem-where", where));
+    if (problem.cause) {
+      row.append(
+        element(
+          "span",
+          "problem-cause",
+          CAUSE_WORDS[problem.cause] || problem.cause,
+        ),
+      );
+    }
+    row.append(
+      element("span", "problem-text", problem.message || "(không có mô tả)"),
+    );
+    list.append(row);
+  }
+  show(card, byKey.size > 0);
+}
+
+/* ------------------------------------------------------------------ panes */
+
+function paintPane(
+  paneId,
+  textId,
+  noteId,
+  metaId,
+  paneState,
+  note,
+  body,
+  meta,
+) {
+  byId(paneId).dataset.state = paneState;
+  setText(byId(noteId), note);
+  setText(byId(textId), body);
+  setText(byId(metaId), meta);
+}
+
+function renderPanes() {
+  const detail = state.detail;
+  if (!detail) {
+    return;
+  }
+  const run = detail.run;
+  const base = `/api/runs/${encodeURIComponent(run.run_id)}`;
+  const source = { state: state.source, note: "", body: "", meta: "" };
+  if (state.source === "idle" || state.source === "loading") {
+    source.state = "loading";
+    source.note = "Đang đọc bản gốc…";
+  } else if (state.source === "failed") {
+    source.state = "failed";
+    source.note = state.sourceNote || "Không đọc được bản gốc.";
+  } else {
+    source.state = "done";
+    source.body = state.sourceText || "";
+    source.meta = state.sourceMeta || "";
+  }
+  paintPane(
+    "pane-source",
+    "source-text",
+    "source-note",
+    "source-meta",
+    source.state,
+    source.note,
+    source.body,
+    source.meta,
+  );
+
+  const target = { state: "empty", note: "", body: "", meta: "" };
+  if (!detail.md) {
+    if (run.status === "running") {
+      target.note = "Bản dịch sẽ hiện ở đây khi lượt dịch xong.";
+    } else if (run.status === "failed") {
+      target.state = "failed";
+      target.note = "Lượt dịch đã lỗi trước khi viết ra bản dịch.";
+    } else if (run.status === "stopped") {
+      /* Stopping is not failing: the pane is simply still empty, and says how
+         it got that way. A red border here would claim a fault that did not
+         happen. */
+      target.note =
+        "Lượt dịch đã dừng trước khi viết ra bản dịch — bấm “Tiếp tục” để dịch nốt.";
+    } else {
+      target.note = "Lượt dịch chưa có bản dịch.";
+    }
+  } else if (state.target === "idle" || state.target === "loading") {
+    target.state = "loading";
+    target.note = "Đang đọc bản dịch…";
+  } else if (state.target === "failed") {
+    target.state = "failed";
+    target.note = state.targetNote || "Không đọc được bản dịch.";
+  } else {
+    target.state = "done";
+    const written = (detail.artifacts || []).filter(
+      (item) => item.kind === "md",
+    )[0];
+    /* The artefact's own name, never the path it happens to live at: where the
+       repository keeps its files is not something a reader needs. */
+    const name = written ? written.name : detail.md_path.split(/[\\/]/).pop();
+    target.note = `File ${name} — hiển thị nguyên văn.`;
+    target.body = state.targetText || "";
+    target.meta = state.targetMeta || "";
+  }
+  paintPane(
+    "pane-target",
+    "target-text",
+    "target-note",
+    "target-meta",
+    target.state,
+    target.note,
+    target.body,
+    target.meta,
+  );
+
+  /* The panes are only read while they are visible; the source costs a whole
+     extraction on the server the first time, so it waits until it is shown. */
+  if (state.view !== "target" && state.source === "idle") {
+    loadSource(base);
+  }
+  if (state.target === "idle" && detail.md) {
+    loadTarget(base);
   }
 }
 
-async function showOutput(runId) {
+async function loadSource(base) {
+  state.source = "loading";
+  renderPanes();
   try {
-    const response = await fetch(`/api/runs/${encodeURIComponent(runId)}/output`);
-    const proof = byId("proof");
-    if (!response.ok) {
-      proof.dataset.state = "empty";
-      proof.textContent = "Lượt chạy này chưa có file kết quả.";
-      byId("proof-path").textContent = "";
+    const payload = await api(`${base}/source`);
+    if (state.panesFor !== currentRunId()) {
       return;
     }
-    proof.dataset.state = "done";
-    proof.textContent = await response.text();
-    const detail = await api(`/api/runs/${encodeURIComponent(runId)}`);
-    byId("proof-path").textContent = detail.run.output_path || "";
+    state.sourceText = payload.text || "";
+    state.sourceMeta = `${formatCount(payload.chars || 0)} ký tự · ${formatCount(payload.blocks || 0)} blocks`;
+    state.source = "done";
   } catch (error) {
-    renderBanner({ kind: "error", text: `Không đọc được kết quả: ${error.message}` });
+    if (state.panesFor !== currentRunId()) {
+      return;
+    }
+    state.source = "failed";
+    state.sourceNote = `Không đọc được bản gốc: ${error.message}`;
   }
+  renderPanes();
 }
 
-/** Tell the user when a run has no event log at all, instead of showing an
- *  empty list that looks like the run is doing nothing. */
-function announceEvents(data) {
-  if (data.has_events === false) {
-    renderBanner({
-      kind: "warn",
-      text: "Lượt chạy này không ghi file sự kiện, nên không có tiến độ để hiện. "
-        + "Bật LOG_JSONL=1 trong .env rồi chạy lại để theo dõi từng chunk.",
-    });
-  } else if (data.malformed) {
-    renderBanner({
-      kind: "warn",
-      text: `File log có ${data.malformed} dòng hỏng; các dòng còn lại vẫn được hiển thị.`,
-    });
-  } else {
-    renderBanner(null);
+async function loadTarget(base) {
+  state.target = "loading";
+  renderPanes();
+  try {
+    const body = await readText(`${base}/output`);
+    if (state.panesFor !== currentRunId()) {
+      return;
+    }
+    state.targetText = body;
+    const words = body.trim() ? body.trim().split(/\s+/).length : 0;
+    state.targetMeta = `${formatCount(words)} từ`;
+    state.target = "done";
+  } catch (error) {
+    if (state.panesFor !== currentRunId()) {
+      return;
+    }
+    state.target = "failed";
+    state.targetNote = `Không đọc được bản dịch: ${error.message}`;
+  }
+  renderPanes();
+}
+
+function currentRunId() {
+  return state.open;
+}
+
+function renderView() {
+  byId("panes").dataset.view = state.view;
+  const buttons = [
+    ["view-split", "split"],
+    ["view-source", "source"],
+    ["view-target", "target"],
+  ];
+  for (const entry of buttons) {
+    byId(entry[0]).setAttribute(
+      "aria-pressed",
+      entry[1] === state.view ? "true" : "false",
+    );
+  }
+  renderPanes();
+}
+
+/* ----------------------------------------------------------------- polling */
+
+async function loadDetail(runId) {
+  const detail = await api(`/api/runs/${encodeURIComponent(runId)}`);
+  if (state.open !== runId) {
+    return;
+  }
+  state.detail = detail;
+  renderJob(detail);
+  renderProgress(detail);
+  renderProblems();
+  renderPanes();
+  renderJobs();
+}
+
+async function openJob(runId) {
+  clearTimeout(state.timer);
+  clearTimeout(state.listTimer);
+  hideBanner();
+  if (state.open !== runId) {
+    state.open = runId;
+    state.detail = null;
+    state.events = [];
+    state.next = 0;
+    state.seenStatus = null;
+    state.hadEvents = false;
+    state.panesFor = runId;
+    state.source = "idle";
+    state.target = "idle";
+    state.sourceText = "";
+    state.targetText = "";
+    state.sourceNote = "";
+    state.targetNote = "";
+  }
+  renderJobs();
+  try {
+    await loadDetail(runId);
+  } catch (error) {
+    renderBanner("error", `Không mở được lượt dịch: ${error.message}`);
+    return;
+  }
+  const run = state.detail.run;
+  state.seenStatus = run.status;
+  if (!isFinal(run.status)) {
+    pollRun(runId);
+  } else if (!state.events.length) {
+    /* A run that died before its first event has nothing to replay; its own
+       output is the only explanation, and the server already put it in
+       `problems`. */
+    pollRun(runId);
   }
 }
 
 async function pollRun(runId) {
-  if (state.runId !== runId) return; // the user moved on
+  clearTimeout(state.timer);
+  let payload;
   try {
-    const data = await api(`/api/runs/${encodeURIComponent(runId)}/events?after=${state.after}`);
-    state.after = data.next;
-    renderStages(data.events);
-    renderChunks(data.events, state.total);
-    renderEvents(data.events);
-    announceEvents(data);
-    if (FINAL_STATUSES.includes(data.status)) {
-      state.polling = false;
-      byId("stop-button").disabled = true;
-      byId("run-hint").textContent =
-        `Lượt chạy ${runId}: ${STATUS_WORDS[data.status] || data.status}`;
-      await showOutput(runId);
-      await loadHistory();
-      if (data.status === "failed") {
-        renderBanner({ kind: "error", text: "Lượt chạy kết thúc với lỗi. Xem dòng sự kiện màu đỏ." });
-      }
-      return;
-    }
-    setTimeout(() => pollRun(runId), POLL_MS);
+    payload = await api(
+      `/api/runs/${encodeURIComponent(runId)}/events?after=${state.next}`,
+    );
   } catch (error) {
-    state.polling = false;
-    renderBanner({ kind: "error", text: `Mất liên lạc với lượt chạy: ${error.message}` });
+    if (state.open === runId) {
+      renderBanner("error", `Không theo dõi được lượt dịch: ${error.message}`);
+    }
+    return;
+  }
+  if (state.open !== runId) {
+    return; // the reader moved to another run
+  }
+  state.next = Number(payload.next) || state.next;
+  if (payload.events && payload.events.length) {
+    state.events = state.events.concat(payload.events);
+    renderProblems(); // Vấn đề cập nhật ngay trong lúc dịch, cùng nguồn với thanh tiến độ
+  }
+
+  const changed = payload.status !== state.seenStatus;
+  state.seenStatus = payload.status;
+  /* The first poll of a healthy run usually beats the child's own log, so the
+     record briefly carries a note saying the run reports no progress. When the
+     log appears that note is taken back on the server, and the only thing left
+     holding the stale copy is this page: one refresh drops it. */
+  const appeared = Boolean(payload.has_events) && !state.hadEvents;
+  state.hadEvents = Boolean(payload.has_events);
+  if (state.detail) {
+    state.detail.run.status = payload.status;
+    state.detail.run.exit_code = payload.exit_code;
+    renderProgress(state.detail);
+    if (changed || appeared) {
+      if (changed && isFinal(payload.status)) {
+        state.target = "idle"; // a new result may have appeared
+      }
+      await loadDetail(runId);
+    }
+  }
+
+  if (payload.malformed) {
+    renderBanner(
+      "warn",
+      `${formatCount(payload.malformed)} dòng trong log lượt dịch chưa đọc được; sẽ thử lại ở lần cập nhật sau.`,
+    );
+  } else if (!payload.has_events && isFinal(payload.status)) {
+    /* A run still starting has simply not opened its log yet; only one that has
+       already ended without ever writing one has something to explain. */
+    renderBanner(
+      "warn",
+      "Lượt dịch đã kết thúc mà không ghi file sự kiện, nên không có tiến độ để đối chiếu.",
+    );
+  } else if (changed) {
+    hideBanner();
+  }
+
+  if (!isFinal(payload.status)) {
+    state.timer = setTimeout(() => pollRun(runId), POLL_MS);
+    return;
+  }
+  await loadRuns();
+}
+
+/* Stopping takes effect at once, with no confirmation: the chunks that already
+   finished stay in the run's checkpoints, so the work is not lost and the
+   `Tiếp tục` button next to this one is the way back. A modal in front of a
+   reversible action only teaches people to click through modals. */
+async function stopRun(runId) {
+  try {
+    await post(`/api/runs/${encodeURIComponent(runId)}/stop`);
+  } catch (error) {
+    renderBanner("error", `Không dừng được lượt dịch: ${error.message}`);
+    return;
+  }
+  await loadRuns();
+  await loadDetail(runId);
+}
+
+/* The delete's guard, drawn in the app's own <dialog> rather than the browser's
+   native confirm. Resolves true only when the reader explicitly chooses "Xóa";
+   "Hủy", Escape, or the backdrop all resolve false — the same as cancelling. */
+function confirmDelete() {
+  const dlg = byId("confirm-delete");
+  if (typeof dlg.showModal !== "function") {
+    return Promise.resolve(false); // no modal support: never delete on a guess
+  }
+  return new Promise((resolve) => {
+    const onClosed = () => {
+      dlg.removeEventListener("close", onClosed);
+      resolve(dlg.returnValue === "delete");
+    };
+    dlg.addEventListener("close", onClosed);
+    dlg.showModal();
+  });
+}
+
+async function deleteRun(runId) {
+  if (!(await confirmDelete())) {
+    return;
+  }
+  try {
+    await request("DELETE", `/api/runs/${encodeURIComponent(runId)}`);
+  } catch (error) {
+    renderBanner("error", `Không xóa được lượt dịch: ${error.message}`);
+    return;
+  }
+  /* The deleted run can no longer be watched or read, so the view returns to
+     the empty state — and its timers must not keep polling a 404. */
+  clearTimeout(state.timer);
+  clearTimeout(state.listTimer);
+  if (state.open === runId) {
+    state.open = null;
+    state.detail = null;
+    state.events = [];
+    state.next = 0;
+    state.seenStatus = null;
+    state.hadEvents = false;
+    state.panesFor = null;
+    state.source = "idle";
+    state.target = "idle";
+    state.sourceText = "";
+    state.targetText = "";
+    state.sourceNote = "";
+    state.targetNote = "";
+    renderEmptyJob();
+  }
+  hideBanner();
+  await loadRuns();
+}
+
+/* The format a resumed run should write is inferred from what it already has:
+   a run that produced both files asked for both, one with only a PDF asked for
+   the PDF. The record does not carry the choice, and re-writing Markdown a
+   reader did not ask for would be worse than asking for it twice. */
+function resumeFormat(detail) {
+  const kinds = (detail.artifacts || []).map((artifact) => artifact.kind);
+  if (kinds.indexOf("md") >= 0 && kinds.indexOf("pdf") >= 0) {
+    return "both";
+  }
+  return kinds.indexOf("pdf") >= 0 ? "pdf" : "md";
+}
+
+async function resumeRun(runId) {
+  const detail =
+    state.detail && state.detail.run.run_id === runId ? state.detail : null;
+  const run = detail
+    ? detail.run
+    : state.runs.filter((row) => row.run_id === runId)[0];
+  if (!run) {
+    renderBanner("error", "Không tìm thấy lượt dịch để tiếp tục.");
+    return;
+  }
+  let created;
+  try {
+    created = await post("/api/runs", {
+      file: run.file,
+      src: run.src || "auto",
+      tgt: run.tgt || "vi",
+      domain: run.domain || "general",
+      format: detail ? resumeFormat(detail) : "md",
+      resume: true,
+    });
+  } catch (error) {
+    renderBanner("error", `Không tiếp tục được lượt dịch: ${error.message}`);
+    return;
+  }
+  /* Resuming starts a fresh run — the id changes — so the page follows it
+     rather than staying on the run it was resumed from. */
+  await loadRuns();
+  if (created && created.run_id) {
+    await openJob(created.run_id);
   }
 }
 
-async function startRun() {
-  const file = byId("file").value;
+/* ------------------------------------------------------------ a new job */
+
+function openNewJobDialog() {
+  const dialog = byId("new-job");
+  show(byId("new-job-alert"), false);
+  setText(byId("new-job-alert"), "");
+  byId("drop").dataset.state = "idle";
+  setText(byId("upload-note"), "");
+  show(byId("upload-bar"), false);
+  state.pendingOverwrite = "";
+  loadInputs();
+  loadGlossaries();
+  if (typeof dialog.showModal === "function") {
+    dialog.showModal();
+  } else {
+    dialog.setAttribute("open", "");
+  }
+}
+
+function closeNewJobDialog() {
+  const dialog = byId("new-job");
+  if (typeof dialog.close === "function") {
+    dialog.close();
+  } else {
+    dialog.removeAttribute("open");
+  }
+}
+
+function formAlert(message, kind) {
+  const alert = byId("new-job-alert");
+  if (!message) {
+    show(alert, false);
+    return;
+  }
+  alert.dataset.kind = kind || "error";
+  setText(alert, message);
+  show(alert, true);
+}
+
+async function loadInputs() {
+  let payload;
+  try {
+    payload = await api("/api/inputs");
+  } catch (error) {
+    formAlert(`Không đọc được thư mục input/: ${error.message}`, "error");
+    return;
+  }
+  const library = clear(byId("library"));
+  const files = payload.files || [];
+  if (!files.length) {
+    library.append(
+      element(
+        "p",
+        "note",
+        "input/ chưa có file PDF nào — hãy kéo thả một file vào ô phía trên.",
+      ),
+    );
+    return;
+  }
+  for (const file of files) {
+    const row = element("label", "lib-row");
+    const radio = element("input");
+    radio.type = "radio";
+    radio.name = "lib-file";
+    radio.value = file.name;
+    radio.checked = file.name === state.selectedFile;
+    radio.addEventListener("change", () => selectFile(file.name));
+    row.append(radio);
+    row.append(element("span", "lib-name", file.name));
+    row.append(
+      element(
+        "span",
+        "lib-meta",
+        `${formatSize(file.size)} · ${formatTime(file.mtime)}`,
+      ),
+    );
+    library.append(row);
+  }
+  if (!state.selectedFile && files.length === 1) {
+    selectFile(files[0].name);
+  }
+  setText(byId("new-job-start"), "Bắt đầu dịch");
+}
+
+function selectFile(name) {
+  state.selectedFile = name;
+  const radios = byId("library").querySelectorAll("input[type=radio]");
+  for (const radio of radios) {
+    radio.checked = radio.value === name;
+  }
+  byId("new-job-start").disabled = !name;
+  byId("new-job-start").textContent = "Bắt đầu dịch";
+}
+
+function dropMessage(state_, text) {
+  const drop = byId("drop");
+  drop.dataset.state = state_;
+  setText(byId("upload-note"), text);
+}
+
+async function uploadFile(file, overwrite) {
+  const name = String((file && file.name) || "").trim();
+  if (!name) {
+    return;
+  }
+  if (!/\.pdf$/i.test(name)) {
+    dropMessage("bad", "Chỉ nhận file .pdf — file khác không dịch được.");
+    return;
+  }
+  dropMessage("busy", `Đang tải ${name}…`);
+  show(byId("upload-bar"), true);
+  byId("upload-bar").dataset.state = "running";
+  byId("upload-fill").style.width = "0%";
+  const route = `/api/inputs/${encodeURIComponent(name)}${overwrite ? "?overwrite=1" : ""}`;
+  try {
+    await sendFile(route, file, (ratio) => {
+      byId("upload-fill").style.width = `${Math.round(ratio * 100)}%`;
+    });
+    /* Overwriting is confirmed, never assumed: the launcher must not silently
+       replace a document the reader already has. */
+    state.pendingOverwrite = "";
+    state.uploaded = name;
+    state.selectedFile = name;
+    byId("upload-bar").dataset.state = "ok";
+    byId("upload-fill").style.width = "100%";
+    dropMessage("idle", `Đã tải ${name} vào input/.`);
+    await loadInputs();
+    selectFile(name);
+  } catch (error) {
+    byId("upload-bar").dataset.state = "fail";
+    if (error.status === 409) {
+      state.pendingOverwrite = name;
+      dropMessage(
+        "bad",
+        `${name} đã có trong input/ — bấm lại (hoặc kéo lại) để ghi đè.`,
+      );
+      return;
+    }
+    dropMessage("bad", `Không tải lên được: ${error.message}`);
+  }
+}
+
+function handleDropped(file) {
   if (!file) {
-    renderBanner({ kind: "error", text: "Chọn một tài liệu trong input/ trước đã." });
+    return;
+  }
+  uploadFile(file, state.pendingOverwrite === file.name);
+}
+
+async function startRun(event) {
+  if (event) {
+    event.preventDefault();
+  }
+  const file = state.selectedFile || state.uploaded;
+  if (!file) {
+    formAlert(
+      "Hãy chọn một file PDF trong input/ hoặc kéo thả một file mới.",
+      "warn",
+    );
     return;
   }
   const tokens = byId("max-tokens").value.trim();
-  byId("run-button").disabled = true;
+  let maxTokens = null;
+  if (tokens) {
+    maxTokens = Number.parseInt(tokens, 10);
+    if (!Number.isFinite(maxTokens)) {
+      formAlert("Token mỗi chunk phải là một số nguyên.", "warn");
+      return;
+    }
+  }
+  const format = byId("format-pdf").checked
+    ? "pdf"
+    : byId("format-both").checked
+      ? "both"
+      : "md";
+  const body = {
+    file: file,
+    src: byId("src").value.trim() || "auto",
+    tgt: byId("tgt").value.trim() || "vi",
+    domain: byId("domain").value.trim() || "general",
+    glossary: byId("glossary").value || null,
+    max_tokens: maxTokens,
+    format: format,
+  };
+  const button = byId("new-job-start");
+  button.disabled = true;
+  button.textContent = "Đang chuẩn bị…";
+  formAlert("Đang đọc tài liệu và lập kế hoạch…", "ok");
   try {
-    const started = await post("/api/runs", {
-      file: file,
-      src: byId("src").value.trim() || "auto",
-      tgt: byId("tgt").value.trim() || "vi",
-      domain: byId("domain").value.trim() || "general",
-      glossary: byId("glossary").value || null,
-      max_tokens: tokens ? Number(tokens) : null,
-      mock: byId("mock").checked,
-    });
-    newRunPanes(started.run_id, started.chunks);
-    state.polling = true;
-    setTimeout(() => pollRun(started.run_id), POLL_MS);
+    const created = await post("/api/runs", body);
+    closeNewJobDialog();
+    await loadRuns();
+    await openJob(created.run_id);
   } catch (error) {
-    renderBanner({ kind: "error", text: `Không chạy được: ${error.message}` });
+    formAlert(`Không bắt đầu được lượt dịch: ${error.message}`, "error");
   } finally {
-    byId("run-button").disabled = false;
+    button.disabled = !state.selectedFile;
+    button.textContent = "Bắt đầu dịch";
   }
 }
 
-async function stopRun() {
-  if (!state.runId) return;
+/* ------------------------------------------------------------------ drawer */
+
+function toggleDrawer(force) {
+  const drawer = byId("drawer");
+  const visible = typeof force === "boolean" ? force : drawer.hidden;
+  show(drawer, visible);
+  byId("nav-tools").setAttribute("aria-expanded", visible ? "true" : "false");
+  if (visible) {
+    showTab(currentTab());
+  }
+}
+
+function currentTab() {
+  for (const name of ["glossary", "memory", "skills"]) {
+    if (byId(`tab-${name}`).getAttribute("aria-selected") === "true") {
+      return name;
+    }
+  }
+  return "glossary";
+}
+
+function showTab(name) {
+  for (const other of ["glossary", "memory", "skills"]) {
+    byId(`tab-${other}`).setAttribute(
+      "aria-selected",
+      other === name ? "true" : "false",
+    );
+    show(byId(`panel-${other}`), other === name);
+  }
+  if (name === "glossary") {
+    loadGlossaries();
+  } else if (name === "memory") {
+    loadMemory();
+  } else {
+    loadSkills();
+  }
+}
+
+async function loadGlossaries(message) {
+  let payload;
   try {
-    const stopped = await post(`/api/runs/${encodeURIComponent(state.runId)}/stop`);
-    renderBanner({ kind: "warn", text: `Lượt chạy ${STATUS_WORDS[stopped.status] || stopped.status}.` });
-    state.polling = false;
-    byId("stop-button").disabled = true;
+    payload = await api("/api/glossaries");
   } catch (error) {
-    renderBanner({ kind: "error", text: `Không dừng được: ${error.message}` });
+    setText(byId("glossary-note"), `Không đọc được từ điển: ${error.message}`);
+    return;
   }
-}
-
-/* ---------------------------------------------------------------- inputs */
-
-async function loadInputs() {
-  const data = await api("/api/inputs");
-  const select = byId("file");
-  select.replaceChildren();
-  for (const file of data.files) {
-    const option = element("option", null, `${file.name} · ${bytes(file.size)}`);
-    option.value = file.name;
-    select.append(option);
+  const files = payload.files || [];
+  const list = clear(byId("glossary-list"));
+  if (!files.length) {
+    list.append(
+      element(
+        "li",
+        "note",
+        "Chưa có từ điển nào. Đặt tên và dán các cặp thuật ngữ ở dưới để tạo một file.",
+      ),
+    );
   }
-  if (!data.files.length) {
-    const option = element("option", null, "chưa có tài liệu nào trong input/");
-    option.value = "";
-    select.append(option);
+  for (const file of files) {
+    const item = element("li", "row");
+    const open = element("button", "row-main btn btn--ghost", file.name);
+    open.type = "button";
+    open.addEventListener("click", () => openGlossary(file.name));
+    item.append(open);
+    item.append(
+      element("span", "row-aside", `${formatCount(file.entries)} cặp`),
+    );
+    list.append(item);
   }
-}
+  /* A fresh message from the caller — "đã lưu 3 cặp" — is the more useful
+     thing on screen, so the standing hint steps aside for it. */
+  setText(
+    byId("glossary-note"),
+    message ||
+      (files.length ? "Bấm một từ điển để xem và sửa nội dung của nó." : ""),
+  );
 
-async function loadGlossaries() {
-  const data = await api("/api/glossaries");
   const select = byId("glossary");
-  select.replaceChildren();
-  const none = element("option", null, "không dùng");
+  const chosen = select.value;
+  clear(select);
+  const none = element("option", null, "— không dùng từ điển —");
   none.value = "";
   select.append(none);
-  for (const file of data.files) {
-    const option = element("option", null, `${file.name} · ${file.entries} cặp`);
+  for (const file of files) {
+    const option = element(
+      "option",
+      null,
+      `${file.name} (${formatCount(file.entries)} cặp)`,
+    );
     option.value = file.name;
     select.append(option);
   }
-  const list = byId("glossary-list");
-  list.replaceChildren();
-  for (const file of data.files) {
-    list.append(element("li", null, `${file.name} · ${file.entries} cặp`));
+  select.value =
+    chosen && files.some((file) => file.name === chosen) ? chosen : "";
+}
+
+async function openGlossary(name) {
+  try {
+    const payload = await api(`/api/glossaries/${encodeURIComponent(name)}`);
+    byId("glossary-name").value = payload.name || name;
+    const lines = (payload.pairs || []).map((row) => row.join(", "));
+    byId("glossary-pairs").value = lines.join("\n");
+    setText(
+      byId("glossary-note"),
+      `Đang sửa ${payload.name || name}: ${formatCount(lines.length)} cặp.`,
+    );
+  } catch (error) {
+    setText(byId("glossary-note"), `Không mở được từ điển: ${error.message}`);
   }
 }
 
 function parsePairs(text) {
-  return text
-    .split("\n")
-    .map((line) => line.trim())
-    .filter((line) => line.length)
-    .map((line) => line.split(",").map((cell) => cell.trim()));
+  const pairs = [];
+  for (const line of text.split(/\r?\n/)) {
+    const trimmed = line.trim();
+    if (!trimmed) {
+      continue;
+    }
+    const cells = trimmed
+      .split(/,|\t/)
+      .map((cell) => cell.trim())
+      .filter((cell) => cell !== "");
+    if (cells.length < 2) {
+      continue;
+    }
+    pairs.push([cells[0], cells[1]]);
+  }
+  return pairs;
 }
 
 async function saveGlossary() {
   const name = byId("glossary-name").value.trim();
-  const pairs = parsePairs(byId("glossary-pairs").value);
   if (!name) {
-    renderBanner({ kind: "error", text: "Đặt tên file glossary trước đã, ví dụ legal.csv." });
+    setText(
+      byId("glossary-note"),
+      "Hãy đặt tên cho file từ điển (ví dụ: legal).",
+    );
+    return;
+  }
+  const pairs = parsePairs(byId("glossary-pairs").value);
+  if (!pairs.length) {
+    setText(
+      byId("glossary-note"),
+      "Cần ít nhất một dòng dạng “thuật ngữ gốc, thuật ngữ dịch”.",
+    );
     return;
   }
   try {
-    await put(`/api/glossaries/${encodeURIComponent(name)}`, { pairs: pairs });
-    renderBanner({ kind: "warn", text: `Đã lưu ${name} với ${pairs.length} cặp.` });
-    await loadGlossaries();
+    const saved = await put(`/api/glossaries/${encodeURIComponent(name)}`, {
+      pairs: pairs,
+    });
+    byId("glossary-name").value = "";
+    byId("glossary-pairs").value = "";
+    await loadGlossaries(
+      `Đã lưu ${formatCount((saved.pairs || pairs).length)} cặp vào ${saved.name || name}.`,
+    );
   } catch (error) {
-    renderBanner({ kind: "error", text: `Không lưu được glossary: ${error.message}` });
+    setText(byId("glossary-note"), `Không lưu được từ điển: ${error.message}`);
+  }
+}
+
+async function loadMemory() {
+  const note = byId("memory-note");
+  setText(note, "Đang đọc bộ nhớ dịch…");
+  let payload;
+  try {
+    payload = await api("/api/memory");
+  } catch (error) {
+    setText(note, `Không đọc được bộ nhớ dịch: ${error.message}`);
+    clear(byId("memory-list"));
+    return;
+  }
+  const memory = payload.memory || {};
+  const pairs = memory.pairs || [];
+  const list = clear(byId("memory-list"));
+  setText(
+    note,
+    memory.total
+      ? `${formatCount(memory.total)} trace đã lưu, xếp theo ${formatCount(pairs.length)} cặp ngôn ngữ.`
+      : "Bộ nhớ dịch đang trống: chưa có lượt dịch nào đủ điểm để lưu lại.",
+  );
+  for (const bucket of pairs) {
+    const item = element("li", "row");
+    item.append(
+      element("span", "row-main", `${bucket.pair} · ${bucket.domain}`),
+    );
+    item.append(
+      element("span", "row-aside", `${formatCount(bucket.traces)} trace`),
+    );
+    const recent = (bucket.recent || [])[0];
+    const sub = element(
+      "span",
+      "row-sub",
+      recent
+        ? `điểm ${bucket.mean_score} · ${String(recent.strategy || "").slice(0, 140)}`
+        : `điểm ${bucket.mean_score}`,
+    );
+    item.append(sub);
+    list.append(item);
   }
 }
 
 async function loadSkills() {
-  const data = await api("/api/skills");
-  const list = byId("skills-list");
-  list.replaceChildren();
-  if (!data.skills.length) {
-    list.append(element("li", null, "chưa có skill nào được học"));
+  const note = byId("skills-note");
+  setText(note, "Đang đọc skill…");
+  let payload;
+  try {
+    payload = await api("/api/skills");
+  } catch (error) {
+    setText(note, `Không đọc được skill: ${error.message}`);
+    clear(byId("skills-list"));
     return;
   }
-  for (const skill of data.skills) {
-    const score = Number(skill.mean_score || 0).toFixed(1);
-    list.append(element("li", null, `${skill.pair} · ${skill.domain} · điểm ${score}`));
-  }
-}
-
-/* ---------------------------------------------------------------- config */
-
-const configInputs = new Map();
-const configLoaded = new Map(); // key -> value as loaded, to spot real edits
-
-function renderConfig(data) {
-  const fields = byId("config-fields");
-  fields.replaceChildren();
-  configInputs.clear();
-  configLoaded.clear();
-
-  for (const key of data.editable) {
-    const value = data.values ? data.values[key] : undefined;
-    const field = element("div", "field");
-    const label = element("label", null, key);
-    label.setAttribute("for", `cfg-${key}`);
-    let input;
-    if (typeof value === "boolean") {
-      input = element("input");
-      input.type = "checkbox";
-      input.checked = value;
-      label.className = "check";
-      label.append(input, element("span", null, key));
-    } else {
-      input = element("input");
-      input.value = value === undefined || value === null ? "" : String(value);
-      field.append(label);
+  const skills = payload.skills || [];
+  const list = clear(byId("skills-list"));
+  setText(
+    note,
+    skills.length
+      ? `${formatCount(skills.length)} skill đã được học từ các lượt dịch trước.`
+      : "Chưa có skill nào: chúng xuất hiện sau khi một cặp ngôn ngữ đạt điểm đủ cao.",
+  );
+  for (const skill of skills) {
+    const item = element("li", "row");
+    item.append(element("span", "row-main", `${skill.pair} · ${skill.domain}`));
+    const score =
+      skill.mean_score === undefined || skill.mean_score === null
+        ? "chưa có điểm"
+        : `điểm ${skill.mean_score}`;
+    item.append(element("span", "row-aside", score));
+    if (skill.instruction) {
+      item.append(
+        element("span", "row-sub", String(skill.instruction).slice(0, 200)),
+      );
     }
-    input.id = `cfg-${key}`;
-    configInputs.set(key, input);
-    configLoaded.set(key, input.type === "checkbox" ? input.checked : input.value);
-    field.append(input);
-    const source = data.sources ? data.sources[key] : "";
-    if (source) {
-      const note = element("span", "hint", source === "env"
-        ? "biến môi trường đang thắng; sửa .env sẽ không có hiệu lực cho tới khi bỏ biến đó"
-        : `nguồn: ${source}`);
-      field.append(note);
-    }
-    fields.append(field);
-  }
-
-  const readonly = element("p", "hint", `Chỉ đọc: ${(data.readonly || []).join(", ")}`);
-  fields.append(readonly);
-
-  const secrets = Object.entries(data.secrets || {});
-  if (secrets.length) {
-    const text = secrets.map(([name, status]) => `${name}: ${status === "set" ? "đã đặt" : "chưa đặt"}`);
-    fields.append(element("p", "hint", `API key (không hiện giá trị): ${text.join(" · ")}`));
-  }
-  byId("config-note").textContent = data.probe_error
-    ? `Không đọc được cấu hình hiệu lực: ${data.probe_error}`
-    : "Giá trị dưới đây là cấu hình hiệu lực, không phải giá trị mặc định.";
-}
-
-async function loadConfig() {
-  try {
-    renderConfig(await api("/api/config"));
-  } catch (error) {
-    byId("config-note").textContent = `Không đọc được cấu hình: ${error.message}`;
+    list.append(item);
   }
 }
 
-async function saveConfig() {
-  // Only settings the user actually changed are sent. Rewriting every key
-  // would quietly persist values that come from the environment into `.env`
-  // and turn a one-line change into an eighteen-line edit.
-  const values = {};
-  for (const [key, input] of configInputs) {
-    const current = input.type === "checkbox" ? input.checked : input.value;
-    if (current === configLoaded.get(key)) continue;
-    values[key] = input.type === "checkbox" ? current : interpret(current);
-  }
-  if (!Object.keys(values).length) {
-    renderBanner({ kind: "warn", text: "Không có thay đổi nào để lưu." });
-    return;
-  }
-  try {
-    const result = await put("/api/config", { values: values });
-    const saved = result.saved.length ? `đã lưu: ${result.saved.join(", ")}` : "không lưu gì";
-    const rejected = result.rejected.map((item) => `${item.key} (${item.reason})`).join(", ");
-    renderBanner({
-      kind: rejected ? "warn" : "warn",
-      text: rejected ? `${saved}. Bị từ chối: ${rejected}` : saved,
-    });
-    await loadConfig();
-  } catch (error) {
-    renderBanner({ kind: "error", text: `Không lưu được cấu hình: ${error.message}` });
-  }
-}
+/* ------------------------------------------------------------------- wiring */
 
-/** Settings are stored as text; keep a number looking like a number and a
- *  bare true/false looking like the 1/0 the config loader expects. */
-function interpret(text) {
-  const trimmed = String(text).trim();
-  if (trimmed === "true") return 1;
-  if (trimmed === "false") return 0;
-  if (trimmed !== "" && !Number.isNaN(Number(trimmed))) return Number(trimmed);
-  return trimmed;
-}
-
-/* ------------------------------------------------------------- bootstrap */
-
-async function boot() {
-  byId("run-button").addEventListener("click", startRun);
-  byId("stop-button").addEventListener("click", stopRun);
-  byId("config-save").addEventListener("click", saveConfig);
+function wire() {
+  byId("nav-new").addEventListener("click", openNewJobDialog);
+  byId("nav-tools").addEventListener("click", () => toggleDrawer());
+  byId("drawer-close").addEventListener("click", () => toggleDrawer(false));
+  for (const name of ["glossary", "memory", "skills"]) {
+    byId(`tab-${name}`).addEventListener("click", () => showTab(name));
+  }
   byId("glossary-save").addEventListener("click", saveGlossary);
-  try {
-    await Promise.all([loadInputs(), loadHistory(), loadGlossaries(), loadSkills()]);
-  } catch (error) {
-    renderBanner({ kind: "error", text: `Không tải được dữ liệu: ${error.message}` });
+
+  byId("new-job-cancel").addEventListener("click", closeNewJobDialog);
+  byId("new-job-form").addEventListener("submit", startRun);
+
+  const drop = byId("drop");
+  const input = byId("file-input");
+  drop.addEventListener("click", () => input.click());
+  drop.addEventListener("keydown", (event) => {
+    if (event.key === "Enter" || event.key === " ") {
+      event.preventDefault();
+      input.click();
+    }
+  });
+  input.addEventListener("change", () => {
+    if (input.files && input.files[0]) {
+      handleDropped(input.files[0]);
+      input.value = "";
+    }
+  });
+  for (const name of ["dragenter", "dragover"]) {
+    drop.addEventListener(name, (event) => {
+      event.preventDefault();
+      if (drop.dataset.state !== "busy") {
+        drop.dataset.state = "over";
+      }
+    });
   }
-  await loadConfig();
+  drop.addEventListener("dragleave", () => {
+    if (drop.dataset.state === "over") {
+      drop.dataset.state = "idle";
+    }
+  });
+  drop.addEventListener("drop", (event) => {
+    event.preventDefault();
+    const files = event.dataTransfer ? event.dataTransfer.files : null;
+    handleDropped(files && files.length ? files[0] : null);
+  });
+  /* A file dropped anywhere else would otherwise be opened by the browser and
+     the page would be replaced by a PDF. */
+  for (const name of ["dragover", "drop"]) {
+    window.addEventListener(name, (event) => {
+      if (!byId("new-job").open) {
+        event.preventDefault();
+      }
+    });
+  }
+
+  byId("view-split").addEventListener("click", () => {
+    state.view = "split";
+    renderView();
+  });
+  byId("view-source").addEventListener("click", () => {
+    state.view = "source";
+    renderView();
+  });
+  byId("view-target").addEventListener("click", () => {
+    state.view = "target";
+    renderView();
+  });
+
+  document.addEventListener("keydown", (event) => {
+    if (event.key === "Escape" && !byId("drawer").hidden) {
+      toggleDrawer(false);
+    }
+  });
 }
 
-document.addEventListener("DOMContentLoaded", boot);
+function boot() {
+  wire();
+  renderEmptyJob();
+  renderFilters();
+  renderView();
+  loadRuns();
+  loadGlossaries();
+}
+
+if (document.readyState === "loading") {
+  document.addEventListener("DOMContentLoaded", boot);
+} else {
+  boot();
+}

@@ -68,9 +68,7 @@ def chunk_document(
     """
     app = get_app_config()
     max_tokens = max_tokens or app.chunk_max_tokens
-    overlap_tokens = (
-        app.chunk_overlap_tokens if overlap_tokens is None else overlap_tokens
-    )
+    overlap_tokens = app.chunk_overlap_tokens if overlap_tokens is None else overlap_tokens
 
     numbered = list(enumerate(doc.blocks))
     texts = [(idx, b, _block_text(b)) for idx, b in numbered]

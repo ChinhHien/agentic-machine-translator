@@ -70,14 +70,14 @@ class SkillOptimizer:
             return None
 
         samples = "\n\n".join(
-            f"--- sample {i+1} (score {o['score']:.1f}) ---\n"
+            f"--- sample {i + 1} (score {o['score']:.1f}) ---\n"
             f"PROMPT (tail): ...{o['prompt'][-300:]}\nOUTPUT: {o['output'][:400]}"
             for i, o in enumerate(recent[-5:])
         )
         prompt = (
             "You optimize translation prompts via textual gradient descent.\n"
             f"Language pair: {src}->{tgt}; domain: {domain}\n"
-            f"Current translator instruction:\n{current.get('instruction','')}\n"
+            f"Current translator instruction:\n{current.get('instruction', '')}\n"
             f"Current few-shot examples:\n"
             + "\n".join(current.get("few_shot", []))
             + "\n\nRecent chunk samples with critic scores:\n"
@@ -118,7 +118,8 @@ class SkillOptimizer:
         if current is not None and new_mean <= old_mean:
             logger.debug(
                 "SkillOpt: keep old skill (new {:.2f} <= old {:.2f})",
-                new_mean, old_mean,
+                new_mean,
+                old_mean,
             )
             return None
 
@@ -134,16 +135,21 @@ class SkillOptimizer:
         }
         self.store.save(src, tgt, domain, skill)
         self._buffer = [
-            b for b in self._buffer
+            b
+            for b in self._buffer
             if not (b["src"] == src and b["tgt"] == tgt and b["domain"] == domain)
         ]
-        logger.info("SkillOpt promoted new skill for {}/{} ({:.2f} > {:.2f})",
-                    f"{src}-{tgt}", domain, new_mean, old_mean)
+        logger.info(
+            "SkillOpt promoted new skill for {}/{} ({:.2f} > {:.2f})",
+            f"{src}-{tgt}",
+            domain,
+            new_mean,
+            old_mean,
+        )
         return skill
 
     # ------------------------------------------------------------------
     def _recent_observations(self, src: str, tgt: str, domain: str) -> list[dict[str, Any]]:
         return [
-            b for b in self._buffer
-            if b["src"] == src and b["tgt"] == tgt and b["domain"] == domain
+            b for b in self._buffer if b["src"] == src and b["tgt"] == tgt and b["domain"] == domain
         ]

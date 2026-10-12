@@ -14,12 +14,14 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import re
 import threading
 import time
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, ClassVar
 
+from loguru import logger
 from openai import OpenAI
 
 from polyglot_lc.config import (
@@ -33,6 +35,47 @@ from polyglot_lc.llm.resilience import (
     call_with_resilience,
     normalize_provider_error,
 )
+
+# Enable verbose LLM client logging via env var
+VERBOSE_LLM = os.getenv("LLM_VERBOSE", "0").lower() in {"1", "true", "yes", "on"}
+
+#: Fallback deadline when a config carries no ``timeout`` field (seconds).
+_HARD_DEADLINE_DEFAULT = 120.0
+#: Grace added on top of the SDK read timeout before the hard deadline fires.
+#: The SDK should time out first; this only catches a socket that stays alive
+#: without making progress (the SDK's timeout is a *read* timeout and is reset
+#: by every arriving byte, so it cannot bound total request time).
+_DEADLINE_GRACE_SECONDS = 10.0
+#: Extra time a request that blew the deadline gets to finish before it is
+#: abandoned. Prevents retrying while the old request still holds the
+#: provider's concurrency slot.
+_DEADLINE_DRAIN_SECONDS = 30.0
+
+#: One queue per provider base_url: at most ``LLM_PROVIDER_CONCURRENCY`` calls
+#: may be in flight at a time. A free tier that serves a single request answers
+#: the second one with 429 ``concurrency_limit_exceeded``, and retrying that is
+#: worse than queueing, because the request it collided with is still running.
+#: The queue is acquired *before* the wall-clock deadline starts, so time spent
+#: waiting a turn is never charged against a call's own deadline.
+_GATES: dict[str, threading.BoundedSemaphore] = {}
+_GATES_LOCK = threading.Lock()
+
+
+def _provider_gate(base_url: str) -> threading.BoundedSemaphore:
+    """The queue for *base_url*, created on first use (see ``_GATES``)."""
+    with _GATES_LOCK:
+        gate = _GATES.get(base_url)
+        if gate is None:
+            limit = max(1, get_retry_config().provider_concurrency)
+            gate = threading.BoundedSemaphore(limit)
+            _GATES[base_url] = gate
+        return gate
+
+
+def reset_provider_gates() -> None:
+    """Forget the per-provider queues (tests and config reloads)."""
+    with _GATES_LOCK:
+        _GATES.clear()
 
 
 class TokenUsage:
@@ -58,8 +101,8 @@ class TokenUsage:
     _cache_hits: int = 0
     _cache_misses: int = 0
     _cache_unknown: int = 0
-    _by_agent: dict[str, dict[str, int]] = {}
-    _by_model: dict[str, dict[str, int]] = {}
+    _by_agent: ClassVar[dict[str, dict[str, int]]] = {}
+    _by_model: ClassVar[dict[str, dict[str, int]]] = {}
 
     @classmethod
     def add(
@@ -96,9 +139,7 @@ class TokenUsage:
             ):
                 if not key:
                     continue
-                bucket = table.setdefault(
-                    key, {"sent": 0, "received": 0, "cached": 0, "calls": 0}
-                )
+                bucket = table.setdefault(key, {"sent": 0, "received": 0, "cached": 0, "calls": 0})
                 bucket["sent"] += prompt
                 bucket["received"] += completion
                 bucket["cached"] += cached
@@ -143,15 +184,6 @@ class TokenUsage:
             cls._cache_unknown = 0
             cls._by_agent.clear()
             cls._by_model.clear()
-
-
-def format_tokens(n: int) -> str:
-    """Human-readable token count (e.g. ``12.4k``, ``1.25M``)."""
-    if n >= 1_000_000:
-        return f"{n / 1_000_000:.2f}M"
-    if n >= 1_000:
-        return f"{n / 1_000:.1f}k"
-    return str(n)
 
 
 @dataclass
@@ -266,17 +298,80 @@ class LLMClient:
     def _mock_embed(self, inputs: list[str]) -> list[list[float]]:
         return [mock_hash_embedding(t) for t in inputs]
 
+    def _deadline(self) -> float:
+        """Hard wall-clock deadline for one provider call, in seconds.
+
+        The SDK timeout plus :data:`_DEADLINE_GRACE_SECONDS`: the SDK should
+        normally fire first, so the deadline stays a backstop.
+        """
+        base = float(getattr(self.config, "timeout", _HARD_DEADLINE_DEFAULT))
+        return base + _DEADLINE_GRACE_SECONDS
+
+    def _with_deadline(self, call: Any) -> Any:
+        """Run *call* under a hard wall-clock deadline.
+
+        The SDK timeout is a *read* timeout: httpx restarts it whenever a byte
+        arrives, so a gateway that trickles keepalive bytes (or simply wedges)
+        can hold a request open indefinitely. A real run stalled for 16 minutes
+        on one Critic request with a 45 s timeout configured. Enforcing a total
+        deadline turns that into an ordinary retryable timeout instead of a
+        dead process; the abandoned worker is a daemon thread and cannot keep
+        the process alive.
+        """
+        box: dict[str, Any] = {}
+
+        def run() -> None:
+            try:
+                box["value"] = call()
+            except BaseException as exc:  # noqa: BLE001 - re-raised on the caller
+                box["error"] = exc
+
+        worker = threading.Thread(target=run, name="llm-call", daemon=True)
+        worker.start()
+        worker.join(self._deadline())
+        if worker.is_alive():
+            # Give an overrunning request a bounded chance to finish. Retrying
+            # while the old request is still in flight makes providers that
+            # limit *concurrency* (e.g. a free tier allowing one request at a
+            # time) answer the retry with 429, which is worse than the stall.
+            worker.join(_DEADLINE_DRAIN_SECONDS)
+        if worker.is_alive():
+            raise TimeoutError(
+                f"LLM request exceeded its {self._deadline():.0f}s wall-clock deadline"
+            )
+        if "error" in box:
+            raise box["error"]
+        return box.get("value")
+
     def _raw_chat(self, messages: list[dict[str, Any]], **kw: Any) -> LLMResponse:
         """Single un-retried chat call; raises normalized resilience errors."""
         start = time.monotonic()
-        try:
-            resp = self._sdk().chat.completions.create(
-                model=self.config.model,
-                messages=messages,  # type: ignore[arg-type]
-                temperature=getattr(self.config, "temperature", 0.3),
-                **kw,
+        if VERBOSE_LLM:
+            logger.debug(
+                "LLM request | model={} base_url={} msgs={}",
+                self.config.model,
+                self.config.base_url,
+                len(messages),
             )
-        except Exception as exc:  # noqa: BLE001 - normalized by resilience layer
+        try:
+            with _provider_gate(self.config.base_url):
+                resp = self._with_deadline(
+                    lambda: self._sdk().chat.completions.create(
+                        model=self.config.model,
+                        messages=messages,  # type: ignore[arg-type]
+                        temperature=getattr(self.config, "temperature", 0.3),
+                        **kw,
+                    )
+                )
+        except Exception as exc:
+            elapsed = time.monotonic() - start
+            if VERBOSE_LLM:
+                logger.debug(
+                    "LLM request failed after {:.1f}s | model={} error={}",
+                    elapsed,
+                    self.config.model,
+                    exc,
+                )
             raise normalize_provider_error(exc) from exc
         latency = int((time.monotonic() - start) * 1000)
         choice = resp.choices[0] if resp.choices else None
@@ -289,6 +384,16 @@ class LLMClient:
             prompt_tokens = _estimate_tokens(_messages_text(messages))
             completion_tokens = _estimate_tokens(text)
             estimated = True
+        if VERBOSE_LLM:
+            logger.debug(
+                "LLM response | model={} latency={}ms prompt={} completion={} cached={} estimated={}",
+                self.config.model,
+                latency,
+                prompt_tokens,
+                completion_tokens,
+                cached_tokens,
+                estimated,
+            )
         return LLMResponse(
             text=text,
             model=self.config.model,
@@ -331,8 +436,12 @@ class LLMClient:
             prompt_tokens = _estimate_tokens(prompt)
             completion_tokens = _estimate_tokens(text)
             TokenUsage.add(
-                prompt_tokens, completion_tokens, agent=agent, model=model,
-                provider=provider, estimated=True,
+                prompt_tokens,
+                completion_tokens,
+                agent=agent,
+                model=model,
+                provider=provider,
+                estimated=True,
             )
             return LLMResponse(
                 text=text,
@@ -352,6 +461,13 @@ class LLMClient:
             assert backup is not None
             return backup._raw_chat(msgs, **kw)
 
+        if VERBOSE_LLM:
+            logger.debug(
+                "LLM resilience call | provider={} model={} max_retries={}",
+                self.config.base_url,
+                self.config.model,
+                get_retry_config().max_retries,
+            )
         resp = call_with_resilience(
             self._raw_chat,
             backup_call if backup is not None else None,
@@ -364,26 +480,42 @@ class LLMClient:
             backup_model=(backup.config.model if backup else ""),
         )
         resp.via_backup = used_backup
+        if VERBOSE_LLM:
+            logger.debug(
+                "LLM call completed | model={} via_backup={} prompt={} completion={} cached={}",
+                self.config.model,
+                used_backup,
+                resp.prompt_tokens,
+                resp.completion_tokens,
+                resp.cached_tokens,
+            )
         TokenUsage.add(
-            resp.prompt_tokens, resp.completion_tokens, agent=agent,
-            cached_tokens=resp.cached_tokens, model=model, provider=provider,
-            estimated=resp.usage_estimated, cache_status=resp.cache_status,
+            resp.prompt_tokens,
+            resp.completion_tokens,
+            agent=agent,
+            cached_tokens=resp.cached_tokens,
+            model=model,
+            provider=provider,
+            estimated=resp.usage_estimated,
+            cache_status=resp.cache_status,
         )
         return resp
 
     def embed(self, inputs: list[str]) -> EmbeddingResponse:
         """Embed a batch of texts (no backup: the reasoning bank is best-effort)."""
         if isinstance(self.config, EmbedConfig) and self.config.is_mock:
-            return EmbeddingResponse(
-                vectors=self._mock_embed(inputs), model=self.config.model
-            )
+            return EmbeddingResponse(vectors=self._mock_embed(inputs), model=self.config.model)
         start = time.monotonic()
         try:
-            resp = self._sdk().embeddings.create(
-                model=self.config.model,
-                input=inputs,
-            )
-        except Exception as exc:  # noqa: BLE001
+            # Embeddings share the provider's concurrency slot with chat calls.
+            with _provider_gate(self.config.base_url):
+                resp = self._with_deadline(
+                    lambda: self._sdk().embeddings.create(
+                        model=self.config.model,
+                        input=inputs,
+                    )
+                )
+        except Exception as exc:
             raise normalize_provider_error(exc) from exc
         del start
         vectors = [item.embedding for item in sorted(resp.data, key=lambda d: d.index)]
@@ -434,8 +566,7 @@ def _apply_cache_prefix(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
     content = first.get("content", "")
     if isinstance(content, str) and content:
         first["content"] = [
-            {"type": "text", "text": content,
-             "cache_control": {"type": "ephemeral"}}
+            {"type": "text", "text": content, "cache_control": {"type": "ephemeral"}}
         ]
         return [first, *messages[1:]]
     return messages
@@ -532,6 +663,17 @@ def mock_hash_embedding(text: str) -> list[float]:
 
 def _mock_json_reply(prompt: str) -> str:
     """Deterministic JSON replies per agent role for mock mode."""
+    if "translation planner" in prompt and "glossary_terms" in prompt:
+        # Unified planner: one request for summary + strategy + glossary +
+        # complexity + section notes. Empty glossary_terms keeps mock runs free
+        # of consistency patching (which needs real term pairs to act on).
+        return (
+            '{"summary": "mock: technical document", '
+            '"strategy": "mock: literal with consistent terminology", '
+            '"few_shot": ["NMT -> NMT"], "pitfalls": ["mock pitfall"], '
+            '"glossary_terms": [], "complexity": 0.2, '
+            '"section_notes": {}, "notes": "mock notes"}'
+        )
     if "translation planner" in prompt:
         return (
             '{"strategy": "mock: literal with consistent terminology", '

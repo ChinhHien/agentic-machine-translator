@@ -24,6 +24,12 @@ PLAIN = (
 MAX_TOKENS = 15
 EXPECTED_CHUNKS = 3
 
+# Several headed sections, so the per-section planning cost is visible.
+MANY_SECTIONS = "".join(
+    f"## Section {i}\n\nParagraph {i} describes a distinct part of the system.\n\n"
+    for i in range(6)
+)
+
 
 @pytest.fixture(autouse=True)
 def _clean_mock_replies():
@@ -36,10 +42,11 @@ def _clean_mock_replies():
     TokenUsage.reset()
 
 
-def _write(tmp_path, text, name="doc.md"):
-    p = tmp_path / name
-    p.write_text(text, encoding="utf-8")
-    return p
+def _write(tmp_path, text, name="doc.pdf"):
+    """Input is PDF-only, so a document has to be rendered into a real one."""
+    from pdfdoc import write_pdf
+
+    return write_pdf(tmp_path / name, text)
 
 
 def _expected_chunks(path):
@@ -64,7 +71,10 @@ def _run(mock_env, monkeypatch, path, *, concurrency=None, replies=None, out=Non
     from polyglot_lc.pipeline import TranslationPipeline
 
     result = TranslationPipeline(quiet=True).run(
-        path, src="en", tgt="vi", max_tokens=MAX_TOKENS,
+        path,
+        src="en",
+        tgt="vi",
+        max_tokens=MAX_TOKENS,
         out=out or str(path.with_suffix(".vi.md")),
     )
     return result, TokenUsage.snapshot(), TokenUsage.snapshot_by_agent()
@@ -92,30 +102,82 @@ def test_max_concurrency_out_of_range(mock_env, monkeypatch):
 
 
 # ------------------------------- request budgets ----------------------------
-def test_request_budget_normal_run(mock_env, tmp_path, monkeypatch):
+def test_request_budget_adaptive_fast_path(mock_env, tmp_path, monkeypatch):
+    """Default adaptive run: simple, cleanly-translated chunks skip the Critic.
+
+    Each chunk costs translate + verify (2 requests) instead of the full
+    translate + critic + verify (3), and the document plan costs ONE Planner
+    request rather than one per section plus one.
+    """
     path = _write(tmp_path, PLAIN)
-    chunks, sections = _expected_chunks(path)
+    chunks, _sections = _expected_chunks(path)
     assert len(chunks) == EXPECTED_CHUNKS
 
-    _result, snap, by = _run(mock_env, monkeypatch, path, concurrency=1)
+    result, snap, by = _run(mock_env, monkeypatch, path, concurrency=1)
+
+    n = len(chunks)
+    assert _calls(by, "TRANSLATOR") == n
+    assert _calls(by, "CRITIC") == 0  # fast path skips critic + refiner
+    assert _calls(by, "REFINER") == 0
+    assert _calls(by, "VERIFIER") == n
+    # one document plan + one SkillOpt gradient call
+    assert _calls(by, "PLANNER") == 2
+    assert snap["calls"] == 2 * n + 2
+    assert result.fast_path_chunks == n
+    assert result.planner_calls == 1
+
+
+def test_request_budget_full_quality_path(mock_env, tmp_path, monkeypatch):
+    """ADAPTIVE_QUALITY=0 restores Translator -> Critic -> Verifier per chunk.
+
+    The merged planner still applies, so this is strictly cheaper than the old
+    per-section summary tree: 3*n + 2 requests instead of 3*n + sections + 3.
+    """
+    monkeypatch.setenv("ADAPTIVE_QUALITY", "0")
+    path = _write(tmp_path, PLAIN)
+    chunks, sections = _expected_chunks(path)
+
+    result, snap, by = _run(mock_env, monkeypatch, path, concurrency=1)
 
     n = len(chunks)
     assert _calls(by, "TRANSLATOR") == n
     assert _calls(by, "CRITIC") == n
-    assert _calls(by, "REFINER") == 0            # default score 8.5 >= threshold
+    assert _calls(by, "REFINER") == 0  # default score 8.5 >= threshold
     assert _calls(by, "VERIFIER") == n
-    # summary tree (sections + doc) + one plan call + one SkillOpt gradient call
-    assert _calls(by, "PLANNER") == len(sections) + 3
-    # per chunk: translate + critic + verify (refiner skipped)
-    assert snap["calls"] == 3 * n + len(sections) + 3
+    assert _calls(by, "PLANNER") == 2
+    assert snap["calls"] == 3 * n + 2
+    # The old pipeline paid one Planner request per section plus one.
+    assert snap["calls"] < 3 * n + len(sections) + 3
+    assert result.standard_path_chunks == n
+    assert result.fast_path_chunks == 0
+
+
+def test_merged_planner_beats_legacy_section_by_section_planning(mock_env, tmp_path, monkeypatch):
+    """P0 regression: planning costs 1 request, not one per section.
+
+    Section counts depend on chunk boundaries, so the legacy planner is compared
+    against the same document rather than against a hard-coded number.
+    """
+    path = _write(tmp_path, MANY_SECTIONS)
+    _chunks, sections = _expected_chunks(path)
+
+    _result, _snap, unified = _run(mock_env, monkeypatch, path, concurrency=1)
+    assert _calls(unified, "PLANNER") == 2  # 1 plan + 1 SkillOpt gradient
+
+    monkeypatch.setenv("UNIFIED_PLANNER", "0")
+    _result, _snap, legacy = _run(mock_env, monkeypatch, path, concurrency=1)
+    # legacy: one request per section + doc summary + plan + SkillOpt gradient
+    assert _calls(legacy, "PLANNER") == len(sections) + 3
+    assert _calls(legacy, "PLANNER") > _calls(unified, "PLANNER")
 
 
 def test_request_budget_critic_requires_refine(mock_env, tmp_path, monkeypatch):
+    monkeypatch.setenv("ADAPTIVE_QUALITY", "0")
     path = _write(tmp_path, PLAIN)
     chunks, _sections = _expected_chunks(path)
 
     replies = {"translation critic": '{"score": 3.0, "issues": ["x"], "suggestions": []}'}
-    _result, snap, by = _run(mock_env, monkeypatch, path, concurrency=1, replies=replies)
+    _result, _snap, by = _run(mock_env, monkeypatch, path, concurrency=1, replies=replies)
 
     n = len(chunks)
     # translate(1) + critic(3) + refiner(2) + verify(1) per chunk
@@ -123,20 +185,24 @@ def test_request_budget_critic_requires_refine(mock_env, tmp_path, monkeypatch):
     assert _calls(by, "CRITIC") == 3 * n
     assert _calls(by, "REFINER") == 2 * n
     assert _calls(by, "VERIFIER") == n
+    # Scores below the threshold drove the deep path for every chunk.
+    assert _result.deep_path_chunks == n
+    assert _result.fast_path_chunks == 0
 
 
 def test_request_budget_semantic_retry(mock_env, tmp_path, monkeypatch):
+    """A verifier failure retranslates even on the fast path (no critique needed)."""
     path = _write(tmp_path, PLAIN)
     chunks, _sections = _expected_chunks(path)
 
     replies = {"translation QA verifier": '{"pass": false, "reasons": ["dropped"]}'}
-    _result, snap, by = _run(mock_env, monkeypatch, path, concurrency=1, replies=replies)
+    _result, _snap, by = _run(mock_env, monkeypatch, path, concurrency=1, replies=replies)
 
     n = len(chunks)
     # verifier fails -> retranslate -> verify again (bounded to one retry)
     assert _calls(by, "TRANSLATOR") == 2 * n
     assert _calls(by, "VERIFIER") == 2 * n
-    assert _calls(by, "CRITIC") == n
+    assert _calls(by, "CRITIC") == 0
     assert _calls(by, "REFINER") == 0
 
 
@@ -152,6 +218,8 @@ def test_verifier_deterministic_failure_skips_llm(mock_env, tmp_path, monkeypatc
 
 # ----------------------------- adaptive refiner -----------------------------
 def test_adaptive_refiner_skips_refine_for_high_score(mock_env, tmp_path, monkeypatch):
+    # Exercises the refiner gate on the full path (the fast path bypasses it).
+    monkeypatch.setenv("ADAPTIVE_QUALITY", "0")
     path = _write(tmp_path, PLAIN)
     chunks, _ = _expected_chunks(path)
     monkeypatch.setenv("CRITIC_THRESHOLD", "9.0")
@@ -164,6 +232,7 @@ def test_adaptive_refiner_skips_refine_for_high_score(mock_env, tmp_path, monkey
 
 
 def test_adaptive_refiner_refines_below_min_score(mock_env, tmp_path, monkeypatch):
+    monkeypatch.setenv("ADAPTIVE_QUALITY", "0")
     path = _write(tmp_path, PLAIN)
     chunks, _ = _expected_chunks(path)
     monkeypatch.setenv("CRITIC_THRESHOLD", "9.0")
@@ -210,6 +279,7 @@ def test_output_order_preserved_under_concurrency(mock_env, tmp_path, monkeypatc
     from polyglot_lc.agents.context import extract_source
     from polyglot_lc.agents.translator import TranslatorAgent
 
+    monkeypatch.setenv("CHUNK_OVERLAP_TOKENS", "0")  # isolate ordering semantics
     path = _write(tmp_path, PLAIN)
     chunks, _ = _expected_chunks(path)
 
@@ -252,7 +322,11 @@ class _BoomRB:
 
 def _ctx(mock_env, rb):
     from polyglot_lc.agents import (
-        CriticAgent, PlannerAgent, RefinerAgent, TranslatorAgent, VerifierAgent,
+        CriticAgent,
+        PlannerAgent,
+        RefinerAgent,
+        TranslatorAgent,
+        VerifierAgent,
     )
     from polyglot_lc.config import get_agent_config
     from polyglot_lc.orchestrator.graph import GraphContext
@@ -271,8 +345,9 @@ def test_plan_document_survives_rb_failure(mock_env):
     from polyglot_lc.orchestrator.graph import plan_document
 
     ctx = _ctx(mock_env, _BoomRB())
-    plan = plan_document(ctx, doc_summary="tech doc", src_lang="en", tgt_lang="vi",
-                         domain="general", glossary_md="")
+    plan = plan_document(
+        ctx, doc_summary="tech doc", src_lang="en", tgt_lang="vi", domain="general", glossary_md=""
+    )
     assert plan["strategy"]  # planning continued without traces
 
 
@@ -283,11 +358,19 @@ def test_chunk_survives_rb_upsert_failure(mock_env, tmp_path):
     chunks, _ = _expected_chunks(path)
     ctx = _ctx(mock_env, _BoomRB())
     graph = make_chunk_graph(ctx)
-    out = graph.invoke({
-        "chunk": chunks[0], "src_lang": "en", "tgt_lang": "vi", "domain": "general",
-        "strategy": "literal", "few_shot": [], "pitfalls": [],
-        "glossary_md": "",
-    }, config={"recursion_limit": 100})
+    out = graph.invoke(
+        {
+            "chunk": chunks[0],
+            "src_lang": "en",
+            "tgt_lang": "vi",
+            "domain": "general",
+            "strategy": "literal",
+            "few_shot": [],
+            "pitfalls": [],
+            "glossary_md": "",
+        },
+        config={"recursion_limit": 100},
+    )
     assert out["translated"]
     assert out["stored"] is False  # RB failure swallowed
 
@@ -321,8 +404,8 @@ def test_cache_fingerprint_stable_and_sensitive():
 
     msgs = [{"role": "system", "content": "shared prefix text"}]
     fp = stable_prefix_fingerprint(msgs, model="m1")
-    assert fp == stable_prefix_fingerprint(msgs, model="m1")   # stable
-    assert fp != stable_prefix_fingerprint(msgs, model="m2")   # model-sensitive
+    assert fp == stable_prefix_fingerprint(msgs, model="m1")  # stable
+    assert fp != stable_prefix_fingerprint(msgs, model="m2")  # model-sensitive
     assert fp != stable_prefix_fingerprint(
         [{"role": "system", "content": "other prefix"}], model="m1"
     )

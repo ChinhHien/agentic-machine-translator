@@ -32,18 +32,23 @@ def build_source_context(
     pitfalls: list[str] | None = None,
     glossary_md: str = "",
     source: str = "",
+    section_note: str = "",
 ) -> str:
     """Build the stable read-source prefix shared by Translator/Critic/Refiner.
 
-    Ordering is deliberate and deterministic (strategy → pitfalls → glossary →
-    source text) so the byte-identical prefix can be cached across the three
-    agent calls for a given chunk.
+    Ordering is deliberate and deterministic (strategy → section note →
+    pitfalls → glossary → source text) so the byte-identical prefix can be
+    cached across the three agent calls for a given chunk. ``section_note`` is
+    the Planner's guidance for the chunk's section; the pipeline passes the
+    same note to all three agents, so the prefix stays cacheable.
     """
     parts = [
         f"You are a member of an expert {src_lang}->{tgt_lang} translation team.",
     ]
     if strategy:
         parts.append(f"Global translation strategy:\n{strategy}")
+    if section_note:
+        parts.append(f"Section guidance from the planner:\n{section_note}")
     pitfalls = [p for p in (pitfalls or []) if p]
     if pitfalls:
         parts.append("Pitfalls to avoid:\n" + "\n".join(f"- {p}" for p in pitfalls))
@@ -63,14 +68,13 @@ def extract_source(messages: list[dict[str, Any]]) -> str:
         content = message.get("content", "")
         if isinstance(content, list):
             content = "\n".join(
-                str(b.get("text", "")) if isinstance(b, dict) else str(b)
-                for b in content
+                str(b.get("text", "")) if isinstance(b, dict) else str(b) for b in content
             )
         text = str(content)
         start = text.find(SOURCE_START)
         end = text.find(SOURCE_END, start + 1)
         if start != -1 and end != -1:
-            body = text[start + len(SOURCE_START):end]
+            body = text[start + len(SOURCE_START) : end]
             if body.strip():
                 return body.strip()
     return ""
@@ -83,12 +87,13 @@ def source_context_messages(
     pitfalls: list[str] | None = None,
     glossary_md: str = "",
     source: str = "",
+    section_note: str = "",
 ) -> dict[str, str]:
     """Return the shared prefix as its own ``system`` message dict."""
     return {
         "role": "system",
         "content": build_source_context(
-            src_lang, tgt_lang, strategy, pitfalls, glossary_md, source
+            src_lang, tgt_lang, strategy, pitfalls, glossary_md, source, section_note
         ),
     }
 
@@ -106,8 +111,7 @@ def stable_prefix_fingerprint(messages: list[dict[str, Any]], model: str = "") -
         content = messages[0].get("content", "")
         if isinstance(content, list):
             content = "\n".join(
-                str(b.get("text", "")) if isinstance(b, dict) else str(b)
-                for b in content
+                str(b.get("text", "")) if isinstance(b, dict) else str(b) for b in content
             )
         prefix = str(content)
     digest = hashlib.sha1()

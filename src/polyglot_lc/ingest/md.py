@@ -1,4 +1,10 @@
-"""Markdown loader: parse with markdown-it-py, preserve structure, shield code."""
+"""Markdown parsing: structure + code shielding, used by the PDF extractor.
+
+This module no longer loads ``.md`` files — PDF is the only accepted input —
+but it owns the Markdown *parser* the layout extractor feeds its rendered
+Markdown through, plus the ``⟦CODE_n⟧`` shielding that keeps code away from the
+translator and puts it back afterwards.
+"""
 
 from __future__ import annotations
 
@@ -18,9 +24,7 @@ def _inline_text(children: list[Any]) -> str:
     """Flatten inline tokens to plain text; drop emphasis markers, keep content."""
     out: list[str] = []
     for tok in children:
-        if tok.type == "text":
-            out.append(tok.content)
-        elif tok.type == "code_inline":
+        if tok.type == "text" or tok.type == "code_inline":
             out.append(tok.content)
         elif tok.type in {"softbreak", "hardbreak"}:
             out.append(" ")
@@ -57,6 +61,32 @@ def shield_code_blocks(md_text: str) -> tuple[str, dict[str, str]]:
     return text, mapping
 
 
+def markdown_table(rows: list[list[str]], *, header: bool = True) -> str:
+    """Render cell rows as a Markdown pipe table, or ``""`` when not a table.
+
+    Rows are padded to the widest row so the columns line up: a header with
+    fewer cells than its body would silently drop the extra values when the
+    document is rendered.
+    """
+    rows = [[str(c).replace("|", "\\|").strip() for c in row] for row in rows if row]
+    if not rows:
+        return ""
+    width = max(len(row) for row in rows)
+
+    def line(cells: list[str]) -> str:
+        return "| " + " | ".join(cells + [""] * (width - len(cells))) + " |"
+
+    out: list[str] = []
+    if header:
+        out.append(line(rows[0]))
+        out.append("| " + " | ".join("---" for _ in range(width)) + " |")
+        body = rows[1:]
+    else:
+        body = rows
+    out.extend(line(row) for row in body)
+    return "\n".join(out)
+
+
 def parse_markdown(
     raw_text: str,
     *,
@@ -65,10 +95,10 @@ def parse_markdown(
 ) -> Document:
     """Parse a markdown string into structural blocks with code shielded.
 
-    Shared entry point for both the ``.md`` loader and the PDF loader (which
-    converts PDFs to markdown with MarkItDown first). *source_format* is
-    recorded in the document metadata so downstream steps know the original
-    container.
+    The PDF extractor renders the document's typography to Markdown and feeds it
+    through here, so this is where PDF structure actually becomes blocks.
+    *source_format* is recorded in the document metadata so downstream steps
+    know the original container.
     """
     raw = unicodedata.normalize("NFC", raw_text)
     text, code_map = shield_code_blocks(raw)
@@ -109,8 +139,31 @@ def parse_markdown(
                 elif t.type == "inline" and depth == 1:
                     items.append(_inline_text(t.children or []))
                 j += 1
-            blocks.append(Block(kind="list", text="\n".join(items),
-                                meta={"items": items}))
+            blocks.append(Block(kind="list", text="\n".join(items), meta={"items": items}))
+            i = j + 1
+            continue
+        if tok.type == "table_open":
+            # Tables carry real text. Skipping these tokens used to delete whole
+            # documents silently, because a converted PDF is mostly tables. Keep
+            # them as a Markdown table: flattening each row into one line is how
+            # a license matrix lost which column its values belonged to.
+            table_rows: list[list[str]] = []
+            cells: list[str] = []
+            j = i + 1
+            while j < len(tokens) and tokens[j].type != "table_close":
+                inner = tokens[j]
+                if inner.type == "tr_open":
+                    cells = []
+                elif inner.type == "inline":
+                    cells.append(_inline_text(inner.children or []))
+                elif inner.type == "tr_close" and cells:
+                    table_rows.append(cells)
+                j += 1
+            body = markdown_table(table_rows)
+            if body.strip():
+                blocks.append(
+                    Block(kind="paragraph", text=body, meta={"table": True, "rows": table_rows})
+                )
             i = j + 1
             continue
         if tok.type == "fence" or tok.type == "code_block":
@@ -141,12 +194,6 @@ def parse_markdown(
     if extra_metadata:
         metadata.update(extra_metadata)
     return Document(blocks=blocks, lang_hint="auto", metadata=metadata)
-
-
-def load_md(data: bytes) -> Document:
-    """Parse markdown bytes into structural blocks with code shielded."""
-    raw = data.decode("utf-8", errors="replace")
-    return parse_markdown(raw, source_format="markdown")
 
 
 def restore_code(translated_text: str, code_map: dict[str, str]) -> str:

@@ -18,7 +18,7 @@ class SummaryNode:
     level: str  # "doc" | "section" | "chunk"
     title: str
     summary: str = ""
-    children: list["SummaryNode"] = field(default_factory=list)
+    children: list[SummaryNode] = field(default_factory=list)
     meta: dict[str, Any] = None  # type: ignore[assignment]
 
     def __post_init__(self) -> None:
@@ -28,7 +28,9 @@ class SummaryNode:
     def render(self, indent: int = 0) -> str:
         """ASCII render used by the Planner prompt and debugging."""
         pad = "  " * indent
-        lines = [f"{pad}[{self.level}] {self.title}" + (f": {self.summary}" if self.summary else "")]
+        lines = [
+            f"{pad}[{self.level}] {self.title}" + (f": {self.summary}" if self.summary else "")
+        ]
         for ch in self.children:
             lines.append(ch.render(indent + 1))
         return "\n".join(lines)
@@ -42,15 +44,19 @@ def build_sections(chunks: list[Chunk]) -> dict[str, list[Chunk]]:
     return sections
 
 
-def _chunk_preview(text: str, limit: int = 160) -> str:
-    """Cheap non-LLM preview used when per-chunk summaries are disabled."""
+def preview_text(text: str, limit: int = 160) -> str:
+    """Cheap non-LLM single-line preview, truncated with an ellipsis.
+
+    Shared by the summary tree (when per-chunk summaries are disabled) and by
+    the unified planner's section outline, so both show a section the same way.
+    """
     flat = " ".join(text.split())
     return flat[:limit] + ("…" if len(flat) > limit else "")
 
 
 def summarize_with_planner(
     chunks: list[Chunk],
-    planner: "Agent",
+    planner: Agent,
     doc_title: str = "Document",
     chunk_summaries: bool | None = None,
 ) -> SummaryNode:
@@ -81,11 +87,9 @@ def summarize_with_planner(
                     "Reply with the summary only.\n\n"
                     f"Section: {sec_name}\nText:\n{c.text[:2000]}"
                 )
-                summary = planner.chat(
-                    [{"role": "user", "content": prompt}]
-                ).text.strip()
+                summary = planner.chat([{"role": "user", "content": prompt}]).text.strip()
             else:
-                summary = _chunk_preview(c.text)
+                summary = preview_text(c.text)
             node = SummaryNode(
                 level="chunk",
                 title=c.id,

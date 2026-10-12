@@ -99,3 +99,80 @@ def test_app_config_bad_int_raises(monkeypatch, mock_env):
     monkeypatch.setenv("CHUNK_MAX_TOKENS", "many")
     with pytest.raises(ConfigError, match="CHUNK_MAX_TOKENS"):
         get_app_config()
+
+
+# ------------------------- workflow v2 defaults -----------------------------
+def test_workflow_defaults(mock_env):
+    cfg = get_app_config()
+    assert cfg.unified_planner is True
+    assert cfg.adaptive_quality is True
+    assert cfg.fast_path_max_complexity == 0.35
+    assert cfg.fast_path_min_score == 9.0
+    assert cfg.fast_path_skip_llm_verify is False
+    assert cfg.resume is False
+    assert cfg.partial_output is False
+    assert cfg.consistency_check is True
+    assert cfg.consistency_max_patches == 5
+    assert cfg.checkpoint_dir is not None
+
+
+def test_workflow_overrides(mock_env, monkeypatch):
+    monkeypatch.setenv("UNIFIED_PLANNER", "0")
+    monkeypatch.setenv("ADAPTIVE_QUALITY", "0")
+    monkeypatch.setenv("FAST_PATH_MIN_SCORE", "8")
+    monkeypatch.setenv("FAST_PATH_MAX_COMPLEXITY", "0.5")
+    monkeypatch.setenv("FAST_PATH_SKIP_LLM_VERIFY", "1")
+    monkeypatch.setenv("RESUME", "1")
+    monkeypatch.setenv("PARTIAL_OUTPUT", "1")
+    monkeypatch.setenv("CONSISTENCY_CHECK", "0")
+    monkeypatch.setenv("CONSISTENCY_MAX_PATCHES", "2")
+    cfg = get_app_config()
+    assert cfg.unified_planner is False
+    assert cfg.adaptive_quality is False
+    assert cfg.fast_path_min_score == 8.0
+    assert cfg.fast_path_max_complexity == 0.5
+    assert cfg.fast_path_skip_llm_verify is True
+    assert cfg.resume is True
+    assert cfg.partial_output is True
+    assert cfg.consistency_check is False
+    assert cfg.consistency_max_patches == 2
+
+
+def test_checkpoint_dir_can_be_disabled(mock_env, monkeypatch):
+    monkeypatch.setenv("CHECKPOINT_DIR", "off")
+    assert get_app_config().checkpoint_dir is None
+    monkeypatch.setenv("CHECKPOINT_DIR", "")
+    assert get_app_config().checkpoint_dir is None
+    monkeypatch.setenv("CHECKPOINT_DIR", "./elsewhere")
+    assert str(get_app_config().checkpoint_dir) == "elsewhere"
+
+
+def test_fast_path_complexity_out_of_range(mock_env, monkeypatch):
+    monkeypatch.setenv("FAST_PATH_MAX_COMPLEXITY", "1.5")
+    with pytest.raises(ConfigError, match="FAST_PATH_MAX_COMPLEXITY|fast_path"):
+        get_app_config()
+
+
+# ---------------------------- output format ---------------------------------
+def test_output_format_defaults_to_markdown(mock_env):
+    cfg = get_app_config()
+    assert cfg.output_format == "md"
+    assert cfg.partial_output is False
+
+
+def test_output_format_does_not_depend_on_partial_output(mock_env, monkeypatch):
+    """OUTPUT_FORMAT must be readable on its own.
+
+    The two settings used to share one ``if`` block, so choosing a format did
+    nothing unless PARTIAL_OUTPUT happened to be set as well.
+    """
+    monkeypatch.setenv("OUTPUT_FORMAT", "both")
+    cfg = get_app_config()
+    assert cfg.output_format == "both"
+    assert cfg.partial_output is False
+
+
+def test_an_unknown_output_format_is_rejected(mock_env, monkeypatch):
+    monkeypatch.setenv("OUTPUT_FORMAT", "docx")
+    with pytest.raises(ConfigError, match="OUTPUT_FORMAT|output_format"):
+        get_app_config()

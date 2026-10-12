@@ -55,6 +55,21 @@ AGENT_GROUPS: dict[str, str] = {
 #: Env prefix holding the shared provider/model for the read-source group.
 SOURCE_GROUP_PREFIX = "SOURCE_GROUP_"
 
+#: Default wall-clock timeout per LLM request (seconds). Overridable globally
+#: via ``LLM_TIMEOUT`` (applies to every agent/embedding that doesn't set its
+#: own ``<NAME>_TIMEOUT`` / ``EMBED_TIMEOUT``). Kept modest so a hung endpoint
+#: can't stall the whole pipeline for minutes on end.
+DEFAULT_TIMEOUT = 45.0
+
+
+def _default_timeout() -> float:
+    """Global request timeout: ``LLM_TIMEOUT`` env or :data:`DEFAULT_TIMEOUT`."""
+    raw = os.getenv("LLM_TIMEOUT", "").strip()
+    if not raw:
+        return DEFAULT_TIMEOUT
+    return _get_float_env("LLM_TIMEOUT", DEFAULT_TIMEOUT)
+
+
 # Zero-setup demo defaults used when LLM_MOCK=1 and a value is not provided.
 MOCK_BASE_URL = "http://mock.local/v1"
 MOCK_TEMPERATURE = 0.2
@@ -83,7 +98,7 @@ class AgentConfig(BaseModel):
     temperature: float = 0.3
     #: Logical group ("planner" | "source" | "verifier") for reporting/routing.
     group: str = ""
-    timeout: float = Field(default=120.0, gt=0)
+    timeout: float = Field(default=DEFAULT_TIMEOUT, gt=0)
     max_retries: int = Field(default=2, ge=0)
     # Backup endpoint used when the primary keeps failing (rate limits,
     # timeouts, connection errors). Configured via ``<NAME>_BACKUP_*`` vars.
@@ -110,12 +125,11 @@ class AgentConfig(BaseModel):
         return v
 
     @model_validator(mode="after")
-    def _check_backup_pair(self) -> "AgentConfig":
+    def _check_backup_pair(self) -> AgentConfig:
         """Backup endpoint needs BOTH base_url and model (or neither)."""
         if bool(self.backup_base_url) != bool(self.backup_model):
             raise ValueError(
-                "backup endpoint requires both <NAME>_BACKUP_BASE_URL and "
-                "<NAME>_BACKUP_MODEL"
+                "backup endpoint requires both <NAME>_BACKUP_BASE_URL and <NAME>_BACKUP_MODEL"
             )
         return self
 
@@ -166,6 +180,9 @@ def _agent_from_env(name: str) -> AgentConfig:
     backup_base_url = os.getenv(f"{prefix}BACKUP_BASE_URL", "").strip()
     backup_model = os.getenv(f"{prefix}BACKUP_MODEL", "").strip()
     backup_api_key = os.getenv(f"{prefix}BACKUP_API_KEY", "").strip()
+    # Per-agent timeout override (e.g., VERIFIER_TIMEOUT=30); falls back to
+    # LLM_TIMEOUT / DEFAULT_TIMEOUT when not set.
+    timeout_raw = os.getenv(f"{prefix}TIMEOUT", "").strip()
 
     group = AGENT_GROUPS.get(name, "")
     group_used = False
@@ -184,20 +201,13 @@ def _agent_from_env(name: str) -> AgentConfig:
             temperature_raw = shared["temperature"]
             group_used = True
 
-    missing = [
-        field
-        for field, value in (("BASE_URL", base_url), ("MODEL", model))
-        if not value
-    ]
+    missing = [field for field, value in (("BASE_URL", base_url), ("MODEL", model)) if not value]
     if missing and not mock:
         missing_vars = ", ".join(f"{prefix}{m}" for m in missing)
         hint = ""
         if name in SOURCE_GROUP_AGENTS:
             group_vars = ", ".join(f"{SOURCE_GROUP_PREFIX}{m}" for m in missing)
-            hint = (
-                f" (or set {group_vars} to share one provider across the "
-                "read-source group)"
-            )
+            hint = f" (or set {group_vars} to share one provider across the read-source group)"
         raise ConfigError(
             f"Missing required environment variables for agent {name}: "
             + missing_vars
@@ -216,9 +226,16 @@ def _agent_from_env(name: str) -> AgentConfig:
         try:
             temperature = float(temperature_raw)
         except ValueError as exc:
-            raise ConfigError(
-                f"{prefix}TEMPERATURE={temperature_raw!r} is not a float"
-            ) from exc
+            raise ConfigError(f"{prefix}TEMPERATURE={temperature_raw!r} is not a float") from exc
+    if timeout_raw:
+        try:
+            timeout = float(timeout_raw)
+        except ValueError as exc:
+            raise ConfigError(f"{prefix}TIMEOUT={timeout_raw!r} is not a float") from exc
+    else:
+        # Global default so one hung endpoint can't stall the whole pipeline
+        # for minutes. Per-agent <NAME>_TIMEOUT always wins when present.
+        timeout = _default_timeout()
 
     try:
         return AgentConfig(
@@ -228,6 +245,7 @@ def _agent_from_env(name: str) -> AgentConfig:
             api_key=api_key,
             temperature=temperature,
             group=group + ("+group" if group_used else ""),
+            timeout=timeout,
             backup_base_url=backup_base_url,
             backup_model=backup_model,
             backup_api_key=backup_api_key,
@@ -242,7 +260,7 @@ class EmbedConfig(BaseModel):
     base_url: str
     model: str
     api_key: str = ""
-    timeout: float = Field(default=60.0, gt=0)
+    timeout: float = Field(default=DEFAULT_TIMEOUT, gt=0)
 
     @field_validator("base_url")
     @classmethod
@@ -262,20 +280,27 @@ def _embed_from_env() -> EmbedConfig:
     base_url = os.getenv("EMBED_BASE_URL", "").strip()
     model = os.getenv("EMBED_MODEL", "").strip()
     api_key = os.getenv("EMBED_API_KEY", "").strip()
-    missing = [
-        f for f, v in (("EMBED_BASE_URL", base_url), ("EMBED_MODEL", model)) if not v
-    ]
+    missing = [f for f, v in (("EMBED_BASE_URL", base_url), ("EMBED_MODEL", model)) if not v]
     if missing and not mock:
         raise ConfigError(
-            "Missing required environment variables: " + ", ".join(missing)
+            "Missing required environment variables: "
+            + ", ".join(missing)
             + ". Add them to your .env (see .env.example), or set LLM_MOCK=1."
         )
     if mock:
         base_url = base_url or MOCK_BASE_URL
         model = model or "mock-embed"
         api_key = api_key or "sk-mock"
+    timeout_raw = os.getenv("EMBED_TIMEOUT", "").strip()
+    if timeout_raw:
+        try:
+            timeout = float(timeout_raw)
+        except ValueError as exc:
+            raise ConfigError(f"EMBED_TIMEOUT={timeout_raw!r} is not a float") from exc
+    else:
+        timeout = _default_timeout()
     try:
-        return EmbedConfig(base_url=base_url, model=model, api_key=api_key)
+        return EmbedConfig(base_url=base_url, model=model, api_key=api_key, timeout=timeout)
     except ValidationError as exc:
         raise ConfigError(format_validation_error(exc, "embedding")) from exc
 
@@ -303,6 +328,53 @@ class AppConfig(BaseModel):
     #: chunk (one request per chunk). Those per-chunk summaries are never used
     #: downstream, so this defaults to False to avoid wasted requests/tokens.
     summary_tree_chunk_summaries: bool = False
+
+    # ------------------------------------------------------------------
+    # Workflow knobs (see the README's architecture section)
+    # ------------------------------------------------------------------
+    #: ONE Planner request produces summary + strategy + glossary + complexity +
+    #: section notes. Set ``UNIFIED_PLANNER=0`` to fall back to the legacy
+    #: summary-tree-then-plan path.
+    unified_planner: bool = True
+    #: Adaptive quality pipeline: route simple, confidently-translated chunks
+    #: straight to the Verifier instead of Critic -> Refiner -> Verifier.
+    adaptive_quality: bool = True
+    #: Fast path gate — a chunk is simple below this complexity (0..1)...
+    fast_path_max_complexity: float = Field(default=0.35, ge=0, le=1)
+    #: ...and confident at or above this deterministic draft score (0..10).
+    fast_path_min_score: float = Field(default=9.0, ge=0, le=10)
+    #: Also skip the paid LLM verification on fast-path chunks (hard checks only).
+    fast_path_skip_llm_verify: bool = False
+    #: Where per-chunk checkpoints live. ``None`` (``CHECKPOINT_DIR=off``)
+    #: disables crash-resume entirely.
+    checkpoint_dir: Path | None = Path("./data/checkpoints")
+    #: Reuse checkpoints from an interrupted run instead of re-translating.
+    resume: bool = False
+    #: What the run writes: ``md`` (translated Markdown, the default), ``pdf``
+    #: (the source PDF rebuilt in place with the translation) or ``both``.
+    output_format: str = "md"
+    #: Unicode TTF used to print the translation into the rebuilt PDF; empty
+    #: means "pick the first available font with Vietnamese coverage".
+    pdf_font_path: str = ""
+    #: Rewrite the output file as chunks complete (long runs only).
+    partial_output: bool = False
+    #: Cross-chunk terminology consistency pass after translation.
+    consistency_check: bool = True
+    #: Upper bound on consistency patch requests per document.
+    consistency_max_patches: int = Field(default=5, ge=0, le=100)
+
+    @field_validator("output_format")
+    @classmethod
+    def _check_output_format(cls, v: str) -> str:
+        value = v.strip().lower()
+        if value not in {"md", "pdf", "both"}:
+            raise ValueError("must be md, pdf or both")
+        return value
+
+
+def _get_str_env(key: str, default: str) -> str:
+    raw = os.getenv(key, "")
+    return raw.strip() if raw.strip() else default
 
 
 def _get_float_env(key: str, default: float) -> float:
@@ -336,7 +408,8 @@ class RetryConfig(BaseModel):
     """LLM resilience tuning; every field is env-overridable.
 
     Env vars: ``LLM_MAX_RETRIES``, ``LLM_RETRY_BASE_DELAY``,
-    ``LLM_RETRY_MAX_DELAY``, ``LLM_RETRY_BUFFER_SECONDS``.
+    ``LLM_RETRY_MAX_DELAY``, ``LLM_RETRY_BUFFER_SECONDS``, ``LLM_RETRY_JITTER``,
+    ``LLM_RETRY_CONCURRENCY_WAIT`` and ``LLM_PROVIDER_CONCURRENCY``.
     """
 
     max_retries: int = Field(default=3, ge=0, le=10)
@@ -346,6 +419,16 @@ class RetryConfig(BaseModel):
     #: Fraction of the backoff a retry may skip, in ``[0, 1]``. ``0`` disables
     #: jitter (deterministic); production default comes from ``LLM_RETRY_JITTER``.
     jitter: float = Field(default=0.0, ge=0.0, le=1.0)
+    #: Shortest wait before retrying a request the provider rejected because
+    #: another one from this process was still in flight. Exponential backoff
+    #: (2 s) only re-collides with the request that is still running server
+    #: side, so this floor is deliberately much longer than the base delay.
+    concurrency_wait: float = Field(default=10.0, ge=0.0, le=120.0)
+    #: Most requests this process keeps in flight per provider ``base_url``.
+    #: ``1`` matches a free tier that serves a single simultaneous request;
+    #: raise it to the provider's real limit. This is a queue, not a throttle:
+    #: queued calls wait their turn instead of failing.
+    provider_concurrency: int = Field(default=1, ge=1, le=32)
 
 
 def get_retry_config() -> RetryConfig:
@@ -357,6 +440,8 @@ def get_retry_config() -> RetryConfig:
             max_delay=_get_float_env("LLM_RETRY_MAX_DELAY", 60.0),
             buffer_seconds=_get_float_env("LLM_RETRY_BUFFER_SECONDS", 2.0),
             jitter=_get_float_env("LLM_RETRY_JITTER", 0.2),
+            concurrency_wait=_get_float_env("LLM_RETRY_CONCURRENCY_WAIT", 10.0),
+            provider_concurrency=_get_int_env("LLM_PROVIDER_CONCURRENCY", 1),
         )
     except ValidationError as exc:
         raise ConfigError(format_validation_error(exc, "retry config")) from exc
@@ -398,13 +483,16 @@ def get_cache_config() -> CacheConfig:
     raw = os.getenv("PROMPT_CACHE", "").strip().lower()
     if not raw:
         return CacheConfig(mode="auto")
-    aliases = {"on": "explicit", "markers": "explicit", "off": "off",
-               "auto": "auto", "explicit": "explicit"}
+    aliases = {
+        "on": "explicit",
+        "markers": "explicit",
+        "off": "off",
+        "auto": "auto",
+        "explicit": "explicit",
+    }
     mode = aliases.get(raw)
     if mode is None:
-        raise ConfigError(
-            f"PROMPT_CACHE={raw!r} is invalid; expected auto|explicit|off"
-        )
+        raise ConfigError(f"PROMPT_CACHE={raw!r} is invalid; expected auto|explicit|off")
     return CacheConfig(mode=mode)
 
 
@@ -417,9 +505,7 @@ def get_agent_config(name: str) -> AgentConfig:
     """
     key = name.strip().upper()
     if key not in AGENT_NAMES:
-        raise ConfigError(
-            f"Unknown agent {name!r}; expected one of {', '.join(AGENT_NAMES)}"
-        )
+        raise ConfigError(f"Unknown agent {name!r}; expected one of {', '.join(AGENT_NAMES)}")
     return _agent_from_env(key)
 
 
@@ -462,6 +548,33 @@ def get_app_config() -> AppConfig:
         kwargs["summary_tree_chunk_summaries"] = _get_bool_env(
             "SUMMARY_TREE_CHUNK_SUMMARIES", False
         )
+    if os.getenv("UNIFIED_PLANNER"):
+        kwargs["unified_planner"] = _get_bool_env("UNIFIED_PLANNER", True)
+    if os.getenv("ADAPTIVE_QUALITY"):
+        kwargs["adaptive_quality"] = _get_bool_env("ADAPTIVE_QUALITY", True)
+    if os.getenv("FAST_PATH_MAX_COMPLEXITY"):
+        kwargs["fast_path_max_complexity"] = _get_float_env("FAST_PATH_MAX_COMPLEXITY", 0.35)
+    if os.getenv("FAST_PATH_MIN_SCORE"):
+        kwargs["fast_path_min_score"] = _get_float_env("FAST_PATH_MIN_SCORE", 9.0)
+    if os.getenv("FAST_PATH_SKIP_LLM_VERIFY"):
+        kwargs["fast_path_skip_llm_verify"] = _get_bool_env("FAST_PATH_SKIP_LLM_VERIFY", False)
+    if "CHECKPOINT_DIR" in os.environ:
+        raw_dir = os.environ["CHECKPOINT_DIR"].strip()
+        kwargs["checkpoint_dir"] = (
+            None if raw_dir.lower() in {"", "off", "none", "0"} else Path(raw_dir)
+        )
+    if os.getenv("RESUME"):
+        kwargs["resume"] = _get_bool_env("RESUME", False)
+    if os.getenv("OUTPUT_FORMAT"):
+        kwargs["output_format"] = _get_str_env("OUTPUT_FORMAT", "md") or "md"
+    if os.getenv("PDF_FONT_PATH"):
+        kwargs["pdf_font_path"] = _get_str_env("PDF_FONT_PATH", "")
+    if os.getenv("PARTIAL_OUTPUT"):
+        kwargs["partial_output"] = _get_bool_env("PARTIAL_OUTPUT", False)
+    if os.getenv("CONSISTENCY_CHECK"):
+        kwargs["consistency_check"] = _get_bool_env("CONSISTENCY_CHECK", True)
+    if os.getenv("CONSISTENCY_MAX_PATCHES"):
+        kwargs["consistency_max_patches"] = _get_int_env("CONSISTENCY_MAX_PATCHES", 5)
     try:
         return AppConfig(**kwargs)
     except ValidationError as exc:

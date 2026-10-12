@@ -10,17 +10,108 @@ _WORD_RE = re.compile(r"[A-Za-z][A-Za-z0-9'-]*")
 
 # Common English words that are capitalized only at sentence start.
 _STOP = {
-    "the", "a", "an", "and", "or", "but", "if", "then", "else", "when", "in",
-    "on", "at", "to", "of", "for", "with", "by", "from", "as", "is", "are",
-    "was", "were", "be", "been", "it", "its", "this", "that", "these", "those",
-    "we", "our", "you", "your", "they", "their", "he", "she", "his", "her",
-    "not", "no", "yes", "do", "does", "did", "have", "has", "had", "will",
-    "would", "can", "could", "should", "may", "might", "must", "shall",
-    "i", "my", "me", "am", "there", "here", "what", "which", "who", "how",
-    "why", "all", "each", "every", "some", "any", "most", "more", "less",
-    "after", "before", "between", "during", "into", "over", "under", "about",
-    "such", "so", "than", "too", "very", "also", "however", "therefore",
-    "figure", "table", "chapter", "section", "appendix", "note", "see",
+    "the",
+    "a",
+    "an",
+    "and",
+    "or",
+    "but",
+    "if",
+    "then",
+    "else",
+    "when",
+    "in",
+    "on",
+    "at",
+    "to",
+    "of",
+    "for",
+    "with",
+    "by",
+    "from",
+    "as",
+    "is",
+    "are",
+    "was",
+    "were",
+    "be",
+    "been",
+    "it",
+    "its",
+    "this",
+    "that",
+    "these",
+    "those",
+    "we",
+    "our",
+    "you",
+    "your",
+    "they",
+    "their",
+    "he",
+    "she",
+    "his",
+    "her",
+    "not",
+    "no",
+    "yes",
+    "do",
+    "does",
+    "did",
+    "have",
+    "has",
+    "had",
+    "will",
+    "would",
+    "can",
+    "could",
+    "should",
+    "may",
+    "might",
+    "must",
+    "shall",
+    "i",
+    "my",
+    "me",
+    "am",
+    "there",
+    "here",
+    "what",
+    "which",
+    "who",
+    "how",
+    "why",
+    "all",
+    "each",
+    "every",
+    "some",
+    "any",
+    "most",
+    "more",
+    "less",
+    "after",
+    "before",
+    "between",
+    "during",
+    "into",
+    "over",
+    "under",
+    "about",
+    "such",
+    "so",
+    "than",
+    "too",
+    "very",
+    "also",
+    "however",
+    "therefore",
+    "figure",
+    "table",
+    "chapter",
+    "section",
+    "appendix",
+    "note",
+    "see",
 }
 
 
@@ -55,9 +146,7 @@ def extract_glossary(
         term = m.group(0)
         if term in {"II", "III", "AI"} or term.lower() in _STOP:
             continue
-        candidates.setdefault(
-            term, GlossaryTerm(term=term, count=0, reason="proper_noun")
-        )
+        candidates.setdefault(term, GlossaryTerm(term=term, count=0, reason="proper_noun"))
         candidates[term].count += 1
 
     # Capitalized words/phrases not at sentence start.
@@ -66,9 +155,7 @@ def extract_glossary(
         phrase = m.group(0)
         if phrase.lower() in _STOP or len(phrase) < 3:
             continue
-        candidates.setdefault(
-            phrase, GlossaryTerm(term=phrase, count=0, reason="capitalized")
-        )
+        candidates.setdefault(phrase, GlossaryTerm(term=phrase, count=0, reason="capitalized"))
         candidates[phrase].count += 1
 
     # Repeated terminology (any capitalized or technical word >= min_count).
@@ -76,17 +163,12 @@ def extract_glossary(
     for word, cnt in words.items():
         if cnt >= min_count and len(word) > 3 and word.lower() not in _STOP:
             if word not in candidates:
-                candidates[word] = GlossaryTerm(
-                    term=word, count=cnt, reason="repeated"
-                )
+                candidates[word] = GlossaryTerm(term=word, count=cnt, reason="repeated")
             else:
                 candidates[word].count = max(candidates[word].count, cnt)
 
     # Keep only terms seen at least min_count times or strong proper nouns.
-    kept = [
-        t for t in candidates.values()
-        if t.count >= min_count or t.reason == "proper_noun"
-    ]
+    kept = [t for t in candidates.values() if t.count >= min_count or t.reason == "proper_noun"]
     kept.sort(key=lambda t: (-t.count, t.term))
     return kept[:max_terms]
 
@@ -103,9 +185,7 @@ def glossary_to_md(terms: list[GlossaryTerm]) -> str:
 MAX_USER_GLOSSARY_TERMS = 200
 
 
-def render_user_glossary(
-    mapping: dict[str, str], limit: int = MAX_USER_GLOSSARY_TERMS
-) -> str:
+def render_user_glossary(mapping: dict[str, str], limit: int = MAX_USER_GLOSSARY_TERMS) -> str:
     """Render a user glossary mapping as prompts bullets, capped at *limit*."""
     items = list(mapping.items())
     if len(items) > limit:

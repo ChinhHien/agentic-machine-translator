@@ -20,22 +20,19 @@ def test_chunk_ids_sequential(mock_env, sample_doc):
 
 
 def test_overlap_produces_shared_text(mock_env):
-    import pytest
 
     from polyglot_lc.ingest.model import Block, Document
 
-    paras = [
-        Block(text=f"Paragraph {i} " + "content " * 12) for i in range(6)
-    ]
+    paras = [Block(text=f"Paragraph {i} " + "content " * 12) for i in range(6)]
     doc = Document(blocks=paras)
     chunks = chunk_document(doc, max_tokens=50, overlap_tokens=15, model="gpt-4o")
     assert len(chunks) >= 2
     # With overlap, adjacent chunks share some content.
     tail_prev = chunks[0].text[-30:]
-    assert any(
-        tail_prev.strip()[:10] in c.text or chunks[0].text in c.text
-        for c in chunks[1:2]
-    ) or True  # overlap is best-effort; main invariant is below
+    assert (
+        any(tail_prev.strip()[:10] in c.text or chunks[0].text in c.text for c in chunks[1:2])
+        or True
+    )  # overlap is best-effort; main invariant is below
     assert chunks[0].token_count <= 50 + 15
 
 
@@ -83,8 +80,8 @@ def test_glossary_csv(tmp_path):
 
 
 def test_summary_tree_shape(mock_env, sample_doc, monkeypatch):
-    from polyglot_lc.config import get_agent_config
     from polyglot_lc.agents import PlannerAgent
+    from polyglot_lc.config import get_agent_config
     from polyglot_lc.segment.summary_tree import summarize_with_planner
 
     monkeypatch.setenv("LLM_MOCK", "1")
