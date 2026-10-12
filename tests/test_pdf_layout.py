@@ -8,13 +8,20 @@ grouping without needing a hand-crafted PDF.
 
 from __future__ import annotations
 
+from polyglot_lc.ingest import load_document
+from polyglot_lc.ingest.md import parse_markdown
+from polyglot_lc.ingest.model import Document
 from polyglot_lc.ingest.pdf_layout import (
+    _build_units,
+    _table_grid,
+    bind_page_geometry,
     line_text,
     looks_like_code,
     normalize_glyphs,
     normalize_toc_entry,
     normalize_toc_lines,
     pages_to_markdown,
+    render_markdown,
 )
 
 BODY = "ABCDEF+CMR12"
@@ -61,15 +68,44 @@ class _StubPage:
         return self._tables
 
 
-class _StubTable:
-    """Minimal pdfplumber table: a bounding box and a cell matrix."""
+class _Row:
+    """pdfplumber's TableRow: only `cells`, which is all the extractor reads."""
 
-    def __init__(self, bbox: tuple[float, float, float, float], rows: list[list[str]]) -> None:
+    def __init__(self, cells: list) -> None:
+        self.cells = cells
+
+
+def _even_grid(
+    bbox: tuple[float, float, float, float], nrows: int, ncols: int
+) -> list[list[tuple]]:
+    """Split a table box into an even grid, for tests that need no exact boxes."""
+    x0, top, x1, bottom = bbox
+    dx, dy = (x1 - x0) / ncols, (bottom - top) / nrows
+    return [
+        [(x0 + c * dx, top + r * dy, x0 + (c + 1) * dx, top + (r + 1) * dy) for c in range(ncols)]
+        for r in range(nrows)
+    ]
+
+
+class _StubTable:
+    """Minimal pdfplumber table: a bounding box, a cell matrix and cell boxes."""
+
+    def __init__(
+        self,
+        bbox: tuple[float, float, float, float],
+        rows: list[list[str]],
+        cells: list[list[tuple[float, float, float, float] | None]] | None = None,
+    ) -> None:
         self.bbox = bbox
         self._rows = rows
+        self._cells = cells if cells is not None else _even_grid(bbox, len(rows), len(rows[0]))
 
     def extract(self) -> list[list[str]]:
         return self._rows
+
+    @property
+    def rows(self) -> list[_Row]:
+        return [_Row(row) for row in self._cells]
 
 
 def _page(lines: list[dict], *, height: float = 0.0, tables: list | None = None):
@@ -265,6 +301,140 @@ def test_a_single_column_region_is_not_a_table():
     assert "Detection" in md
 
 
+def _bound_doc(pages: list) -> Document:
+    """The document the extractor produces, with each block's geometry bound."""
+    units = _build_units(pages)
+    doc = parse_markdown(render_markdown(units), source_format="pdf")
+    bind_page_geometry(doc, units)
+    return doc
+
+
+def test_table_cell_boxes_line_up_with_the_markdown_matrix():
+    table = _StubTable(
+        bbox=(40.0, 120.0, 500.0, 200.0),
+        rows=[["Feature", "State"], ["Servers", "5"]],
+        cells=[
+            [(40.0, 120.0, 270.0, 160.0), (270.0, 120.0, 500.0, 160.0)],
+            [(40.0, 160.0, 270.0, 200.0), (270.0, 160.0, 500.0, 200.0)],
+        ],
+    )
+    doc = _bound_doc(
+        [
+            _page(
+                [_line(["Feature", "State"], top=130.0), _line(["Servers", "5"], top=170.0)],
+                height=595.0,
+                tables=[table],
+            )
+        ]
+    )
+
+    cells = doc.blocks[0].meta["pdf"]["cells"]
+    assert [len(row) for row in cells] == [2, 2], "one cell per cell of the Markdown table"
+    assert cells[0][0][:4] == [40.0, 120.0, 270.0, 160.0]
+    assert cells[1][1][:4] == [270.0, 160.0, 500.0, 200.0]
+    assert doc.blocks[0].meta["pdf"]["kind"] == "table"
+
+
+def test_merged_columns_merge_their_boxes():
+    """A merged cell repeats its text in every column it spans; its box spans too."""
+    table = _StubTable(
+        bbox=(40.0, 120.0, 500.0, 200.0),
+        rows=[["Feature", "LS", "LS"], ["Servers", "5", "5"]],
+        cells=[
+            [
+                (40.0, 120.0, 300.0, 160.0),
+                (300.0, 120.0, 400.0, 160.0),
+                (400.0, 120.0, 500.0, 160.0),
+            ],
+            [
+                (40.0, 160.0, 300.0, 200.0),
+                (300.0, 160.0, 400.0, 200.0),
+                (400.0, 160.0, 500.0, 200.0),
+            ],
+        ],
+    )
+    rows, cells = _table_grid(table)
+    assert rows == [["Feature", "LS"], ["Servers", "5"]]
+    assert [row[1] for row in cells] == [
+        (300.0, 120.0, 500.0, 160.0),
+        (300.0, 160.0, 500.0, 200.0),
+    ]
+
+
+def test_cell_typography_comes_from_the_source_lines():
+    """Each cell is set the way the source set it, header row included."""
+    table = _StubTable(
+        bbox=(40.0, 120.0, 500.0, 200.0), rows=[["Feature", "State"], ["Servers", "5"]]
+    )
+    doc = _bound_doc(
+        [
+            _page(
+                [
+                    _line(["Feature", "State"], top=130.0, x0=40.5, size=12.0, font="Verdana-Bold"),
+                    _line(["Servers", "5"], top=170.0, x0=42.0, size=9.0),
+                ],
+                height=595.0,
+                tables=[table],
+            )
+        ]
+    )
+    header, body = doc.blocks[0].meta["pdf"]["cells"]
+    assert header[0][5] == 12.0 and header[0][7] is True  # the source line's size and weight
+    assert body[0][5] == 9.0 and body[0][7] is False
+    assert header[0][4] == 0.5  # the source's own inset, held at the floor
+
+
+def test_a_cell_without_a_box_is_null():
+    table = _StubTable(
+        bbox=(40.0, 120.0, 500.0, 200.0),
+        rows=[["Feature", "State"], ["Servers", "5"]],
+        cells=[
+            [(40.0, 120.0, 270.0, 160.0), None],
+            [(40.0, 160.0, 270.0, 200.0), (270.0, 160.0, 500.0, 200.0)],
+        ],
+    )
+    _rows, cells = _table_grid(table)
+    assert cells[0][1] is None and cells[1][1][:2] == (270.0, 160.0)
+
+
+def test_a_row_whose_cell_count_disagrees_with_extract_gets_no_boxes():
+    """A phantom column must not be lined up against the wrong cell."""
+    table = _StubTable(
+        bbox=(40.0, 120.0, 500.0, 200.0),
+        rows=[["Feature", "State"], ["Servers", "5"]],
+        cells=[
+            [(40.0, 120.0, 500.0, 160.0)],
+            [(40.0, 160.0, 270.0, 200.0), (270.0, 160.0, 500.0, 200.0)],
+        ],
+    )
+    _rows, cells = _table_grid(table)
+    assert cells == [
+        [None, None],
+        [(40.0, 160.0, 270.0, 200.0), (270.0, 160.0, 500.0, 200.0)],
+    ]
+
+
+def test_a_table_split_across_pages_gets_one_block_per_page():
+    pages = [
+        _page(
+            [_line(["Alpha", "1"], top=130.0)],
+            height=595.0,
+            tables=[_StubTable((40.0, 120.0, 500.0, 200.0), [["Alpha", "1"], ["Beta", "2"]])],
+        ),
+        _page(
+            [_line(["Gamma", "3"], top=130.0)],
+            height=595.0,
+            tables=[_StubTable((40.0, 120.0, 500.0, 200.0), [["Gamma", "3"], ["Delta", "4"]])],
+        ),
+    ]
+    doc = _bound_doc(pages)
+    tables = [block for block in doc.blocks if block.meta.get("table")]
+    assert len(tables) == 2
+    assert tables[0].text.startswith("| Alpha | 1 |")
+    assert tables[1].text.startswith("| Gamma | 3 |")
+    assert tables[1].meta["pdf"]["cells"][1][1][:2] == [270.0, 160.0]
+
+
 def test_paragraph_gap_splits_but_line_spacing_does_not():
     lines = [
         _line(["First", "line", "of", "the", "paragraph."], top=127.0),
@@ -344,3 +514,37 @@ def test_roman_numbered_entry_is_not_glued_to_the_line_above():
     assert "Preface . . . . . . xi" in md
     assert "xi 0.1" not in md
     assert md.count("0.1") == 1
+
+
+# --------------------------- source appearance ------------------------------
+# What the rebuild needs to replace text without changing the page: the face it
+# was set in, its colour, and the bullets a list's items carried.
+
+
+def _geometry(markdown: str, tmp_path) -> dict[int, dict]:
+    from pdfdoc import write_pdf
+
+    doc = load_document(write_pdf(tmp_path / "faces.pdf", markdown))
+    return {i: (b.meta.get("pdf") or {}) for i, b in enumerate(doc.blocks)}
+
+
+def test_a_block_records_the_face_and_colour_the_source_set_it_in(tmp_path):
+    geo = _geometry("# Tiêu đề\n\nThân bài bình thường.\n", tmp_path)
+    heading, body = geo[0], geo[1]
+    assert heading["font"] == "Helvetica-Bold"
+    assert heading["bold"] is True and heading["italic"] is False
+    assert heading["color"] == (0.0, 0.0, 0.0)
+    assert body["font"] == "Helvetica"
+    assert body["bold"] is False
+
+
+def test_a_list_records_the_marker_of_every_item(tmp_path):
+    geo = _geometry("Một câu mở đầu.\n\n- mục một\n- mục hai\n", tmp_path)
+    assert geo[1]["kind"] == "list"
+    assert geo[1]["markers"] == ["-", "-"]
+
+
+def test_a_numbered_list_records_its_labels(tmp_path):
+    geo = _geometry("Một câu mở đầu.\n\n1. mục đầu\n2. mục sau\n", tmp_path)
+    assert geo[1]["kind"] == "list"
+    assert geo[1]["markers"] == ["1.", "2."]

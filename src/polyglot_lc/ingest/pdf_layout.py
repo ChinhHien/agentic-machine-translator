@@ -55,6 +55,7 @@ import statistics
 import unicodedata
 from collections import Counter
 from collections.abc import Iterable
+from dataclasses import dataclass
 from typing import Any
 
 from loguru import logger
@@ -209,6 +210,64 @@ def _is_mono(font: str) -> bool:
     return any(marker.lower() in lowered for marker in _MONO_MARKERS)
 
 
+def _font_style(font: str) -> tuple[bool, bool]:
+    """``(bold, italic)`` read off a font name (``Verdana-Bold`` -> bold)."""
+    lowered = font.lower()
+    return "bold" in lowered, ("italic" in lowered or "oblique" in lowered)
+
+
+def _rgb(value: Any) -> tuple[float, ...] | None:
+    """A glyph's non-stroking colour as an RGB triple, or ``None``."""
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, (int, float)):
+        return (float(value),) * 3
+    if not isinstance(value, (list, tuple)) or not value:
+        return None
+    try:
+        parts = [float(part) for part in value]
+    except (TypeError, ValueError):
+        return None
+    if len(parts) == 1:
+        return (parts[0], parts[0], parts[0])
+    if len(parts) == 3:
+        return tuple(parts)
+    if len(parts) == 4:  # CMYK: printed documents still arrive in it.
+        c, m, y, k = parts
+        return (
+            round((1 - c) * (1 - k), 4),
+            round((1 - m) * (1 - k), 4),
+            round((1 - y) * (1 - k), 4),
+        )
+    return None
+
+
+def _char_color(chars: Iterable[dict[str, Any]]) -> tuple[float, ...] | None:
+    """The colour the line is painted in (its most common one), or ``None``."""
+    seen: Counter[tuple[float, ...]] = Counter()
+    for ch in chars:
+        rgb = _rgb(ch.get("non_stroking_color"))
+        if rgb is not None:
+            seen[rgb] += 1
+    return seen.most_common(1)[0][0] if seen else None
+
+
+def _face(chars: list[dict[str, Any]]) -> dict[str, Any]:
+    """The keywords :class:`_RawLine` takes to describe how a line *looks*.
+
+    The dominant non-space glyph wins: a line's own bullet or a stray space run
+    is set in another face, and the text's face is what the translation has to
+    be printed in. The rebuild reads these to replace text without changing the
+    document's typography.
+    """
+    named = Counter(_font_of(c) for c in chars if str(c.get("text") or "").strip())
+    if not named:
+        named = Counter(_font_of(c) for c in chars)
+    font = named.most_common(1)[0][0] if named else ""
+    bold, italic = _font_style(font)
+    return {"font": font, "bold": bold, "italic": italic, "color": _char_color(chars)}
+
+
 def looks_like_code(text: str) -> bool:
     """True when *text* is source code rather than prose set in a mono face."""
     stripped = text.strip()
@@ -242,7 +301,22 @@ def line_text(chars: Iterable[dict[str, Any]]) -> str:
 class _RawLine:
     """One visual line of a page, classified by role."""
 
-    __slots__ = ("bottom", "kind", "level", "page", "size", "text", "top", "x0", "x1")
+    __slots__ = (
+        "bold",
+        "bottom",
+        "cells",
+        "color",
+        "font",
+        "italic",
+        "kind",
+        "level",
+        "page",
+        "size",
+        "text",
+        "top",
+        "x0",
+        "x1",
+    )
 
     def __init__(
         self,
@@ -255,6 +329,12 @@ class _RawLine:
         size: float,
         x1: float = 0.0,
         bottom: float = 0.0,
+        *,
+        font: str = "",
+        bold: bool = False,
+        italic: bool = False,
+        color: tuple[float, ...] | None = None,
+        cells: list[list[list | None]] | None = None,
     ) -> None:
         self.page = page
         self.top = top
@@ -265,6 +345,13 @@ class _RawLine:
         self.x1 = x1
         self.bottom = bottom
         self.size = size
+        self.font = font
+        self.bold = bold
+        self.italic = italic
+        self.color = color
+        #: A table's cells, one entry per cell: box, inset, size, alignment,
+        #: weight. Empty for every other kind of line.
+        self.cells: list[list[list | None]] = cells or []
 
 
 #: (page, x0, top, x1, bottom) in PDF points, origin at the top-left corner.
@@ -280,7 +367,19 @@ class _Unit:
     can never disagree about where a translated block belongs.
     """
 
-    __slots__ = ("kind", "level", "rects", "size", "text")
+    __slots__ = (
+        "bold",
+        "cells",
+        "color",
+        "font",
+        "italic",
+        "kind",
+        "level",
+        "markers",
+        "rects",
+        "size",
+        "text",
+    )
 
     def __init__(self, kind: str, text: str, level: int = 0, size: float = 0.0) -> None:
         self.kind = kind  # heading | table | code | body | list | toc
@@ -289,12 +388,31 @@ class _Unit:
         self.size = size
         #: One entry per source line, in reading order.
         self.rects: list[Rect] = []
+        #: How the unit is set, so the rebuilt PDF can print its translation in
+        #: the same face: the first line's font, weight, slant and colour.
+        self.font = ""
+        self.bold = False
+        self.italic = False
+        self.color: tuple[float, ...] | None = None
+        #: The bullet glyphs this unit's items were marked with, item by item.
+        self.markers: list[str] = []
+        #: A table's cells (box, inset, size, alignment, weight), row by row.
+        self.cells: list[list[list | None]] = []
 
     def take(self, lines: Iterable[_RawLine]) -> None:
         """Record the source lines that produced this unit."""
         for line in lines:
             self.rects.append((line.page, line.x0, line.top, line.x1, line.bottom))
             self.size = max(self.size, line.size)
+            if line.cells:
+                self.cells = line.cells
+            if not self.font and line.font:
+                self.font, self.bold, self.italic, self.color = (
+                    line.font,
+                    line.bold,
+                    line.italic,
+                    line.color,
+                )
 
 
 def _header_band(page: Any) -> float:
@@ -351,14 +469,27 @@ def _classify(
     x0 = min(float(c["x0"]) for c in chars)
     x1 = max(float(c["x1"]) for c in chars)
     bottom = float(line.get("bottom") or top)
+    face = _face(chars)
+
+    def raw(
+        kind: str,
+        level: int,
+        text: str,
+        x0: float,
+        size: float,
+        x1: float = 0.0,
+        bottom: float = 0.0,
+    ) -> _RawLine:
+        return _RawLine(page_no, top, kind, level, text, x0, size, x1, bottom, **face)
+
     # Oversized first: the first line of a page is often a section title, and
     # dropping it as a running head is how a document loses every heading.
     if size >= heading_min:
         level = 1 if size >= h1_min else 2
-        return _RawLine(page_no, top, "heading", level, text, x0, size, x1, bottom)
+        return raw("heading", level, text, x0, size, x1, bottom)
 
     if top < header_band and _looks_like_running_head(text):
-        return _RawLine(page_no, top, "header", 0, text, 0.0, 0.0)
+        return raw("header", 0, text, 0.0, 0.0)
 
     mono = sum(1 for c in chars if _is_mono(_font_of(c)))
     if mono / len(chars) >= _CODE_RATIO:
@@ -367,7 +498,7 @@ def _classify(
         # contain plain sentences (compiler output, numeric data). The run
         # context decides — see _resolve_mono_runs().
         kind = "code" if looks_like_code(text) else "mono"
-        return _RawLine(page_no, top, kind, 0, text, x0, size, x1, bottom)
+        return raw(kind, 0, text, x0, size, x1, bottom)
 
     kind = "body"
     stripped = text.lstrip()
@@ -379,7 +510,7 @@ def _classify(
         kind = "bullet"
     elif len(stripped) > 3 and stripped[0] in _NUMBERED_PREFIX and stripped[1:3] in (". ", ") "):
         kind = "numbered"
-    return _RawLine(page_no, top, kind, 0, text, x0, size, x1, bottom)
+    return raw(kind, 0, text, x0, size, x1, bottom)
 
 
 def _resolve_mono_runs(lines: list[_RawLine]) -> None:
@@ -428,18 +559,75 @@ def _font_thresholds(pages: list[Any]) -> tuple[float, float]:
     return heading_min, max(body * 1.9, heading_min + 4.0)
 
 
+#: One cell's own box: ``(x0, top, x1, bottom)``, same frame as :data:`Rect`.
+Cell = tuple[float, float, float, float]
+
+#: Cell geometry used where the source says nothing (no line inside the cell).
+_CELL_DEFAULT_SIZE = 10.0
+_CELL_PAD_DEFAULT = 2.0
+#: How far the source's own inset is honoured, and how far it is trusted.
+_CELL_PAD_MIN = 0.5
+_CELL_PAD_MAX = 2.0
+#: How far off a cell's centre a line may sit and still read as centred.
+_CELL_ALIGN_TOLERANCE = 2.0
+
+
 def _cell_text(value: Any) -> str:
     """One table cell as a single line of text."""
     return " ".join(str(value or "").split())
 
 
-def _table_rows(table: Any) -> list[list[str]] | None:
-    """Normalised cell matrix of *table*, or ``None`` when it is not a table.
+def _cell_box(value: Any) -> Cell | None:
+    """A pdfplumber cell box as a 4-tuple, or ``None`` when it has no box."""
+    if value is None:
+        return None
+    try:
+        x0, top, x1, bottom = (float(part) for part in tuple(value)[:4])
+    except (TypeError, ValueError, IndexError):
+        return None
+    return (x0, top, x1, bottom)
+
+
+def _union_box(first: Cell | None, second: Cell | None) -> Cell | None:
+    """The box covering both cells, for the columns a merge collapsed."""
+    if first is None:
+        return second
+    if second is None:
+        return first
+    return (
+        min(first[0], second[0]),
+        min(first[1], second[1]),
+        max(first[2], second[2]),
+        max(first[3], second[3]),
+    )
+
+
+def _table_boxes(table: Any, nrows: int, ncols: int) -> list[list[Cell | None]]:
+    """Cell boxes of *table*, one entry per cell of its extracted text matrix.
+
+    A row whose reported cell count disagrees with the width of its text (the
+    "phantom" columns pdfplumber sometimes reports) gets ``None`` throughout:
+    aligning those boxes by index would print one cell's translation into its
+    neighbour, which is worse than leaving that row in the source language.
+    """
+    rows = getattr(table, "rows", None) or ()
+    boxes: list[list[Cell | None]] = []
+    for row in rows:
+        cells = [_cell_box(cell) for cell in getattr(row, "cells", None) or ()]
+        boxes.append(cells if len(cells) == ncols else [None] * ncols)
+    if len(boxes) != nrows:
+        return [[None] * ncols for _ in range(nrows)]
+    return boxes
+
+
+def _table_grid(table: Any) -> tuple[list[list[str]], list[list[Cell | None]]] | None:
+    """Normalised cell matrix of *table* plus the source box of every cell.
 
     pdfplumber reports a merged cell's text in *every* column it spans, so
     adjacent columns are merged when they never disagree (equal, or one of them
     empty). That turns an 11-column reading of a 6-column license matrix back
-    into one column per license.
+    into one column per license. The same merges are applied to the cell boxes,
+    so index ``[i][j]`` of the text and of the boxes always mean the same cell.
     """
     try:
         raw = table.extract()
@@ -451,6 +639,7 @@ def _table_rows(table: Any) -> list[list[str]] | None:
         return None
     width = max(len(row) for row in rows)
     rows = [row + [""] * (width - len(row)) for row in rows]
+    boxes = _table_boxes(table, len(rows), width)
 
     kept: list[int] = [0]
     for col in range(1, width):
@@ -459,33 +648,91 @@ def _table_rows(table: Any) -> list[list[str]] | None:
             for r in rows:
                 if not r[prev]:
                     r[prev] = r[col]
+            for index in range(len(boxes)):
+                boxes[index][prev] = _union_box(boxes[index][prev], boxes[index][col])
         else:
             kept.append(col)
     rows = [[r[c] for c in kept] for r in rows]
-    rows = [r for r in rows if any(r)]
+    boxes = [[row[c] for c in kept] for row in boxes]
+    # A row with no text at all is not part of the table; its boxes go with it,
+    # so the two matrices stay index-aligned.
+    kept_rows = [(row, box) for row, box in zip(rows, boxes, strict=True) if any(row)]
+    rows = [row for row, _ in kept_rows]
+    boxes = [box for _, box in kept_rows]
     # A one-column "table" is a framed paragraph, not a table; a single row has
     # no header to compare against. Let those lines flow as normal text.
     if len(rows) < 2 or len(rows[0]) < 2:
         return None
-    return rows
+    return rows, boxes
 
 
-def _page_tables(page: Any, page_no: int) -> list[tuple[float, float, float, float, str]]:
-    """``(x0, top, x1, bottom, markdown)`` for the real tables of one page."""
+def _cell_entry(lines: list[_RawLine], box: Cell | None) -> list | None:
+    """How one cell was set: box, inset, size, alignment and weight.
+
+    The source's own lines inside the cell are the only evidence of its padding
+    and alignment, so they decide both rather than a constant — a centred header
+    or a right-aligned number stays where the source put it. The inset is kept
+    small: the room belongs to a translation that is usually longer.
+    """
+    if box is None:
+        return None
+    x0, top, x1, bottom = box
+    inside = [
+        line
+        for line in lines
+        if line.kind not in {"table", "header"}
+        and x0 <= (line.x0 + line.x1) / 2 <= x1
+        and top <= line.top <= bottom
+    ]
+    size = max((line.size for line in inside), default=_CELL_DEFAULT_SIZE)
+    if not inside:
+        return [x0, top, x1, bottom, _CELL_PAD_DEFAULT, size, "left", False, False]
+    gaps = [
+        min(line.x0 - x0, x1 - line.x1, line.top - top, bottom - max(line.bottom, line.top))
+        for line in inside
+    ]
+    pad = min(max(min(gaps), _CELL_PAD_MIN), _CELL_PAD_MAX)
+    first = inside[0]
+    box_center = (x0 + x1) / 2
+    line_center = (first.x0 + first.x1) / 2
+    if abs(line_center - box_center) <= _CELL_ALIGN_TOLERANCE:
+        align = "center"
+    elif abs(first.x1 - x1) <= _CELL_ALIGN_TOLERANCE and abs(first.x0 - x0) > _CELL_ALIGN_TOLERANCE:
+        align = "right"
+    else:
+        align = "left"
+    return [x0, top, x1, bottom, pad, size, align, first.bold, first.italic]
+
+
+@dataclass
+class _Table:
+    """One detected table: its box, its Markdown, and a box per cell."""
+
+    bbox: tuple[float, float, float, float]
+    markdown: str
+    boxes: list[list[Cell | None]]
+
+
+def _page_tables(page: Any, page_no: int) -> list[_Table]:
+    """The real tables of one page, with a source box for every cell."""
     finder = getattr(page, "find_tables", None)
     if not callable(finder):
         return []
-    found: list[tuple[tuple[float, ...], list[list[str]]]] = []
+    found: list[_Table] = []
     for table in finder():
-        rows = _table_rows(table)
-        if rows is None:
+        grid = _table_grid(table)
+        if grid is None:
             continue
+        rows, boxes = grid
         bbox = tuple(float(v) for v in table.bbox)
         # A nested table would emit content its outer table already carries.
-        if any(other[0] <= bbox[0] and other[3] >= bbox[3] and other != bbox for other, _ in found):
+        if any(
+            other.bbox[0] <= bbox[0] and other.bbox[3] >= bbox[3] and other.bbox != bbox
+            for other in found
+        ):
             continue
-        found.append((bbox, rows))
-    return [(b[0], b[1], b[2], b[3], markdown_table(rows)) for b, rows in found]
+        found.append(_Table(bbox=bbox, markdown=markdown_table(rows), boxes=boxes))
+    return found
 
 
 def _page_lines(
@@ -515,15 +762,29 @@ def _page_lines(
 
     tables = _page_tables(page, page_no)
     if tables:
-        for x0, top, x1, bottom, markdown in tables:
+        for table in tables:
+            x0, top, x1, bottom = table.bbox
+            # Read the cells' own typography off the lines this table replaces,
+            # before those lines are dropped below.
+            cells = [[_cell_entry(lines, box) for box in row] for row in table.boxes]
             lines.append(
-                _RawLine(page_no, top, "table", 0, markdown, x0, 0.0, x1=x1, bottom=bottom)
+                _RawLine(
+                    page_no,
+                    top,
+                    "table",
+                    0,
+                    table.markdown,
+                    x0,
+                    0.0,
+                    x1=x1,
+                    bottom=bottom,
+                    cells=cells,
+                )
             )
         lines = [
             ln
             for ln in lines
-            if ln.kind == "table"
-            or not any(top <= ln.top <= bottom for _x0, top, _x1, bottom, _ in tables)
+            if ln.kind == "table" or not any(t.bbox[1] <= ln.top <= t.bbox[3] for t in tables)
         ]
         lines.sort(key=lambda ln: (ln.top, ln.kind != "table"))
 
@@ -623,6 +884,25 @@ def _bullet_text(text: str) -> str:
     return stripped or text.lstrip()
 
 
+def _bullet_marker(text: str) -> str:
+    """The bullet glyph a list-item line starts with, or ``""``.
+
+    The rebuild prints it again: the source glyph is redacted along with the
+    item's text, and a list that lost its marks no longer reads as a list.
+    """
+    stripped = text.lstrip()
+    for mark in (*_BULLETS, *_BULLET_CHARS):
+        if stripped.startswith(mark) and (mark in _BULLETS or stripped[1:2] == " "):
+            return mark
+    return ""
+
+
+def _number_marker(text: str) -> str:
+    """The ``1.``/``2)`` label a numbered list item starts with, or ``""``."""
+    match = re.match(r"\s*(\d{1,3}[.)])(?=\s)", text)
+    return match.group(1) if match else ""
+
+
 def _build_units(pages: list[Any]) -> list[_Unit]:
     """Group every page into Markdown units, keeping each unit's geometry.
 
@@ -642,7 +922,8 @@ def _build_units(pages: list[Any]) -> list[_Unit]:
     }
 
     units: list[_Unit] = []
-    pending: list[tuple[_RawLine, str]] = []  # (line, rendered text) of one unit
+    # (line, rendered text, bullet glyph) of one unit.
+    pending: list[tuple[_RawLine, str, str]] = []
     pending_kind = "body"
     code_run: list[_RawLine] = []
     prev: _RawLine | None = None
@@ -652,10 +933,11 @@ def _build_units(pages: list[Any]) -> list[_Unit]:
         nonlocal pending, pending_kind
         if not pending:
             return
-        text = _join_wrapped([rendered for _, rendered in pending])
+        text = _join_wrapped([rendered for _, rendered, _ in pending])
         if text:
             unit = _Unit(pending_kind, text)
-            unit.take([line for line, _ in pending])
+            unit.take([line for line, _, _ in pending])
+            unit.markers = [marker for _, _, marker in pending if marker]
             units.append(unit)
         pending, pending_kind = [], "body"
 
@@ -723,15 +1005,16 @@ def _build_units(pages: list[Any]) -> list[_Unit]:
                 flush()  # closes the previous item (or paragraph)
             pending_kind = "list"
             item = _bullet_text(ln.text) if ln.kind == "bullet" else ln.text.strip()
+            marker = _bullet_marker(ln.text) if ln.kind == "bullet" else _number_marker(ln.text)
             # Markdown needs the marker back for the parser to see a list.
-            pending.append((ln, "- " + item if ln.kind == "bullet" else item))
+            pending.append((ln, "- " + item if ln.kind == "bullet" else item, marker))
         else:
             if new_block:
                 flush()
             # A body line right under a list item is that item's next line.
             if pending_kind != "list":
                 pending_kind = "body"
-            pending.append((ln, ln.text))
+            pending.append((ln, ln.text, ""))
         prev = ln
 
     flush()
@@ -816,11 +1099,25 @@ def bind_page_geometry(doc: Document, units: list[_Unit]) -> int:
             logger.debug("PDF geometry: no unit for block {!r}", block.text[:40])
             continue
         owned = units[index : index + span]
-        block.meta["pdf"] = {
+        markers = [mark for unit in owned for mark in unit.markers if mark]
+        geometry: dict[str, Any] = {
             "rects": [rect for unit in owned for rect in unit.rects],
             "size": max((unit.size for unit in owned), default=0.0),
             "kind": owned[0].kind,
+            # How the source set this block: the rebuild prints the translation
+            # in the same face and colour instead of a generic substitute.
+            "font": owned[0].font,
+            "bold": owned[0].bold,
+            "italic": owned[0].italic,
+            "color": owned[0].color,
+            # The markers the list's items carried, item by item.
+            "markers": markers,
         }
+        # A table also carries where each of its cells is, so the rebuild can
+        # print the translation of a cell inside that cell's own box.
+        if owned[0].kind == "table" and owned[0].cells:
+            geometry["cells"] = owned[0].cells
+        block.meta["pdf"] = geometry
         index += span
         bound += 1
     if bound != len(doc.blocks):
