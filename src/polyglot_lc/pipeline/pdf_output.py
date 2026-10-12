@@ -747,9 +747,12 @@ def _insert_cell(page: Any, item: _Placement, pymupdf: Any, default_font: Path |
     Unlike :func:`_insert` there is no branch that borrows the room down to the
     bottom margin: a cell that outgrows its row would print over the rules and
     the rows below it, so its only way down is to shrink the type — and only to
-    the floor. When the translation still will not fit, the cell's own source
+    the floor.    When the translation still will not fit, the cell's own source
     text is printed in its place, at the source size when that fits and at the
-    floor otherwise.
+    floor otherwise. A cell whose source held nothing is not a failure even
+    then: pdfplumber reports sliver boxes a fraction of a line wide where a
+    merged column collapsed, and an empty cell that stays empty has lost
+    nothing — ``None`` is kept for cells whose *text* could not be placed.
     """
     font_file = str(item.font_file or default_font)
     fontname = _resource_name(font_file)
@@ -779,6 +782,8 @@ def _insert_cell(page: Any, item: _Placement, pymupdf: Any, default_font: Path |
         return "translated"
     source = (item.source_text or "").strip()
     if source and fits(source):
+        return "source"
+    if not source:
         return "source"
     return None
 
