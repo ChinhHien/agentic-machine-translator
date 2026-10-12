@@ -33,8 +33,6 @@ class ReasoningBank:
         Silently keeping stale vectors would break every query, so the bank is
         reset (logged as a warning) instead of failing mid-run.
         """
-        import os
-
         try:
             if self._col.count() == 0:
                 return
@@ -44,7 +42,9 @@ class ReasoningBank:
         except Exception as exc:  # noqa: BLE001 - dimension/type mismatches
             logger.warning(
                 "Reasoning Bank incompatible with current embeddings ({}) — "
-                "resetting collection at {}", exc, self.path,
+                "resetting collection at {}",
+                exc,
+                self.path,
             )
             self._client.delete_collection("reasoning_traces")
             self._col = self._client.get_or_create_collection(
@@ -79,7 +79,9 @@ class ReasoningBank:
             doc = docs[i] if i < len(docs) else ""
             dist = dists[i] if i < len(dists) else None
             traces.append(
-                ReasoningTrace.from_metadata(id=trace_id, document=doc, metadata=meta, distance=dist)
+                ReasoningTrace.from_metadata(
+                    id=trace_id, document=doc, metadata=meta, distance=dist
+                )
             )
         return traces
 
@@ -91,7 +93,9 @@ class ReasoningBank:
         if trace.score < MIN_UPSERT_SCORE:
             logger.debug(
                 "Trace {} rejected (score {:.2f} < {})",
-                trace.id, trace.score, MIN_UPSERT_SCORE,
+                trace.id,
+                trace.score,
+                MIN_UPSERT_SCORE,
             )
             return False
         vec = self.embedder.embed_one(trace.document_text())

@@ -11,11 +11,15 @@ build/
 .ruff_cache/
 data/reasoning_bank/*
 !data/reasoning_bank/.gitkeep
+data/checkpoints/
 logs/*
 !logs/.gitkeep
 skills/**/session_*.json
 *.md
 !README.md
 !docs/**/*.md
+*.pdf
 
 .superpowers/
+.output/*
+.input/*

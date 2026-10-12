@@ -2,8 +2,6 @@
 
 from __future__ import annotations
 
-from typing import Any
-
 from pydantic import BaseModel, Field
 
 from polyglot_lc.agents.base import Agent
@@ -24,9 +22,7 @@ class Critique(BaseModel):
         if self.issues:
             lines.append("Issues:\n" + "\n".join(f"- {i}" for i in self.issues))
         if self.suggestions:
-            lines.append(
-                "Suggestions:\n" + "\n".join(f"- {s}" for s in self.suggestions)
-            )
+            lines.append("Suggestions:\n" + "\n".join(f"- {s}" for s in self.suggestions))
         return "\n".join(lines)
 
 
@@ -44,6 +40,7 @@ class CriticAgent(Agent):
         glossary_md: str = "",
         strategy: str = "",
         pitfalls: list[str] | None = None,
+        section_note: str = "",
     ) -> Critique:
         """Score *draft* (0-10) against *source* on fidelity, fluency, terms.
 
@@ -52,13 +49,30 @@ class CriticAgent(Agent):
         """
         messages = [
             source_context_messages(
-                src_lang, tgt_lang, strategy, pitfalls, glossary_md, source
+                src_lang,
+                tgt_lang,
+                strategy,
+                pitfalls,
+                glossary_md,
+                source,
+                section_note,
             )
         ]
         dynamic = (
             "You are a meticulous translation critic.\n"
             f"Translation ({tgt_lang}):\n{draft[:2500]}\n\n"
-            "Score fidelity, fluency and terminology from 0 to 10. "
+            "Score fidelity, fluency, terminology and structure from 0 to 10 "
+            "against this rubric:\n"
+            "- 9-10: publishable as-is; nothing a careful editor would touch.\n"
+            "- 7-8: good, only minor nits; safe to ship.\n"
+            "- 4-6: one real defect (mistranslation, dropped or added "
+            "content, wrong term, broken structure) that must be fixed.\n"
+            "- 0-3: unusable.\n"
+            "Be strict about two things: the draft must keep the source's "
+            "headings, lists, placeholders and Markdown table rows (report a "
+            "flattened or rewritten table as an issue), and it must use the "
+            "glossary exactly. Below 7, every issue must name the exact text "
+            "at fault so it can be fixed without re-reading the whole chunk.\n"
             "Reply ONLY with JSON:\n"
             '{"score": 8.5, "issues": ["..."], "suggestions": ["..."]}'
         )

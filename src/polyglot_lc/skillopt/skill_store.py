@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import math
 import time
 from pathlib import Path
 from typing import Any
@@ -17,9 +18,7 @@ class SkillStore:
     def _path(self, src: str, tgt: str, domain: str) -> Path:
         return self.dir / f"{src}-{tgt}" / f"{domain or 'general'}.json"
 
-    def load(
-        self, src: str, tgt: str, domain: str
-    ) -> dict[str, Any] | None:
+    def load(self, src: str, tgt: str, domain: str) -> dict[str, Any] | None:
         """Return the promoted skill, or None when absent."""
         p = self._path(src, tgt, domain)
         if not p.exists():
@@ -41,9 +40,7 @@ class SkillStore:
         p.parent.mkdir(parents=True, exist_ok=True)
         skill.setdefault("updated_at", time.time())
         tmp = p.with_suffix(".tmp")
-        tmp.write_text(
-            json.dumps(skill, ensure_ascii=False, indent=2), encoding="utf-8"
-        )
+        tmp.write_text(json.dumps(skill, ensure_ascii=False, indent=2), encoding="utf-8")
         tmp.replace(p)
         return p
 
@@ -51,9 +48,7 @@ class SkillStore:
         """Path of the rolling score-history file (not a promoted skill)."""
         return self._path(src, tgt, domain).with_name(f"{domain or 'general'}.history.jsonl")
 
-    def append_score(
-        self, src: str, tgt: str, domain: str, score: float
-    ) -> list[float]:
+    def append_score(self, src: str, tgt: str, domain: str, score: float) -> list[float]:
         """Append a critic score to history, keeping the last 50 entries."""
         hp = self.history_path(src, tgt, domain)
         hp.parent.mkdir(parents=True, exist_ok=True)
@@ -67,17 +62,12 @@ class SkillStore:
         scores.append(score)
         scores = scores[-50:]
         hp.write_text(
-            "\n".join(
-                json.dumps({"score": s, "ts": time.time()}) for s in scores
-            )
-            + "\n",
+            "\n".join(json.dumps({"score": s, "ts": time.time()}) for s in scores) + "\n",
             encoding="utf-8",
         )
         return scores
 
-    def recent_scores(
-        self, src: str, tgt: str, domain: str, n: int = 20
-    ) -> list[float]:
+    def recent_scores(self, src: str, tgt: str, domain: str, n: int = 20) -> list[float]:
         """The last *n* non-NaN scores for this pair/domain."""
         vals: list[float] = []
         hp = self.history_path(src, tgt, domain)
@@ -87,7 +77,7 @@ class SkillStore:
                     s = float(json.loads(line)["score"])
                 except (json.JSONDecodeError, KeyError, ValueError):
                     continue
-                if s == s:  # NaN check
+                if not math.isnan(s):  # skip NaN sentinels
                     vals.append(s)
         return vals[-n:]
 

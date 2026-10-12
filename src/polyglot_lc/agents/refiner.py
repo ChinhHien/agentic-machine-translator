@@ -21,6 +21,7 @@ class RefinerAgent(Agent):
         strategy: str = "",
         pitfalls: list[str] | None = None,
         glossary_md: str = "",
+        section_note: str = "",
     ) -> str:
         """Return the refined translation for *draft*.
 
@@ -29,7 +30,13 @@ class RefinerAgent(Agent):
         """
         messages = [
             source_context_messages(
-                src_lang, tgt_lang, strategy, pitfalls, glossary_md, source
+                src_lang,
+                tgt_lang,
+                strategy,
+                pitfalls,
+                glossary_md,
+                source,
+                section_note,
             ),
             {
                 "role": "user",
@@ -38,8 +45,9 @@ class RefinerAgent(Agent):
                     f"Current draft:\n{draft[:2000]}\n\n"
                     f"Critic feedback:\n{critique_text[:1500]}\n\n"
                     "Rewrite the draft fixing every issue, referring to the "
-                    "source text above. Keep formatting and placeholders "
-                    "intact. Output ONLY the improved translation."
+                    "source text above. Keep the structure intact: headings, "
+                    "lists, placeholders and Markdown table rows stay as they "
+                    "are. Output ONLY the improved translation."
                 ),
             },
         ]

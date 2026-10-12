@@ -28,9 +28,7 @@ class TranslationMemory:
         with self._lock:
             self._store.setdefault(key, []).append((src.strip(), tgt.strip()))
 
-    def lookup(
-        self, src: str, src_lang: str = "", tgt_lang: str = "", top: int = 2
-    ) -> Pairs:
+    def lookup(self, src: str, src_lang: str = "", tgt_lang: str = "", top: int = 2) -> Pairs:
         """Return up to *top* matches (exact first, then fuzzy >= threshold)."""
         key = f"{src_lang or 'auto'}->{tgt_lang or 'auto'}"
         with self._lock:

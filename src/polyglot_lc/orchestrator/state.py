@@ -8,15 +8,17 @@ from typing_extensions import TypedDict
 
 
 class ChunkState(TypedDict, total=False):
-    """State for one chunk: Translate -> Critic -> [Refiner -> Critic] -> Verify.
+    """State for one chunk: Translate -> [Critic -> Refiner] -> Verify -> Collect.
 
     Document-level values (strategy, glossary, language pair) are copied into
     each chunk's state so independent chunks can run concurrently without
-    sharing mutable state.
+    sharing mutable state. The adaptive routing fields are per chunk: the
+    coordinator computes ``complexity`` before dispatch, and the Translator node
+    derives ``draft_score`` / ``fast_path`` from the draft it just produced.
     """
 
     # Document-level context (read-only during chunk processing)
-    chunk: Any                       # segment.chunker.Chunk
+    chunk: Any  # segment.chunker.Chunk
     src_lang: str
     tgt_lang: str
     domain: str
@@ -25,14 +27,23 @@ class ChunkState(TypedDict, total=False):
     pitfalls: list[str]
     glossary_md: str
 
+    # Adaptive routing (per chunk)
+    complexity: float | None  # 0..1 difficulty; None disables the fast path
+    section_note: str  # Planner guidance for this chunk's section
+    draft_score: float  # deterministic draft quality, 0-10
+    draft_issues: list[str]
+    fast_path: bool  # True -> skip Critic/Refiner, verify directly
+    skip_llm_verify: bool  # True -> deterministic hard checks only
+
     # Per-chunk working set
     draft: str
-    critique: Any                    # Critique | None
+    critique: Any  # Critique | None
     refine_round: int
-    verify_result: Any               # VerifyResult | None
-    retranslate_count: int           # semantic retranslate retries (bounded)
+    verify_result: Any  # VerifyResult | None
+    retranslate_count: int  # semantic retranslate retries (bounded)
 
     # Outputs
-    translated: str                  # final draft for this chunk
-    trace: dict[str, Any]            # reasoning-bank trace (for scoring)
-    stored: bool                     # whether the trace passed the RB gate
+    translated: str  # final draft for this chunk
+    path: str  # fast | standard | deep (which route ran)
+    trace: dict[str, Any]  # reasoning-bank trace (for scoring)
+    stored: bool  # whether the trace passed the RB gate

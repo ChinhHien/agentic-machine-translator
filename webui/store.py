@@ -1,8 +1,13 @@
-"""Stores for the web UI: configuration now, runs/skills/glossaries later.
+"""Stores for the web UI: runs, skills and glossaries.
 
 Everything here is a plain file reader meant to be called from the server
 process, so nothing in this module imports :mod:`polyglot_lc` (see the package
 docstring in :mod:`webui`).
+
+There is deliberately no configuration store: the web application has no view
+of `.env` at all — not a value, not a key name, not whether a key is set. What
+a run needs from the environment it inherits from the process that started the
+server, and the terminal is where a human inspects or changes that.
 """
 
 from __future__ import annotations
@@ -10,181 +15,11 @@ from __future__ import annotations
 import csv
 import json
 import os
-import re
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any
 
 from webui.paths import safe_child
-
-#: Settings the UI may change; values are written into `.env`.
-EDITABLE_KEYS: tuple[str, ...] = (
-    "CHUNK_MAX_TOKENS",
-    "CHUNK_OVERLAP_TOKENS",
-    "MAX_CONCURRENCY",
-    "CRITIC_THRESHOLD",
-    "REFINE_ROUNDS",
-    "REFINE_MIN_SCORE",
-    "RB_TOP_K",
-    "UNIFIED_PLANNER",
-    "ADAPTIVE_QUALITY",
-    "FAST_PATH_MAX_COMPLEXITY",
-    "FAST_PATH_MIN_SCORE",
-    "FAST_PATH_SKIP_LLM_VERIFY",
-    "CONSISTENCY_CHECK",
-    "CONSISTENCY_MAX_PATCHES",
-    "PARTIAL_OUTPUT",
-    "RESUME",
-    "PDF_EXTRACTOR",
-    "LLM_MOCK",
-)
-
-#: Settings the UI only displays. Repointing a path from the UI would send a
-#: later run's output somewhere unexpected, for no benefit the UI can explain.
-READONLY_KEYS: tuple[str, ...] = (
-    "LOGS_DIR",
-    "SKILLS_DIR",
-    "REASONING_BANK_PATH",
-    "CHECKPOINT_DIR",
-)
-
-#: Credentials the project documents in `.env.example`. The UI reports only
-#: whether each one is set, so a user can see why a run would fail while no
-#: value ever enters the server process. `tests/test_webui_store.py` fails when
-#: `.env.example` grows a credential this list does not know about.
-SECRET_KEYS: tuple[str, ...] = (
-    "TRANSLATOR_API_KEY",
-    "TRANSLATOR_BACKUP_API_KEY",
-    "PLANNER_API_KEY",
-    "VERIFIER_API_KEY",
-    "CRITIC_API_KEY",
-    "REFINER_API_KEY",
-    "SOURCE_GROUP_API_KEY",
-    "EMBED_API_KEY",
-)
-
-#: Name fragments marking a value the server must never read or return.
-_SECRET_MARKERS = ("KEY", "TOKEN", "SECRET", "PASSWORD")
-
-#: A `NAME = value` (or bare `NAME`) assignment line.
-_KEY_LINE_RE = re.compile(r"^\s*([A-Za-z_][A-Za-z0-9_]*)\s*=")
-
-
-def is_secret(name: str) -> bool:
-    """True when *name* looks like a credential the UI must not touch.
-
-    Markers are matched as whole underscore-separated segments, or as a suffix
-    of the collapsed name, rather than as plain substrings. Plain substring
-    matching flags ``CHUNK_MAX_TOKENS`` (it contains ``TOKEN``) and so would
-    declare a token *budget* a credential — contradicting the spec, which lists
-    that setting as editable. The direction is still conservative: a name is
-    secret when it has any doubt, so ``x_token`` and ``OPENAI_APIKEY`` are both
-    caught.
-    """
-    upper = name.upper()
-    if any(segment in _SECRET_MARKERS for segment in upper.split("_")):
-        return True
-    collapsed = upper.replace("_", "")
-    return any(collapsed.endswith(marker) for marker in _SECRET_MARKERS)
-
-
-class ConfigStore:
-    """Reads and writes `.env` without ever touching a secret's value.
-
-    ``env_keys`` returns the *names* present in the file (never values), and
-    ``save`` rewrites exactly the lines for the keys it was asked to change,
-    leaving comments, blank lines and every other setting byte-for-byte alone.
-    Writes go through a temporary file in the same directory so a reader can
-    never see a half-written `.env`.
-    """
-
-    def __init__(self, root: Path, env_path: Path) -> None:
-        self.root = root
-        self.env_path = env_path
-
-    def _read_text(self) -> str:
-        """The file's exact text, with its own line endings preserved.
-
-        ``Path.read_text`` uses universal newlines, which silently rewrites
-        CRLF to LF on the way in; the style is then lost and ``save`` would
-        write the whole file with the wrong ending. Reading with ``newline=""``
-        keeps the bytes as they are.
-        """
-        try:
-            with self.env_path.open("r", encoding="utf-8", newline="") as handle:
-                return handle.read()
-        except FileNotFoundError:
-            return ""
-        except OSError:  # pragma: no cover - unreadable or exotic file
-            return ""
-
-    def env_keys(self) -> set[str]:
-        """Names of the settings assigned in `.env` — never their values."""
-        return {
-            match.group(1)
-            for line in self._read_text().splitlines()
-            if (match := _KEY_LINE_RE.match(line))
-        }
-
-    def secret_status(self) -> dict[str, str]:
-        """``"set"``/``"unset"`` per credential name — never a value.
-
-        Names come from :data:`SECRET_KEYS` plus anything secret-shaped already
-        in `.env`, so a credential the user added by hand also shows up. The
-        process environment is consulted **by name only**, which is why a key
-        exported in the shell reads "set" even when `.env` never mentions it —
-        exactly the priority order the UI has to explain to the user.
-        """
-        in_dotenv = self.env_keys()
-        in_env = set(os.environ)
-        names = set(SECRET_KEYS) | {name for name in in_dotenv if is_secret(name)}
-        return {
-            name: ("set" if name in in_dotenv or name in in_env else "unset")
-            for name in sorted(names)
-        }
-
-    @staticmethod
-    def _render(value: Any) -> str:
-        """Render a value the way `python-dotenv` reads it back."""
-        if isinstance(value, bool):
-            return "1" if value else "0"
-        return str(value)
-
-    def save(self, values: dict[str, Any]) -> tuple[list[str], list[dict[str, str]]]:
-        """Apply an editable whitelist of *values*; return (saved, rejected)."""
-        saved: list[str] = []
-        rejected: list[dict[str, str]] = []
-        text = self._read_text()
-        newline = "\r\n" if "\r\n" in text else "\n"
-        lines = text.splitlines()
-        for key, value in values.items():
-            # Secrets are refused before the whitelist check, so a credential
-            # can never be written even if a whitelist entry were added wrongly.
-            if is_secret(key):
-                rejected.append({"key": key, "reason": "secret"})
-                continue
-            if key not in EDITABLE_KEYS:
-                rejected.append({"key": key, "reason": "not editable"})
-                continue
-            rendered = f"{key}={self._render(value)}"
-            for index, line in enumerate(lines):
-                match = _KEY_LINE_RE.match(line)
-                if match is not None and match.group(1) == key:
-                    lines[index] = rendered
-                    break
-            else:
-                lines.append(rendered)
-            saved.append(key)
-        if lines:
-            self._write_atomic(newline.join(lines) + newline)
-        return saved, rejected
-
-    def _write_atomic(self, body: str) -> None:
-        """Write *body* through a temp file so readers never see it half-written."""
-        self.env_path.parent.mkdir(parents=True, exist_ok=True)
-        tmp = self.env_path.with_name(self.env_path.name + ".tmp")
-        tmp.write_text(body, encoding="utf-8", newline="")
-        os.replace(tmp, self.env_path)
 
 
 # ---------------------------------------------------------------------------
@@ -357,6 +192,28 @@ class RunsStore:
         start = max(0, int(after))
         return events[start:], len(events), malformed
 
+    def tail_output(self, run_id: str, limit: int = 40) -> str:
+        """The last *limit* lines the run itself printed.
+
+        A child can die before it writes any event (a configuration error at
+        import time is the common case), and then the event log is empty while
+        the reason is sitting in stderr. This is what lets the page answer
+        "why did it stop?" with the run's own words instead of a guess.
+        """
+        try:
+            directory = self.dir_for(run_id)
+        except ValueError:
+            return ""
+        for name in ("stderr.log", "stdout.log"):
+            try:
+                text = (directory / name).read_text(encoding="utf-8", errors="replace")
+            except OSError:
+                continue
+            lines = [line.rstrip() for line in text.splitlines() if line.strip()]
+            if lines:
+                return "\n".join(lines[-limit:])
+        return ""
+
 
 # ---------------------------------------------------------------------------
 # Skills
@@ -398,16 +255,18 @@ class SkillsStore:
             data = _read_json(path)
             if not isinstance(data, dict):
                 continue
-            found.append({
-                "pair": path.parent.name,
-                "domain": path.stem,
-                "mean_score": data.get("mean_score"),
-                "promoted_at": data.get("promoted_at"),
-                "updated_at": data.get("updated_at"),
-                "instruction": str(data.get("instruction", "")),
-                "src_lang": str(data.get("src_lang", "")),
-                "tgt_lang": str(data.get("tgt_lang", "")),
-            })
+            found.append(
+                {
+                    "pair": path.parent.name,
+                    "domain": path.stem,
+                    "mean_score": data.get("mean_score"),
+                    "promoted_at": data.get("promoted_at"),
+                    "updated_at": data.get("updated_at"),
+                    "instruction": str(data.get("instruction", "")),
+                    "src_lang": str(data.get("src_lang", "")),
+                    "tgt_lang": str(data.get("tgt_lang", "")),
+                }
+            )
         found.sort(key=lambda skill: (skill["pair"], skill["domain"]))
         return found
 
@@ -472,11 +331,7 @@ class GlossaryStore:
         path = self.path_for(name)
         try:
             with path.open("r", encoding="utf-8-sig", newline="") as handle:
-                return [
-                    [cell.strip() for cell in row]
-                    for row in csv.reader(handle)
-                    if row
-                ]
+                return [[cell.strip() for cell in row] for row in csv.reader(handle) if row]
         except OSError:
             return []
 

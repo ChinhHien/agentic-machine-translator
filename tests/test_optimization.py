@@ -72,8 +72,12 @@ def test_read_source_group_shares_identical_prefix(mock_env):
     refiner = RefinerAgent(get_agent_config("REFINER"))
 
     translator_msgs = translator.build_prompt(
-        "Source chunk text.", "en", "vi", "literal",
-        pitfalls=["avoid literalism"], glossary_md="- NMT (x2)",
+        "Source chunk text.",
+        "en",
+        "vi",
+        "literal",
+        pitfalls=["avoid literalism"],
+        glossary_md="- NMT (x2)",
     )
 
     captured: dict[str, list] = {}
@@ -90,12 +94,23 @@ def test_read_source_group_shares_identical_prefix(mock_env):
     refiner.chat = fake_chat  # type: ignore[assignment]
 
     critic.review(
-        "Source chunk text.", "draft", "en", "vi",
-        glossary_md="- NMT (x2)", strategy="literal", pitfalls=["avoid literalism"],
+        "Source chunk text.",
+        "draft",
+        "en",
+        "vi",
+        glossary_md="- NMT (x2)",
+        strategy="literal",
+        pitfalls=["avoid literalism"],
     )
     refiner.refine(
-        "Source chunk text.", "draft", "Score: 3.0/10", "en", "vi",
-        strategy="literal", pitfalls=["avoid literalism"], glossary_md="- NMT (x2)",
+        "Source chunk text.",
+        "draft",
+        "Score: 3.0/10",
+        "en",
+        "vi",
+        strategy="literal",
+        pitfalls=["avoid literalism"],
+        glossary_md="- NMT (x2)",
     )
 
     prefix = translator_msgs[0]["content"]
@@ -123,7 +138,7 @@ class _CountingPlanner:
     def __init__(self) -> None:
         self.calls = 0
 
-    def chat(self, messages, **kw):  # noqa: ANN001, ANN003
+    def chat(self, messages, **kw):
         self.calls += 1
         return SimpleNamespace(text="summary")
 
@@ -168,22 +183,31 @@ def test_verifier_truncates_source_to_chunk_context(mock_env):
 
 
 # ------------------------- planner runs once --------------------------------
-def test_planner_runs_once_per_run(mock_env, sample_md_file, monkeypatch):
-    from polyglot_lc.agents.planner import PlannerAgent
-
-    calls = {"n": 0}
-    original = PlannerAgent.plan
-
-    def wrapped(self, *args, **kwargs):  # noqa: ANN001, ANN002, ANN003
-        calls["n"] += 1
-        return original(self, *args, **kwargs)
-
-    monkeypatch.setattr(PlannerAgent, "plan", wrapped)
+def test_document_plan_costs_one_planner_request(mock_env, sample_pdf_file):
+    """The whole document plan (summary + strategy + glossary) is one request."""
     from polyglot_lc.pipeline import TranslationPipeline
 
     pipeline = TranslationPipeline(quiet=True)
-    pipeline.run(sample_md_file, src="en", tgt="vi")
-    assert calls["n"] == 1
+    result = pipeline.run(sample_pdf_file, src="en", tgt="vi")
+    # One Planner request for the document plan; the SkillOpt gradient call and
+    # any consistency patch are separate and not counted here.
+    assert result.planner_calls == 1
+
+
+def test_legacy_summary_tree_path_is_still_available(mock_env, sample_pdf_file, monkeypatch):
+    """UNIFIED_PLANNER=0 falls back to the old (more expensive) planning flow."""
+    from polyglot_lc.pipeline import TranslationPipeline
+
+    unified = TranslationPipeline(quiet=True).run(sample_pdf_file, src="en", tgt="vi")
+    assert unified.planner_calls == 1
+
+    monkeypatch.setenv("UNIFIED_PLANNER", "0")
+    legacy = TranslationPipeline(quiet=True).run(
+        sample_pdf_file, src="en", tgt="vi", out=str(sample_pdf_file.with_suffix(".legacy.md"))
+    )
+    # summary tree (one request per section + one for the document) + the plan
+    assert legacy.planner_calls > unified.planner_calls
+    assert legacy.output_path
 
 
 # ------------------------- CLI token report ---------------------------------
@@ -191,10 +215,10 @@ def test_cli_token_report_shows_cache_and_models():
     from polyglot_lc.cli import _token_report
 
     TokenUsage.reset()
-    TokenUsage.add(1000, 200, agent="TRANSLATOR", cached_tokens=600,
-                   model="m1", provider="http://a/v1")
-    TokenUsage.add(500, 100, agent="VERIFIER",
-                   model="m2", provider="http://b/v1")
+    TokenUsage.add(
+        1000, 200, agent="TRANSLATOR", cached_tokens=600, model="m1", provider="http://a/v1"
+    )
+    TokenUsage.add(500, 100, agent="VERIFIER", model="m2", provider="http://b/v1")
     report = _token_report()
     assert "Cached input:   600" in report
     assert "Uncached input: 900" in report

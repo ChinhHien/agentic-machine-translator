@@ -2,8 +2,8 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from pathlib import Path
-from typing import Callable
 
 from loguru import logger
 
@@ -25,7 +25,8 @@ def get_loader(ext: str) -> Loader:
     key = ext.lower().lstrip(".")
     if key not in _REGISTRY:
         raise ValueError(
-            f"Unsupported file extension {ext!r}. Supported: {sorted(_REGISTRY)}"
+            f"Unsupported file extension {ext!r}. This project translates PDF "
+            "input only (no OCR, no Markdown/text input)."
         )
     return _REGISTRY[key]
 
@@ -46,15 +47,9 @@ def load_document(path: str | Path) -> Document:
 
 # Built-in loaders -------------------------------------------------------
 def _bootstrap() -> None:
-    from polyglot_lc.ingest import md as _md
     from polyglot_lc.ingest import pdf as _pdf
-    from polyglot_lc.ingest import txt as _txt
 
     register("pdf", _pdf.load_pdf)
-    register("txt", _txt.load_txt)
-    register("text", _txt.load_txt)
-    register("md", _md.load_md)
-    register("markdown", _md.load_md)
 
 
 _bootstrap()

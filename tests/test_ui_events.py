@@ -51,9 +51,8 @@ def test_simpleui_prints_steps_and_captures_failure(tmp_path):
     with ui:
         with ui.step("ok-step"):
             pass
-        with pytest.raises(ValueError):
-            with ui.step("bad-step", "chunk-000"):
-                raise ValueError("kaput")
+        with pytest.raises(ValueError), ui.step("bad-step", "chunk-000"):
+            raise ValueError("kaput")
     assert any("bad-step" in e for e in ui.errors)
     rendered = console.file.getvalue()
     assert "Running ok-step" in rendered
@@ -66,12 +65,11 @@ def test_simpleui_quiet_suppresses_step_lines(tmp_path):
     sink = EventSink(tmp_path, enabled=False)
     console = Console(file=io.StringIO(), width=100, force_terminal=False)
     ui = SimpleUI(sink, console=console, quiet=True)
-    with ui:
-        with ui.step("translate"):
-            pass
+    with ui, ui.step("translate"):
+        pass
     assert console.file.getvalue().strip() == ""
     # events are still logged regardless of quiet mode
-    assert list(sink.tail(1))[0].step == "translate"
+    assert next(iter(sink.tail(1))).step == "translate"
 
 
 def test_simpleui_set_stats_and_errors(tmp_path):
@@ -85,29 +83,100 @@ def test_simpleui_set_stats_and_errors(tmp_path):
     assert ui.errors == ["boom"]
 
 
-def test_step_standalone_sink(tmp_path):
-    from polyglot_lc.ui.step import step
+def test_simpleui_failure_is_recorded_as_an_event(tmp_path):
+    """The live path (SimpleUI.step) is the only step context there is."""
+    sink = EventSink(tmp_path, enabled=False)
+    ui = SimpleUI(sink, quiet=True)
+    with pytest.raises(RuntimeError), ui.step("solo"):
+        raise RuntimeError("x")
+    assert next(iter(sink.tail(1))).status == "fail"
+    assert any("solo" in e for e in ui.errors)
+
+
+def test_step_end_carries_duration_and_the_token_delta_for_that_step(tmp_path):
+    """Tokens per step are a delta against the global counter, not a total."""
+    TokenUsage.reset()
+    sink = EventSink(tmp_path, enabled=True)
+    ui = SimpleUI(sink, quiet=True)
+    with ui.step("translate", "chunk-000"):
+        TokenUsage.add(120, 40, agent="TRANSLATOR", model="m", provider="http://x/v1")
+    line = json.loads(sink.path.read_text(encoding="utf-8").splitlines()[-1])
+    assert line["status"] == "ok"
+    assert line["type"] == "step_end"
+    assert line["duration_ms"] >= 0
+    assert line["tokens"] == {"sent": 120, "received": 40, "cached": 0}
+
+
+def test_a_failing_step_records_a_cause_from_the_closed_set(tmp_path):
+    from polyglot_lc.llm.resilience import RateLimitError
+    from polyglot_lc.ui.trace import CAUSES
+
+    sink = EventSink(tmp_path, enabled=True)
+    ui = SimpleUI(sink, quiet=True)
+    with pytest.raises(RateLimitError), ui.step("translate", "chunk-000"):
+        raise RateLimitError("429 rate limit exceeded")
+    line = json.loads(sink.path.read_text(encoding="utf-8").splitlines()[-1])
+    assert line["status"] == "fail"
+    assert line["cause"] == "rate_limit" and line["cause"] in CAUSES
+
+
+def test_every_record_carries_the_run_id_and_the_existing_keys_survive(tmp_path):
+    """A reader written before the richer records existed must not need updating."""
+    sink = EventSink(tmp_path, enabled=True, run_id="20261012_015104_dad6b2")
+    sink.record(type="run_note", text="reasoning bank unavailable")
+    line = json.loads(sink.path.read_text(encoding="utf-8").splitlines()[-1])
+    assert line["run_id"] == "20261012_015104_dad6b2"
+    assert line["type"] == "run_note" and line["ts"] > 0
+    assert {"ts", "step", "chunk_id", "status", "latency", "error"} <= set(line)
+    assert line["text"] == "reasoning bank unavailable"
+
+
+def test_an_error_record_speaks_the_old_vocabulary_too(tmp_path):
+    """The web UI filters on status, so an error record has to look like a fail."""
+    sink = EventSink(tmp_path, enabled=True)
+    sink.record(
+        type="error", step="translate", chunk_id="chunk-000", cause="rate_limit", message="429"
+    )
+    line = json.loads(sink.path.read_text(encoding="utf-8").splitlines()[-1])
+    assert line["status"] == "fail"
+    assert line["error"] == "429" and line["cause"] == "rate_limit"
+    assert sink.problem_count == 1
+
+
+def test_the_problem_count_reconciles_with_the_failures_written(tmp_path):
+    sink = EventSink(tmp_path, enabled=True)
+    sink.fail("translate", "chunk-000", error="boom")
+    sink.record(type="error", step="verify", cause="verify", message="nope")
+    sink.emit(Event(step="translate", chunk_id="chunk-001", status="ok"))
+    assert sink.problem_count == 2
+
+
+def test_events_written_through_emit_carry_the_run_id(tmp_path):
+    sink = EventSink(tmp_path, enabled=True, run_id="r1")
+    sink.emit(Event(step="translate", chunk_id="chunk-000", status="ok"))
+    line = json.loads(sink.path.read_text(encoding="utf-8").splitlines()[-1])
+    assert line["run_id"] == "r1"
+    assert {"ts", "step", "chunk_id", "status", "latency", "error"} <= set(line)
+
+
+def test_record_is_a_silent_no_op_when_logging_is_off(tmp_path):
+    sink = EventSink(tmp_path, enabled=False)
+    sink.record(type="run_start", file="x.pdf")  # must not raise, must not write
+    assert sink.path is None
+
+
+def test_a_run_id_minted_here_matches_the_web_ui_shape(tmp_path):
+    import re
 
     sink = EventSink(tmp_path, enabled=False)
-    with step("solo", sink=sink):
-        pass
-    assert list(sink.tail(1))[0].status == "ok"
-
-
-def test_step_standalone_failure(tmp_path):
-    from polyglot_lc.ui.step import step
-
-    sink = EventSink(tmp_path, enabled=False)
-    with pytest.raises(RuntimeError):
-        with step("solo", sink=sink):
-            raise RuntimeError("x")
-    assert list(sink.tail(1))[0].status == "fail"
+    assert re.fullmatch(r"\d{8}_\d{6}_[0-9a-f]{6}", sink.run_id)
 
 
 def test_simpleui_run_with_cached_metrics_does_not_break(tmp_path):
     TokenUsage.reset()
-    TokenUsage.add(100, 10, agent="TRANSLATOR", cached_tokens=60,
-                   model="mock-model", provider="http://x/v1")
+    TokenUsage.add(
+        100, 10, agent="TRANSLATOR", cached_tokens=60, model="mock-model", provider="http://x/v1"
+    )
     snap = TokenUsage.snapshot()
     assert snap["cached"] == 60
     TokenUsage.reset()

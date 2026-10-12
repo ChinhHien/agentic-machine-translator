@@ -18,7 +18,7 @@ class TranslatorAgent(Agent):
 
     name = "TRANSLATOR"
 
-    def __init__(self, config=None, tm: TranslationMemory | None = None) -> None:  # noqa: ANN001
+    def __init__(self, config=None, tm: TranslationMemory | None = None) -> None:
         super().__init__(config)
         # NB: not `tm or ...` — TranslationMemory defines __len__, so an empty
         # TM is falsy and would silently get replaced by a fresh instance.
@@ -34,6 +34,7 @@ class TranslatorAgent(Agent):
         pitfalls: list[str] | None = None,
         glossary_md: str = "",
         extra_critique: str = "",
+        section_note: str = "",
     ) -> list[dict[str, str]]:
         """Assemble the translation prompt (exposed for SkillOpt testing).
 
@@ -43,7 +44,13 @@ class TranslatorAgent(Agent):
         """
         messages = [
             source_context_messages(
-                src_lang, tgt_lang, strategy, pitfalls, glossary_md, chunk_text
+                src_lang,
+                tgt_lang,
+                strategy,
+                pitfalls,
+                glossary_md,
+                chunk_text,
+                section_note,
             )
         ]
         user_parts: list[str] = []
@@ -52,17 +59,26 @@ class TranslatorAgent(Agent):
         tm_hits = self.tm.lookup(chunk_text, src_lang, tgt_lang)
         if tm_hits:
             user_parts.append(
-                "Translation memory matches:\n"
-                + "\n".join(f"- {s} => {t}" for s, t in tm_hits)
+                "Translation memory matches:\n" + "\n".join(f"- {s} => {t}" for s, t in tm_hits)
             )
         if extra_critique:
+            # Carries the verifier's rejection reasons on the single bounded
+            # retranslate, so the wording stays neutral about who rejected it.
             user_parts.append(
-                "A previous draft was criticized; fix these issues:\n" + extra_critique
+                "An earlier draft was rejected for these reasons; the new "
+                "translation must fix every one of them:\n" + extra_critique
             )
         user_parts.append(
             "Rules:\n"
             "- Translate the source text above faithfully; keep formatting, "
             "headings and placeholders (e.g. ⟦CODE_1⟧) exactly as-is.\n"
+            "- Preserve the document structure exactly: keep every paragraph "
+            "separated by a blank line, keep headings (#, ##...) and bullet "
+            "lists as-is, and never merge two paragraphs into one.\n"
+            "- Keep Markdown tables as tables: translate the text inside a "
+            "cell, but keep the rows, the `|` separators and the `| --- |` "
+            "header line, and never rewrite a table as prose or merge its "
+            "cells into a sentence.\n"
             "- Use the glossary consistently.\n"
             "- Output ONLY the translation, no commentary."
         )

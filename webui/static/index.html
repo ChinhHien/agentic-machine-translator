@@ -3,137 +3,249 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>polyglot-lc — bàn điều khiển dịch</title>
+<meta name="color-scheme" content="light dark">
+<title>polyglot-lc — dịch tài liệu PDF</title>
 <link rel="stylesheet" href="/static/app.css">
 </head>
 <body>
 
-<p id="banner" class="banner" role="status" hidden></p>
+<header class="topbar">
+  <p class="brand">polyglot-lc</p>
+  <div class="topbar-actions">
+    <button id="nav-tools" class="btn" type="button" aria-expanded="false" aria-controls="drawer">
+      Công cụ
+    </button>
+    <button id="nav-new" class="btn btn--primary" type="button">Dịch tài liệu mới</button>
+  </div>
+</header>
 
-<div class="app">
+<p id="banner" class="banner" role="status" aria-live="polite" hidden></p>
 
-  <aside class="rail">
+<div class="layout">
 
-    <section id="launcher" class="panel" aria-labelledby="launcher-title">
-      <h1 id="launcher-title" class="wordmark">polyglot-lc</h1>
-      <p class="subtitle">Dịch tài liệu dài bằng nhiều agent, theo dõi từng chunk.</p>
-
-      <div class="field">
-        <label for="file">Tài liệu trong <code>input/</code></label>
-        <select id="file"></select>
-      </div>
-
-      <div class="pair">
-        <div class="field">
-          <label for="src">Ngôn ngữ nguồn</label>
-          <input id="src" name="src" value="auto" autocomplete="off" spellcheck="false">
-        </div>
-        <div class="field">
-          <label for="tgt">Ngôn ngữ đích</label>
-          <input id="tgt" name="tgt" value="vi" autocomplete="off" spellcheck="false">
-        </div>
-      </div>
-
-      <div class="field">
-        <label for="domain">Lĩnh vực</label>
-        <input id="domain" name="domain" value="general" autocomplete="off" spellcheck="false">
-      </div>
-
-      <div class="field">
-        <label for="glossary">Glossary</label>
-        <select id="glossary"></select>
-      </div>
-
-      <div class="field">
-        <label for="max-tokens">Token mỗi chunk</label>
-        <input id="max-tokens" name="max-tokens" type="number" min="64" step="16"
-               placeholder="theo cấu hình" inputmode="numeric">
-      </div>
-
-      <label class="check" for="mock">
-        <input id="mock" name="mock" type="checkbox">
-        <span>Chạy thử, không cần API key</span>
-      </label>
-
-      <div class="actions">
-        <button id="run-button" type="button" class="primary">Chạy</button>
-        <button id="stop-button" type="button" disabled>Dừng</button>
-      </div>
-      <p id="run-hint" class="hint">Chưa có lượt chạy nào được chọn.</p>
-    </section>
-
-    <section id="history" class="panel" aria-labelledby="history-title">
-      <h2 id="history-title" class="panel-title">Lịch sử</h2>
-      <ol id="run-list" class="runs" aria-label="Các lượt chạy gần đây"></ol>
-    </section>
-
-    <details id="config-panel" class="panel panel--fold">
-      <summary>Tùy chọn dịch</summary>
-      <p id="config-note" class="hint"></p>
-      <div id="config-fields"></div>
-      <div class="actions">
-        <button id="config-save" type="button">Lưu thay đổi</button>
-      </div>
-    </details>
-
-    <details id="glossary-panel" class="panel panel--fold">
-      <summary>Glossary</summary>
-      <div class="field">
-        <label for="glossary-name">Tên file</label>
-        <input id="glossary-name" name="glossary-name" placeholder="legal.csv" autocomplete="off">
-      </div>
-      <div class="field">
-        <label for="glossary-pairs">Từng cặp, mỗi dòng <code>nguồn, đích</code></label>
-        <textarea id="glossary-pairs" name="glossary-pairs" rows="5" spellcheck="false"></textarea>
-      </div>
-      <div class="actions">
-        <button id="glossary-save" type="button">Lưu glossary</button>
-      </div>
-      <ul id="glossary-list" class="plain"></ul>
-    </details>
-
-    <details id="skills-panel" class="panel panel--fold">
-      <summary>Skill đã học</summary>
-      <ul id="skills-list" class="plain"></ul>
-    </details>
-
+  <aside class="rail" aria-labelledby="jobs-title">
+    <div class="rail-head">
+      <h2 id="jobs-title" class="section-title">Lịch sử</h2>
+      <span id="jobs-count" class="count"></span>
+    </div>
+    <div id="jobs-filter" class="chips" role="group" aria-label="Lọc theo trạng thái"></div>
+    <ul id="jobs" class="jobs" aria-label="Các lượt dịch"></ul>
+    <p id="jobs-empty" class="empty" hidden></p>
   </aside>
 
-  <main class="main">
+  <main class="view">
 
-    <section class="band band--stages" aria-labelledby="stages-title">
-      <h2 id="stages-title" class="band-title">Giai đoạn</h2>
-      <ol id="stage-rail" class="stages" aria-live="polite"></ol>
-    </section>
+    <section id="job" class="job" data-state="empty" aria-labelledby="job-title">
+      <div class="job-head">
+        <div class="job-heading">
+          <h2 id="job-title" class="job-title">Chưa mở lượt dịch nào</h2>
+          <p id="job-meta" class="meta"></p>
+        </div>
+        <span id="job-status" class="badge" data-state="empty"></span>
+      </div>
 
-    <section class="band" aria-labelledby="matrix-title">
-      <h2 id="matrix-title" class="band-title">
-        Chunk <span id="chunk-summary" class="count"></span>
-      </h2>
-      <div id="chunk-matrix" class="matrix" role="list" aria-label="Trạng thái từng chunk"></div>
-      <ul id="matrix-legend" class="legend">
-        <li><span class="swatch swatch--running"></span>đang chạy</li>
-        <li><span class="swatch swatch--ok"></span>xong</li>
-        <li><span class="swatch swatch--patched"></span>có ghi chú thuật ngữ</li>
-        <li><span class="swatch swatch--retry"></span>phải thử lại</li>
-        <li><span class="swatch swatch--fail"></span>lỗi</li>
-        <li><span class="swatch swatch--wait"></span>chờ</li>
-      </ul>
-    </section>
+      <div id="job-actions" class="job-actions"></div>
+      <p id="job-alert" class="alert" hidden></p>
 
-    <section class="band band--proof" aria-labelledby="proof-title">
-      <h2 id="proof-title" class="band-title">Bản dịch</h2>
-      <p id="proof-path" class="path"></p>
-      <article id="proof" class="proof"><p class="empty">Chưa có bản dịch. Chọn một tài liệu rồi bấm Chạy.</p></article>
-    </section>
+      <div id="progress" class="card progress" hidden>
+        <div class="progress-row">
+          <div id="bar" class="bar" data-state="wait" role="progressbar"
+               aria-valuemin="0" aria-valuemax="100" aria-valuenow="0"><div id="bar-fill" class="bar-fill"></div></div>
+          <span id="progress-count" class="mono" aria-live="polite"></span>
+          <span id="progress-elapsed" class="mono"></span>
+        </div>
+        <p id="progress-step" class="progress-step"></p>
+        <p id="progress-routes" class="progress-routes mono"></p>
+        <ol id="steps" class="steps" aria-label="Các bước của pipeline"></ol>
+      </div>
 
-    <section class="band band--events" aria-labelledby="events-title">
-      <h2 id="events-title" class="band-title">Sự kiện</h2>
-      <ol id="events" class="events" aria-live="polite"></ol>
+      <section id="problems" class="card problems" hidden aria-labelledby="problems-title">
+        <h3 id="problems-title" class="card-title">Vấn đề</h3>
+        <ul id="problems-list" class="problems-list"></ul>
+      </section>
+
+      <div class="panes-note">
+        <p class="view-switch" role="group" aria-label="Cách hiển thị">
+          <button id="view-split" class="seg" type="button" aria-pressed="true">Hai cột</button>
+          <button id="view-source" class="seg" type="button" aria-pressed="false">Chỉ bản gốc</button>
+          <button id="view-target" class="seg" type="button" aria-pressed="false">Chỉ bản dịch</button>
+        </p>
+      </div>
+
+      <div id="panes" class="panes" data-view="split">
+        <article id="pane-source" class="pane" data-state="empty" aria-labelledby="source-title">
+          <header class="pane-head">
+            <h3 id="source-title" class="card-title">Bản gốc</h3>
+            <span id="source-meta" class="count"></span>
+          </header>
+          <p id="source-note" class="note"></p>
+          <pre id="source-text" class="pane-text"></pre>
+        </article>
+        <article id="pane-target" class="pane" data-state="empty" aria-labelledby="target-title">
+          <header class="pane-head">
+            <h3 id="target-title" class="card-title">Bản dịch</h3>
+            <span id="target-meta" class="count"></span>
+          </header>
+          <p id="target-note" class="note"></p>
+          <pre id="target-text" class="pane-text"></pre>
+        </article>
+      </div>
     </section>
 
   </main>
 </div>
+
+<dialog id="new-job" class="dialog" aria-labelledby="new-job-title">
+  <form id="new-job-form" class="dialog-form" method="dialog">
+    <h2 id="new-job-title" class="dialog-title">Dịch tài liệu mới</h2>
+    <p id="new-job-alert" class="alert" hidden></p>
+
+    <div id="drop" class="drop" data-state="idle" tabindex="0" role="button"
+         aria-describedby="drop-hint">
+      <p class="drop-title">Kéo thả file PDF vào đây</p>
+      <p id="drop-hint" class="drop-hint">hoặc bấm để chọn — chỉ nhận .pdf có lớp chữ, không OCR</p>
+      <label class="visually-hidden" for="file-input">Chọn file PDF</label>
+      <input id="file-input" class="visually-hidden" type="file" accept="application/pdf,.pdf">
+      <div id="upload-bar" class="bar bar--slim" data-state="wait" hidden><div id="upload-fill" class="bar-fill"></div></div>
+      <p id="upload-note" class="note"></p>
+    </div>
+
+    <fieldset class="field-group">
+      <legend class="legend">Tài liệu có sẵn trong input/</legend>
+      <div id="library" class="library"></div>
+    </fieldset>
+
+    <div class="grid-2">
+      <p class="field">
+        <label class="label" for="src">Ngôn ngữ nguồn</label>
+        <input id="src" class="input" value="auto" list="languages" autocomplete="off"
+               spellcheck="false">
+      </p>
+      <p class="field">
+        <label class="label" for="tgt">Ngôn ngữ đích</label>
+        <input id="tgt" class="input" value="vi" list="languages" autocomplete="off"
+               spellcheck="false">
+      </p>
+    </div>
+    <datalist id="languages">
+      <!-- The value stays the language code the backend expects; the label is
+           only the web UI's display name, so the run is unaffected. -->
+      <option value="auto" label="Tự động"></option>
+      <option value="en" label="Tiếng Anh"></option>
+      <option value="vi" label="Tiếng Việt"></option>
+      <option value="ja" label="Tiếng Nhật"></option>
+      <option value="ko" label="Tiếng Hàn"></option>
+      <option value="zh" label="Tiếng Trung"></option>
+      <option value="fr" label="Tiếng Pháp"></option>
+      <option value="de" label="Tiếng Đức"></option>
+      <option value="es" label="Tiếng Tây Ban Nha"></option>
+    </datalist>
+
+    <fieldset id="formats" class="field-group">
+      <legend class="legend">Kết quả xuất ra</legend>
+      <div class="seg-group">
+        <label class="seg seg--choice" for="format-md">
+          <input id="format-md" name="format" type="radio" value="md" checked>
+          <span>Markdown</span>
+        </label>
+        <label class="seg seg--choice" for="format-pdf">
+          <input id="format-pdf" name="format" type="radio" value="pdf">
+          <span>PDF giữ định dạng</span>
+        </label>
+        <label class="seg seg--choice" for="format-both">
+          <input id="format-both" name="format" type="radio" value="both">
+          <span>Cả hai</span>
+        </label>
+      </div>
+    </fieldset>
+
+    <details class="field-group details">
+      <summary class="summary">Nâng cao</summary>
+      <p class="field">
+        <label class="label" for="domain">Lĩnh vực</label>
+        <input id="domain" class="input" value="general" autocomplete="off" spellcheck="false">
+      </p>
+      <p class="field">
+        <label class="label" for="glossary">Từ điển thuật ngữ</label>
+        <select id="glossary" class="input"></select>
+      </p>
+      <p class="field">
+        <label class="label" for="max-tokens">Token mỗi chunk (không bắt buộc)</label>
+        <input id="max-tokens" class="input" type="number" min="64" step="16"
+               inputmode="numeric" placeholder="theo cấu hình">
+      </p>
+    </details>
+
+    <div class="dialog-actions">
+      <button id="new-job-cancel" class="btn" type="button">Hủy</button>
+      <button id="new-job-start" class="btn btn--primary" type="submit" disabled>
+        Bắt đầu dịch
+      </button>
+    </div>
+  </form>
+</dialog>
+
+<dialog id="confirm-delete" class="dialog dialog--confirm" aria-labelledby="confirm-delete-title">
+  <form method="dialog" class="dialog-form">
+    <h2 id="confirm-delete-title" class="dialog-title">Xóa lượt dịch</h2>
+    <p id="confirm-delete-msg" class="confirm-copy">
+      Xóa hoàn toàn lượt dịch này khỏi lịch sử (cả bản dịch)?
+      Hành động này không hoàn tác được.
+    </p>
+    <div class="dialog-actions">
+      <button value="cancel" class="btn" type="submit">Hủy</button>
+      <button value="delete" class="btn btn--danger" type="submit">Xóa</button>
+    </div>
+  </form>
+</dialog>
+
+<aside id="drawer" class="drawer" hidden aria-labelledby="drawer-title">
+  <header class="drawer-head">
+    <h2 id="drawer-title" class="section-title">Công cụ</h2>
+    <button id="drawer-close" class="btn btn--ghost" type="button">Đóng</button>
+  </header>
+
+  <div class="tabs" role="tablist" aria-label="Công cụ dịch">
+    <button id="tab-glossary" class="tab" role="tab" type="button" aria-selected="true"
+            aria-controls="panel-glossary">Từ điển</button>
+    <button id="tab-memory" class="tab" role="tab" type="button" aria-selected="false"
+            aria-controls="panel-memory">Bộ nhớ dịch</button>
+    <button id="tab-skills" class="tab" role="tab" type="button" aria-selected="false"
+            aria-controls="panel-skills">Skill đã học</button>
+  </div>
+
+  <section id="panel-glossary" class="panel" role="tabpanel" aria-labelledby="tab-glossary">
+    <p id="glossary-note" class="note"></p>
+    <ul id="glossary-list" class="rows"></ul>
+    <p class="field">
+      <label class="label" for="glossary-name">Tên file</label>
+      <input id="glossary-name" class="input" placeholder="legal.csv" autocomplete="off"
+             spellcheck="false">
+    </p>
+    <p class="field">
+      <label class="label" for="glossary-pairs">Mỗi dòng một cặp nguồn, đích</label>
+      <textarea id="glossary-pairs" class="input" rows="5" spellcheck="false"></textarea>
+    </p>
+    <button id="glossary-save" class="btn" type="button">Lưu từ điển</button>
+  </section>
+
+  <section id="panel-memory" class="panel" role="tabpanel" aria-labelledby="tab-memory" hidden>
+    <p id="memory-note" class="note"></p>
+    <ul id="memory-list" class="rows"></ul>
+  </section>
+
+  <section id="panel-skills" class="panel" role="tabpanel" aria-labelledby="tab-skills" hidden>
+    <p id="skills-note" class="note"></p>
+    <ul id="skills-list" class="rows"></ul>
+  </section>
+</aside>
+
+<noscript>
+  <p class="banner" data-kind="warn">
+    Trang này cần JavaScript để theo dõi lượt dịch. Không có nó, hãy dùng terminal:
+    <code>polyglot translate --file input/&lt;tài liệu&gt;.pdf --tgt vi</code>.
+  </p>
+</noscript>
 
 <script src="/static/app.js" defer></script>
 

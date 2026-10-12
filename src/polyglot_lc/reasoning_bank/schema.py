@@ -45,13 +45,13 @@ class ReasoningTrace(BaseModel):
     @classmethod
     def from_metadata(
         cls,
-        id: str,  # noqa: A002 - chroma uses "id"
+        id: str,  # name mandated by chromadb's query result row
         document: str,
         metadata: dict[str, Any],
         distance: float | None = None,
-    ) -> "ReasoningTrace":
+    ) -> ReasoningTrace:
         """Rebuild a trace from a chroma query result row."""
-        split = lambda s: [p for p in (s or "").split(" ||| ") if p]  # noqa: E731
+        split = lambda s: [p for p in (s or "").split(" ||| ") if p]
         return cls(
             id=id,
             domain=metadata.get("domain", "general"),

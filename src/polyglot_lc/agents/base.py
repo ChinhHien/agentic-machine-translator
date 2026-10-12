@@ -13,7 +13,7 @@ class Agent:
 
     name: str = "AGENT"
 
-    def __init__(self, config=None) -> None:  # noqa: ANN001
+    def __init__(self, config=None) -> None:
         self.config = config or get_agent_config(self.name)
         self.client = LLMClient(self.config)
         self.calls: int = 0

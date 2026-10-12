@@ -8,6 +8,8 @@ import respx
 from openai import (
     APIConnectionError,
     APITimeoutError,
+)
+from openai import (
     RateLimitError as SDKRateLimitError,
 )
 
@@ -32,22 +34,33 @@ BACKUP_URL = "http://backup.test/v1/chat/completions"
 
 
 def make_agent_config(**kw) -> AgentConfig:
-    return AgentConfig(name="TRANSLATOR", base_url=BASE, model="test-model",
-                       api_key="sk-test", temperature=0.1, **kw)
+    return AgentConfig(
+        name="TRANSLATOR",
+        base_url=BASE,
+        model="test-model",
+        api_key="sk-test",
+        temperature=0.1,
+        **kw,
+    )
 
 
 def chat_payload(text: str, model: str = "test-model") -> dict:
     return {
-        "id": "c1", "object": "chat.completion", "created": 1, "model": model,
-        "choices": [{"index": 0, "message": {"role": "assistant", "content": text},
-                     "finish_reason": "stop"}],
+        "id": "c1",
+        "object": "chat.completion",
+        "created": 1,
+        "model": model,
+        "choices": [
+            {"index": 0, "message": {"role": "assistant", "content": text}, "finish_reason": "stop"}
+        ],
         "usage": {"prompt_tokens": 5, "completion_tokens": 7, "total_tokens": 12},
     }
 
 
 def ratelimit_response(hint: str = "try again in 1s") -> httpx.Response:
     return httpx.Response(
-        429, json={"error": {"message": f"rate_limit_exceeded: Please {hint}"}},
+        429,
+        json={"error": {"message": f"rate_limit_exceeded: Please {hint}"}},
         request=httpx.Request("POST", CHAT_URL),
     )
 
@@ -98,16 +111,22 @@ def test_normalize_sdk_ratelimit_error():
 
 
 def test_normalize_timeout_and_connection():
-    assert isinstance(normalize_provider_error(APITimeoutError(
-        httpx.Request("POST", CHAT_URL))), TransientError)
-    assert isinstance(normalize_provider_error(APIConnectionError(
-        request=httpx.Request("POST", CHAT_URL))), TransientError)
+    assert isinstance(
+        normalize_provider_error(APITimeoutError(httpx.Request("POST", CHAT_URL))), TransientError
+    )
+    assert isinstance(
+        normalize_provider_error(APIConnectionError(request=httpx.Request("POST", CHAT_URL))),
+        TransientError,
+    )
 
 
 def test_normalize_status_codes():
     req = httpx.Request("POST", CHAT_URL)
-    e500 = normalize_provider_error(httpx.HTTPStatusError(
-        "server error", request=req, response=httpx.Response(500, request=req)))
+    e500 = normalize_provider_error(
+        httpx.HTTPStatusError(
+            "server error", request=req, response=httpx.Response(500, request=req)
+        )
+    )
     assert isinstance(e500, TransientError) and e500.status == 500
     e429 = normalize_provider_error(RuntimeError("HTTP 429 too many requests"))
     assert isinstance(e429, RateLimitError)
@@ -148,6 +167,9 @@ def test_get_retry_config_defaults(mock_env):
     assert cfg.max_delay == 60.0
     assert cfg.buffer_seconds == 2.0
     assert cfg.jitter == 0.2  # production default; jitter bounded retries
+    # One request in flight by default: the safe reading of an unknown provider.
+    assert cfg.provider_concurrency == 1
+    assert cfg.concurrency_wait == 10.0
 
 
 def test_get_retry_config_overrides(mock_env, monkeypatch):
@@ -155,9 +177,22 @@ def test_get_retry_config_overrides(mock_env, monkeypatch):
     monkeypatch.setenv("LLM_RETRY_BASE_DELAY", "1")
     monkeypatch.setenv("LLM_RETRY_MAX_DELAY", "30")
     monkeypatch.setenv("LLM_RETRY_BUFFER_SECONDS", "1.5")
+    monkeypatch.setenv("LLM_RETRY_CONCURRENCY_WAIT", "4")
+    monkeypatch.setenv("LLM_PROVIDER_CONCURRENCY", "4")
     cfg = get_retry_config()
-    assert (cfg.max_retries, cfg.base_delay, cfg.max_delay,
-            cfg.buffer_seconds) == (5, 1.0, 30.0, 1.5)
+    assert (cfg.max_retries, cfg.base_delay, cfg.max_delay, cfg.buffer_seconds) == (
+        5,
+        1.0,
+        30.0,
+        1.5,
+    )
+    assert (cfg.concurrency_wait, cfg.provider_concurrency) == (4.0, 4)
+
+
+def test_get_retry_config_rejects_a_zero_provider_concurrency(mock_env, monkeypatch):
+    monkeypatch.setenv("LLM_PROVIDER_CONCURRENCY", "0")
+    with pytest.raises(ConfigError, match="provider_concurrency"):
+        get_retry_config()
 
 
 def test_get_retry_config_bad_values(mock_env, monkeypatch):
@@ -175,8 +210,10 @@ def test_get_retry_config_bad_values(mock_env, monkeypatch):
 # ---------------------------------------------------------------------------
 def test_resilience_success_first_try():
     calls = []
-    assert call_with_resilience(lambda *a, **k: calls.append(1) or "ok", None,
-                                retry_cfg=RetryConfig()) == "ok"
+    assert (
+        call_with_resilience(lambda *a, **k: calls.append(1) or "ok", None, retry_cfg=RetryConfig())
+        == "ok"
+    )
     assert len(calls) == 1
 
 
@@ -184,8 +221,7 @@ def test_resilience_ratelimit_hint_plus_buffer(_fast_resilience):
     def flaky():
         raise RateLimitError("try again in 47.4s", retry_after=47.4, status=429)
 
-    cfg = RetryConfig(max_retries=1, base_delay=2.0, max_delay=60.0,
-                      buffer_seconds=2.0)
+    cfg = RetryConfig(max_retries=1, base_delay=2.0, max_delay=60.0, buffer_seconds=2.0)
     with pytest.raises(RateLimitError):
         call_with_resilience(flaky, None, retry_cfg=cfg)
     # One wait: provider hint 47.4s + 2.0s buffer.
@@ -193,12 +229,74 @@ def test_resilience_ratelimit_hint_plus_buffer(_fast_resilience):
     assert RetryStats.snapshot()["rate_limit_retries"] == 1
 
 
+def test_concurrency_limited_429_waits_for_the_slot(_fast_resilience):
+    """Exponential backoff re-collides; wait for the slot to clear instead."""
+    calls: list[int] = []
+
+    def flaky():
+        calls.append(1)
+        if len(calls) == 1:
+            raise RateLimitError(
+                "Error code: 429 - {'error': {'code': 'concurrency_limit_exceeded',"
+                " 'message': 'Too many concurrent requests (limit: 1)'}}",
+                status=429,
+            )
+        return "ok"
+
+    cfg = RetryConfig(max_retries=2, base_delay=1.0, max_delay=60.0, concurrency_wait=7.5)
+    assert call_with_resilience(flaky, None, retry_cfg=cfg) == "ok"
+    # The plain backoff for attempt 0 would have been 1.0s.
+    assert _fast_resilience == [7.5]
+    assert RetryStats.snapshot()["rate_limit_retries"] == 1
+
+
+def test_concurrency_floor_does_not_slow_a_plain_rate_limit(_fast_resilience):
+    """Only a concurrency rejection earns the longer wait."""
+
+    def always():
+        raise RateLimitError("rate_limit_exceeded: slow down", status=429)
+
+    cfg = RetryConfig(max_retries=1, base_delay=2.0, max_delay=60.0, concurrency_wait=30.0)
+    with pytest.raises(RateLimitError):
+        call_with_resilience(always, None, retry_cfg=cfg)
+    assert _fast_resilience == [2.0]
+
+
+def test_concurrency_floor_is_a_minimum_even_with_jitter(_fast_resilience):
+    """Jitter spreads the retries of callers that collided together.
+
+    Spread must not eat into the minimum: a wait shorter than the floor just
+    collides again, which is the whole problem.
+    """
+
+    def always():
+        raise RateLimitError("429 concurrency_limit_exceeded", status=429)
+
+    cfg = RetryConfig(
+        max_retries=1, base_delay=1.0, max_delay=60.0, concurrency_wait=5.0, jitter=0.5
+    )
+    with pytest.raises(RateLimitError):
+        call_with_resilience(always, None, retry_cfg=cfg)
+    assert 5.0 <= _fast_resilience[0] <= 7.5
+
+
+def test_concurrency_wait_is_capped_by_max_delay(_fast_resilience):
+    """The floor is a wait, not a licence to wait forever."""
+
+    def always():
+        raise RateLimitError("429 concurrency_limit_exceeded", status=429)
+
+    cfg = RetryConfig(max_retries=1, base_delay=2.0, max_delay=5.0, concurrency_wait=30.0)
+    with pytest.raises(RateLimitError):
+        call_with_resilience(always, None, retry_cfg=cfg)
+    assert _fast_resilience == [5.0]
+
+
 def test_resilience_ratelimit_hint_capped_at_max_delay(_fast_resilience):
     def always():
         raise RateLimitError("try again in 900s", retry_after=900.0, status=429)
 
-    cfg = RetryConfig(max_retries=2, base_delay=2.0, max_delay=60.0,
-                      buffer_seconds=2.0)
+    cfg = RetryConfig(max_retries=2, base_delay=2.0, max_delay=60.0, buffer_seconds=2.0)
     with pytest.raises(RateLimitError):
         call_with_resilience(always, None, retry_cfg=cfg)
     assert _fast_resilience == [60.0, 60.0]
@@ -226,8 +324,7 @@ def test_resilience_ratelimit_refreshes_hint_between_retries(_fast_resilience):
         state["n"] += 1
         hint = 5.0 if state["n"] == 1 else 8.0
         if state["n"] <= 2:
-            raise RateLimitError(f"try again in {hint}s", retry_after=hint,
-                                 status=429)
+            raise RateLimitError(f"try again in {hint}s", retry_after=hint, status=429)
         return "ok"
 
     cfg = RetryConfig(max_retries=3, buffer_seconds=1.0)
@@ -258,8 +355,7 @@ def test_resilience_permanent_never_retries_or_falls_back(_fast_resilience):
         raise PermanentError("invalid api key", status=401)
 
     with pytest.raises(PermanentError):
-        call_with_resilience(bad, lambda *a, **k: "backup",
-                             retry_cfg=RetryConfig(max_retries=3))
+        call_with_resilience(bad, lambda *a, **k: "backup", retry_cfg=RetryConfig(max_retries=3))
     assert len(calls) == 1
     assert _fast_resilience == []
     assert RetryStats.snapshot()["fallbacks"] == 0
@@ -269,8 +365,9 @@ def test_resilience_exhausted_falls_back_to_backup():
     def always_429():
         raise RateLimitError("try again in 5s", retry_after=5.0, status=429)
 
-    out = call_with_resilience(always_429, lambda *a, **k: "from-backup",
-                               retry_cfg=RetryConfig(max_retries=3))
+    out = call_with_resilience(
+        always_429, lambda *a, **k: "from-backup", retry_cfg=RetryConfig(max_retries=3)
+    )
     assert out == "from-backup"
     stats = RetryStats.snapshot()
     assert stats["rate_limit_retries"] == 3
@@ -281,8 +378,9 @@ def test_resilience_timeout_exhausted_falls_back():
     def always_timeout():
         raise TransientError("request timed out")
 
-    out = call_with_resilience(always_timeout, lambda *a, **k: "backup-ok",
-                               retry_cfg=RetryConfig(max_retries=2))
+    out = call_with_resilience(
+        always_timeout, lambda *a, **k: "backup-ok", retry_cfg=RetryConfig(max_retries=2)
+    )
     assert out == "backup-ok"
     assert RetryStats.snapshot()["fallbacks"] == 1
 
@@ -313,8 +411,9 @@ def test_zero_retries_falls_back_immediately(_fast_resilience):
         calls.append(1)
         raise TransientError("timeout")
 
-    out = call_with_resilience(primary, lambda *a, **k: "backup",
-                               retry_cfg=RetryConfig(max_retries=0))
+    out = call_with_resilience(
+        primary, lambda *a, **k: "backup", retry_cfg=RetryConfig(max_retries=0)
+    )
     assert out == "backup"
     assert len(calls) == 1
     assert _fast_resilience == []
@@ -361,12 +460,11 @@ def test_chat_retries_on_429_with_hint_then_succeeds(monkeypatch):
 def test_chat_falls_back_to_backup_after_429_exhausted(monkeypatch):
     monkeypatch.setenv("LLM_MAX_RETRIES", "2")
     primary = respx.post(CHAT_URL)
-    primary.side_effect = [ratelimit_response(), ratelimit_response(),
-                           ratelimit_response()]
-    respx.post(BACKUP_URL).respond(json=chat_payload("from backup",
-                                                     model="backup-model"))
-    client = LLMClient(make_agent_config(
-        backup_base_url="http://backup.test/v1", backup_model="backup-model"))
+    primary.side_effect = [ratelimit_response(), ratelimit_response(), ratelimit_response()]
+    respx.post(BACKUP_URL).respond(json=chat_payload("from backup", model="backup-model"))
+    client = LLMClient(
+        make_agent_config(backup_base_url="http://backup.test/v1", backup_model="backup-model")
+    )
     resp = client.chat([{"role": "user", "content": "hi"}])
     assert resp.text == "from backup"
     assert resp.model == "backup-model"
@@ -378,10 +476,10 @@ def test_chat_falls_back_to_backup_after_429_exhausted(monkeypatch):
 @respx.mock
 def test_chat_permanent_401_does_not_retry_or_fallback(monkeypatch):
     monkeypatch.setenv("LLM_MAX_RETRIES", "3")
-    route = respx.post(CHAT_URL).respond(status_code=401,
-                                         json={"error": {"message": "bad key"}})
-    client = LLMClient(make_agent_config(
-        backup_base_url="http://backup.test/v1", backup_model="backup-model"))
+    route = respx.post(CHAT_URL).respond(status_code=401, json={"error": {"message": "bad key"}})
+    client = LLMClient(
+        make_agent_config(backup_base_url="http://backup.test/v1", backup_model="backup-model")
+    )
     with pytest.raises(LLMError) as exc_info:
         client.chat([{"role": "user", "content": "hi"}])
     assert isinstance(exc_info.value, PermanentError)
@@ -410,14 +508,17 @@ def test_backup_config_pair_validation():
 
 def test_has_backup_property():
     assert make_agent_config().has_backup is False
-    assert make_agent_config(backup_base_url="http://b.test/v1",
-                             backup_model="m").has_backup is True
+    assert (
+        make_agent_config(backup_base_url="http://b.test/v1", backup_model="m").has_backup is True
+    )
 
 
 def test_backup_client_uses_backup_config():
-    client = LLMClient(make_agent_config(
-        backup_base_url="http://b.test/v1", backup_model="m",
-        backup_api_key="sk-b"))
+    client = LLMClient(
+        make_agent_config(
+            backup_base_url="http://b.test/v1", backup_model="m", backup_api_key="sk-b"
+        )
+    )
     backup = client._backup_client()
     assert backup is not None
     assert backup.config.base_url == "http://b.test/v1"
