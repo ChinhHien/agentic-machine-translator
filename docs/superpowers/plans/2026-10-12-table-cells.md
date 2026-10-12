@@ -51,7 +51,7 @@ Năm trường hợp spec ngụ ý nhưng chưa thành test riêng — mỗi dò
   - `metadata: block.meta["pdf"]["cells"]` = `list[list[list | None]]`, 1:1 với ô của `block.text`.
   - Slot `cells` trên `_RawLine` và `_Unit`.
 
-- [ ] **Step 1: Mở rộng stub và viết test thất bại**
+- [x] **Step 1: Mở rộng stub và viết test thất bại**
 
 Thêm vào `_StubTable` trong `tests/test_pdf_layout.py` (giữ nguyên `extract()` cũ để các test hiện có chạy được):
 
@@ -117,12 +117,12 @@ def test_table_cell_boxes_line_up_with_the_markdown_matrix():
 
 Bổ sung import: `parse_markdown` từ `polyglot_lc.ingest.md`, và `_build_units`, `bind_page_geometry`, `render_markdown` từ `polyglot_lc.ingest.pdf_layout`.
 
-- [ ] **Step 2: Chạy test để chắc nó thất bại**
+- [x] **Step 2: Chạy test để chắc nó thất bại**
 
 Run: `python -m pytest tests/test_pdf_layout.py::test_table_cell_boxes_line_up_with_the_markdown_matrix -v`
 Expected: FAIL — `KeyError: 'cells'`.
 
-- [ ] **Step 3: Cài đặt phần ingest**
+- [x] **Step 3: Cài đặt phần ingest**
 
 Trong `src/polyglot_lc/ingest/pdf_layout.py`:
 
@@ -134,14 +134,14 @@ Trong `src/polyglot_lc/ingest/pdf_layout.py`:
 - `_RawLine`: thêm `cells` vào `__slots__` và một tham số từ khoá `cells: list | None = None` (`self.cells = cells or []`); `_Unit`: thêm slot `cells` (mặc định `[]`) và copy trong `emit("table", …)` / `take` không cần đổi;
 - `bind_page_geometry`: ghi thêm `"cells": owned[0].cells` **chỉ khi** `owned[0].kind == "table"` và `owned[0].cells` khác rỗng.
 
-- [ ] **Step 4: Chạy test để chắc nó pass**
+- [x] **Step 4: Chạy test để chắc nó pass**
 
 Run: `python -m pytest tests/test_pdf_layout.py -v`
 Expected: PASS, cả file (không test cũ nào đổi kết quả). Phép kiểm chứng "Markdown không đổi"
 (spec §8) chính là test cũ `test_table_is_emitted_as_markdown_and_not_repeated_as_prose`: nó so chuỗi
 Markdown chính xác, nên refactor mà làm đổi chữ sẽ làm nó đỏ.
 
-- [ ] **Step 5: Thêm bốn test biên của task này**
+- [x] **Step 5: Thêm bốn test biên của task này**
 
 ```python
 def test_merged_columns_merge_their_boxes():
@@ -224,12 +224,12 @@ def test_a_table_split_across_pages_gets_one_block_per_page():
     assert tables[1].meta["pdf"]["cells"][1][1][0] == 270.0 + 90.0  # ô của trang thứ hai
 ```
 
-- [ ] **Step 6: Chạy cả file test**
+- [x] **Step 6: Chạy cả file test**
 
 Run: `python -m pytest tests/test_pdf_layout.py -v`
 Expected: PASS (5 test mới + toàn bộ test cũ).
 
-- [ ] **Step 7: Commit**
+- [x] **Step 7: Commit**
 
 ```bash
 git add src/polyglot_lc/ingest/pdf_layout.py tests/test_pdf_layout.py
@@ -251,7 +251,7 @@ git commit -m "feat(ingest): record each table cell's box, size and alignment"
   - `_Placement.align: str | None` (mặc định `None` = hành vi hiện nay) và `_Placement.source_text: str | None`.
   - `placements()` sinh `_Placement(kind="cell", …)` cho từng ô in được, với `box` = hộp in (hộp ô thụt vào `pad`), `redact` = danh sách một phần tử là **hộp ô**, `align`, `size`, `source_text` = chữ gốc của ô.
 
-- [ ] **Step 1: Viết các test thất bại**
+- [x] **Step 1: Viết các test thất bại**
 
 Thêm vào `tests/test_pdf_output.py` (fixture block dùng chung cho cả task này):
 
@@ -362,12 +362,12 @@ def test_cells_and_code_and_geometryless_blocks_are_kept_as_source():
     assert kept == 3
 ```
 
-- [ ] **Step 2: Chạy test để chắc chúng thất bại**
+- [x] **Step 2: Chạy test để chắc chúng thất bại**
 
 Run: `python -m pytest tests/test_pdf_output.py -k "cell or table" -v`
 Expected: FAIL — `placements` trả `items == []` cho block bảng.
 
-- [ ] **Step 3: Cài đặt**
+- [x] **Step 3: Cài đặt**
 
 Trong `src/polyglot_lc/pipeline/pdf_output.py`:
 
@@ -376,12 +376,12 @@ Trong `src/polyglot_lc/pipeline/pdf_output.py`:
 - `placements()`: thay dòng `if block.meta.get("table") …: kept += 1; continue` bằng một hàm `_table_placements(geo, block, raw, match_style, default_font, printed_by_page)` trả `list[_Placement] | None`; `None` nghĩa là "giữ nguyên cả bảng" (`kept += 1`). Hàm từ chối khi: `cells` rỗng; hình dạng `_markdown_cells(raw)` khác `cells`; mọi ô đều không in được. Với ô in được: bỏ qua khi chữ dịch rỗng hoặc hộp `None`; bỏ qua khi hộp nằm trong hoặc bằng một hộp đã in trước đó **trên cùng trang**; ngược lại tạo `_Placement(kind="cell", page=…, box=hộp thụt `pad`, source_box=hộp ô, redact=[hộp ô], size=size của ô, text=chữ dịch, align=align của ô, source_text=chữ gốc của ô, font_file=match_font(font của block, bold của ô, italic của ô) khi `match_style`, color=màu của block)`;
 - giữ nguyên đường đi của block thường, và để `_insert` (Task 3) lo phần in.
 
-- [ ] **Step 4: Chạy test để chắc chúng pass**
+- [x] **Step 4: Chạy test để chắc chúng pass**
 
 Run: `python -m pytest tests/test_pdf_output.py -v`
 Expected: PASS, cả file.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add src/polyglot_lc/pipeline/pdf_output.py tests/test_pdf_output.py
@@ -400,11 +400,11 @@ git commit -m "feat(pdf): place each translated table cell in its own source box
 - Consumes: `_Placement(kind="cell", align=…, source_text=…)` từ Task 2.
 - Produces: `_CELL_MIN_SCALE = 0.70`; `_insert_cell(page, item, pymupdf, font_file) -> str | None` trả `"translated"`, `"source"` hoặc `None`; `RebuildStats.cells: int` và `RebuildStats.cells_kept: int`; trong `tests/pdfdoc.py`: `write_table_pdf(path, rows, *, col_widths=None, row_height=18.0, left=72.0, top=150.0, size=9.0) -> Path`.
 
-- [ ] **Step 1: Viết `write_table_pdf` trong `tests/pdfdoc.py`**
+- [x] **Step 1: Viết `write_table_pdf` trong `tests/pdfdoc.py`**
 
 Helper này là thứ hai test dưới cần, nên làm trước. Yêu cầu: mỗi hàng cao `row_height`, mỗi cột rộng theo `col_widths` (mặc định 90 pt), kẻ **đường ngang ở mọi ranh giới hàng và đường dọc ở mọi ranh giới cột** bằng `page.draw_line` — pdfplumber chỉ bắt được bảng khi có đường kẻ thật — rồi in chữ từng ô bằng `page.insert_text` tại `(ô.x0 + 3, ô.top + 12)` với `fontname="hebo"` cho hàng đầu và `"helv"` cho các hàng sau.
 
-- [ ] **Step 2: Viết các test thất bại**
+- [x] **Step 2: Viết các test thất bại**
 
 ```python
 def _one_cell_pdf(tmp_path, *, text: str = "Feature", width: float = 60.0):
@@ -445,12 +445,12 @@ def test_a_cell_does_not_spill_below_the_page(tmp_path, unicode_font):
             assert top >= box[1] - 1 and bottom <= box[3] + 1
 ```
 
-- [ ] **Step 3: Chạy test để chắc chúng thất bại**
+- [x] **Step 3: Chạy test để chắc chúng thất bại**
 
 Run: `python -m pytest tests/test_pdf_output.py -k "cannot_fit or spill" -v`
 Expected: FAIL — `AttributeError: 'RebuildStats' object has no attribute 'cells'`.
 
-- [ ] **Step 4: Cài đặt**
+- [x] **Step 4: Cài đặt**
 
 - `_CELL_MIN_SCALE = 0.70` cạnh `_MIN_SCALE`;
 - `_insert_cell(page, item, pymupdf, font_file)`: giống vòng lặp của `_insert` nhưng `floor = max(item.size * _CELL_MIN_SCALE, 4.0)` và **không** có nhánh "dùng nốt chỗ tới lề dưới"; hộp luôn là `item.box`. Vòng 1 thử `item.text` (bản dịch); nếu không vừa, vòng 2 thử `item.source_text` ở cỡ gốc của ô, rồi ở sàn; trả `"translated"`, `"source"`, hoặc `None` khi cả hai đều không vừa;
@@ -459,12 +459,12 @@ Expected: FAIL — `AttributeError: 'RebuildStats' object has no attribute 'cell
 - `rebuild_pdf`: `"translated"` → `stats.cells += 1`, `stats.placed += 1`; `"source"` → `stats.cells_kept += 1`, `stats.placed += 1`; `None` → vào `stats.failures` như hiện nay; dòng log cuối thêm số ô (`{} cell(s) translated, {} kept as source`);
 - docstring module: bảng chuyển từ danh sách "deliberately left alone" sang danh sách được dựng lại, nêu rõ hai luật (sàn 70%, rơi về chữ gốc của ô) và điều kiện giữ nguyên cả bảng khi bản dịch sai hình dạng.
 
-- [ ] **Step 5: Chạy test để chắc chúng pass**
+- [x] **Step 5: Chạy test để chắc chúng pass**
 
 Run: `python -m pytest tests/test_pdf_output.py -v`
 Expected: PASS, cả file.
 
-- [ ] **Step 6: Commit**
+- [x] **Step 6: Commit**
 
 ```bash
 git add src/polyglot_lc/pipeline/pdf_output.py tests/pdfdoc.py tests/test_pdf_output.py
@@ -483,7 +483,7 @@ git commit -m "feat(pdf): print a cell within its box, falling back to the sourc
 - Consumes: `rebuild_pdf` (Task 3), `block.meta["pdf"]["cells"]` (Task 1), `write_table_pdf` (Task 3).
 - Produces: không có interface mới cho code sản phẩm; chỉ test và tài liệu.
 
-- [ ] **Step 1: Viết test tích hợp**
+- [x] **Step 1: Viết test tích hợp**
 
 ```python
 def test_a_real_table_page_is_rebuilt_with_its_cells_translated(tmp_path, unicode_font):
@@ -525,23 +525,23 @@ def test_a_real_table_page_is_rebuilt_with_its_cells_translated(tmp_path, unicod
             ), f"chữ nằm ngoài ô: {word[4]!r}"
 ```
 
-- [ ] **Step 2: Chạy test để chắc nó pass (hoặc thất bại đúng chỗ)**
+- [x] **Step 2: Chạy test để chắc nó pass (hoặc thất bại đúng chỗ)**
 
 Run: `python -m pytest tests/test_pdf_output.py::test_a_real_table_page_is_rebuilt_with_its_cells_translated -v`
 Expected: PASS. Nếu khẳng định `get_drawings()` không đổi bị FAIL, thu hẹp `redact` của ô về đúng bao các
 dòng chữ nguồn (xem spec §10) rồi chạy lại. Ở đây mọi ô đều in được nên `cells_kept == 0`; vế (d)
 của spec §8 — "chữ nguồn còn lại chỉ thuộc các ô fallback" — là test của Task 3.
 
-- [ ] **Step 3: Cập nhật README**
+- [x] **Step 3: Cập nhật README**
 
 Ba chỗ nói bảng giữ nguyên tiếng gốc: dòng về "bảng biểu" ở đầu file, mục mô tả PDF dựng lại (danh sách "hai loại đó vẫn…"), và phần ghi chú so với pdf2zh. Sửa thành: chữ trong ô được dịch và in lại vào đúng ô của lưới gốc; ô không đủ chỗ giữ tiếng gốc; code vẫn là loại duy nhất không được dịch.
 
-- [ ] **Step 4: Chạy toàn bộ suite và lint**
+- [x] **Step 4: Chạy toàn bộ suite và lint**
 
 Run: `python -m pytest -q; python -m ruff check src tests webui; python -m ruff format --check src tests webui`
 Expected: tất cả PASS/sạch (exit code 0).
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add tests/test_pdf_output.py README.md
