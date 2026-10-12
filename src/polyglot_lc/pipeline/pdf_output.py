@@ -14,11 +14,25 @@ looks like the page it replaces. Two things the source expressed through
 * a **contents entry**'s dot leader is measured back in between the translated
   title and its page number, which stays against the right margin.
 
+A **table** is rebuilt as well, but cell by cell, inside the grid the source
+page already drew: the rules stay exactly where they were and each translated
+cell is printed into its own box. Two rules keep that honest:
+
+* a cell's type may be shrunk to 70% of its source size (``_CELL_MIN_SCALE``)
+  but no further, and never outside its box — unlike a block, a cell does not
+  get to borrow the room down to the bottom margin, because what surrounds it is
+  the layout;
+* when the translation still will not fit, the cell prints its own source text
+  at the source size instead of dropping the cell or bleeding into its
+  neighbour.
+
+The same reasoning applies to a table whose translation cannot be trusted to
+line up with the source grid (wrong shape, a stray ``|``, a bare ``|`` split):
+the whole table stays in the source language rather than having its cells
+aligned against the wrong boxes.
+
 What is deliberately left alone (and why):
 
-* **tables** — a table's meaning lives in its grid, and re-flowing its text into
-  the same box without the columns would be worse than leaving it readable in
-  the source language. Tables *are* translated in the Markdown output.
 * **code** — never translated by the pipeline (it is shielded as
   ``⟦CODE_n⟧``), so the source text stays.
 * **anything without geometry or translation** — a chunk whose retries were
@@ -152,6 +166,11 @@ _BOTTOM_MARGIN = 28.0
 #: of the source size). Below this, source fidelity is worth more than the fit.
 _MIN_SCALE = 0.55
 
+#: The same limit for a table cell, and a tighter one: a cell is surrounded by
+#: the rules of its grid, so shrinking it is the only way it can grow, and text
+#: much smaller than the source's would read as a different document's table.
+_CELL_MIN_SCALE = 0.70
+
 
 class PdfOutputError(RuntimeError):
     """The PDF could not be rebuilt (usually: no Unicode font is available)."""
@@ -164,6 +183,10 @@ class RebuildStats:
     pages: int = 0
     placed: int = 0
     kept: int = 0
+    #: Table cells printed with their translation, and cells that fell back to
+    #: their own source text because the translation would not fit the box.
+    cells: int = 0
+    cells_kept: int = 0
     font: str = ""
     failures: list[str] = field(default_factory=list)
 
@@ -701,14 +724,78 @@ def _toc_line(item: _Placement, font_file: str, pymupdf: Any) -> str:
     return f"{title} " + "." * count + f" {number}"
 
 
-def _insert(page: Any, item: _Placement, pymupdf: Any, default_font: Path | str) -> bool:
+def _align_of(item: _Placement, pymupdf: Any) -> int:
+    """The alignment to print *item* with.
+
+    A table cell carries the alignment the source used there (the ingest reads
+    it off the cell's own lines), so it is honoured as it is. Everything else
+    starts left-aligned and may be re-decided by the caller.
+    """
+    if item.align:
+        return {
+            "left": pymupdf.TEXT_ALIGN_LEFT,
+            "center": pymupdf.TEXT_ALIGN_CENTER,
+            "right": pymupdf.TEXT_ALIGN_RIGHT,
+        }.get(str(item.align), pymupdf.TEXT_ALIGN_LEFT)
+    return pymupdf.TEXT_ALIGN_LEFT
+
+
+def _insert_cell(page: Any, item: _Placement, pymupdf: Any, default_font: Path | str) -> str | None:
+    """Print one table cell inside its own box.
+
+    Returns ``"translated"``, ``"source"`` or ``None`` (neither would fit).
+    Unlike :func:`_insert` there is no branch that borrows the room down to the
+    bottom margin: a cell that outgrows its row would print over the rules and
+    the rows below it, so its only way down is to shrink the type — and only to
+    the floor. When the translation still will not fit, the cell's own source
+    text is printed in its place, at the source size when that fits and at the
+    floor otherwise.
+    """
+    font_file = str(item.font_file or default_font)
+    fontname = _resource_name(font_file)
+    align = _align_of(item, pymupdf)
+    box = pymupdf.Rect(*item.box)
+    floor = max(item.size * _CELL_MIN_SCALE, 4.0)
+
+    def fits(text: str) -> bool:
+        size = item.size
+        while size >= floor:
+            unused = page.insert_textbox(
+                box,
+                text,
+                fontname=fontname,
+                fontfile=font_file,
+                fontsize=size,
+                align=align,
+                lineheight=1.15,
+                color=item.color,
+            )
+            if unused >= 0:
+                return True
+            size -= max(item.size * 0.05, 0.25)
+        return False
+
+    if item.text and fits(item.text):
+        return "translated"
+    source = (item.source_text or "").strip()
+    if source and fits(source):
+        return "source"
+    return None
+
+
+def _insert(page: Any, item: _Placement, pymupdf: Any, default_font: Path | str) -> str | None:
     """Print *item* inside its box, shrinking the font until it fits.
+
+    Returns ``"block"`` once the text is on the page, and ``None`` when even the
+    fallback could not place it. A table cell is handed to :func:`_insert_cell`.
 
     The TTF is passed on every call: ``Page.insert_font`` only registers the font
     in the resource dictionary of the page it is called on, so a page that did
     not call it would fall back to a base-14 font and raise on the Vietnamese
     glyphs it cannot encode.
     """
+    if item.kind == "cell":
+        return _insert_cell(page, item, pymupdf, default_font)
     font_file = str(item.font_file or default_font)
     fontname = _resource_name(font_file)
     text = item.text
@@ -717,7 +804,7 @@ def _insert(page: Any, item: _Placement, pymupdf: Any, default_font: Path | str)
     x0, top, x1, bottom = item.box
     limit = max(page.rect.height - _BOTTOM_MARGIN, bottom)
     box = pymupdf.Rect(x0, top, x1, min(bottom, limit))
-    align = pymupdf.TEXT_ALIGN_LEFT
+    align = _align_of(item, pymupdf)
     if item.kind == "heading":
         # A title that sits clear of both margins and near the page's centre is
         # a centred title; left-aligning it is the one change a reader notices.
@@ -741,7 +828,7 @@ def _insert(page: Any, item: _Placement, pymupdf: Any, default_font: Path | str)
             color=item.color,
         )
         if unused >= 0:
-            return True
+            return "block"
         size -= max(item.size * 0.05, 0.25)
     # Still too long for the original space: use the room down to the bottom
     # margin at the floor size rather than dropping the lines.
@@ -755,7 +842,7 @@ def _insert(page: Any, item: _Placement, pymupdf: Any, default_font: Path | str)
         lineheight=1.15,
         color=item.color,
     )
-    return unused >= 0
+    return "block" if unused >= 0 else None
 
 
 def rebuild_pdf(
@@ -805,18 +892,28 @@ def rebuild_pdf(
             text=pymupdf.PDF_REDACT_TEXT_REMOVE,
         )
         for item in page_items:
-            if _insert(page, item, pymupdf, font_file):
-                stats.placed += 1
-            else:
+            outcome = _insert(page, item, pymupdf, font_file)
+            if outcome is None:
                 stats.failures.append(f"page {page_no}: text did not fit")
+                continue
+            stats.placed += 1
+            if item.kind != "cell":
+                continue
+            if outcome == "translated":
+                stats.cells += 1
+            else:
+                stats.cells_kept += 1
 
     out = Path(out_path)
     out.parent.mkdir(parents=True, exist_ok=True)
     document.save(str(out), garbage=4, deflate=True)
     document.close()
     logger.info(
-        "PDF rebuild: {} block(s) placed, {} kept as source, {} page(s) -> {}",
+        "PDF rebuild: {} block(s) placed ({} cell(s) translated, {} kept in source), "
+        "{} kept as source, {} page(s) -> {}",
         stats.placed,
+        stats.cells,
+        stats.cells_kept,
         stats.kept,
         stats.pages,
         out,

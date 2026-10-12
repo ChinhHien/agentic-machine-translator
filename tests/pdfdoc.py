@@ -108,3 +108,55 @@ def write_pdf(path: str | Path, markdown: str) -> Path:
     doc.save(str(out))
     doc.close()
     return out
+
+
+def write_table_pdf(
+    path: str | Path,
+    rows: list[list[str]],
+    *,
+    col_widths: list[float] | None = None,
+    row_height: float = 18.0,
+    left: float = _LEFT,
+    top: float = _TOP,
+    size: float = 9.0,
+) -> Path:
+    """Write *rows* as a ruled table on one PDF page and return the path.
+
+    A table has to be *drawn* to be one: pdfplumber finds tables from their
+    rules, not from how the glyphs happen to line up, so every row boundary gets
+    a horizontal line and every column boundary a vertical one. The first row is
+    set in bold, the way a header would be.
+    """
+    import pymupdf
+
+    widths = list(col_widths) if col_widths else [90.0] * max(len(row) for row in rows)
+    right = left + sum(widths)
+    height = row_height * len(rows)
+    doc = pymupdf.open()
+    page = doc.new_page(width=_WIDTH, height=_HEIGHT)
+
+    def column_x(column: int) -> float:
+        return left + sum(widths[:column])
+
+    for index in range(len(rows) + 1):
+        y = top + index * row_height
+        page.draw_line((left, y), (right, y))
+    for index in range(len(widths) + 1):
+        x = column_x(index)
+        page.draw_line((x, top), (x, top + height))
+
+    for r, row in enumerate(rows):
+        font = _HEADING_FONT if r == 0 else _BODY_FONT
+        for c, text in enumerate(row):
+            page.insert_text(
+                (column_x(c) + 3, top + r * row_height + 12),
+                text,
+                fontname=font,
+                fontsize=size,
+            )
+
+    out = Path(path)
+    out.parent.mkdir(parents=True, exist_ok=True)
+    doc.save(str(out))
+    doc.close()
+    return out

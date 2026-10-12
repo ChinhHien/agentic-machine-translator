@@ -291,6 +291,69 @@ def test_an_untranslated_document_rebuilds_nothing(tmp_path, unicode_font):
     assert stats.kept >= 1
 
 
+# ---------------------------------- cells -----------------------------------
+
+
+def _table_pdf(tmp_path):
+    """One page holding nothing but a ruled 2x2 table.
+
+    The table is two columns wide because a single-column region is not a table
+    at all as far as the ingest is concerned, and two rows because a lone row has
+    no header to be read against.
+    """
+    from pdfdoc import write_table_pdf
+
+    return write_table_pdf(
+        tmp_path / "table.pdf",
+        [["Feature", "State"], ["Servers", "5"]],
+        col_widths=[240.0, 70.0],
+    )
+
+
+def test_a_cell_that_cannot_fit_keeps_its_source_text(tmp_path, unicode_font):
+    pymupdf = pytest.importorskip("pymupdf")
+    src = _table_pdf(tmp_path)
+    doc = load_document(src)
+    # Long enough that no size down to the 70% floor can wrap it into the two
+    # lines the cell's 17 pt row has room for.
+    too_long = "Một trăm hai mươi ký tự dịch rất dài " * 6
+    texts = {0: f"| Đặc điểm | Trạng thái |\n| --- | --- |\n| {too_long} | 5 |"}
+
+    stats = rebuild_pdf(src, doc, texts, tmp_path / "out.pdf", font_path=unicode_font)
+
+    assert stats.cells == 3 and stats.cells_kept == 1
+    assert stats.failures == []
+    with pymupdf.open(tmp_path / "out.pdf") as rebuilt:
+        text = rebuilt[0].get_text().replace("\xa0", " ")
+        assert "Servers" in text
+        assert "Đặc điểm" in text
+
+
+def test_a_cell_does_not_spill_below_the_page(tmp_path, unicode_font):
+    """Không có nhánh 'dùng nốt chỗ tới lề dưới' cho ô: chữ phải nằm trong ô."""
+    pymupdf = pytest.importorskip("pymupdf")
+    src = _table_pdf(tmp_path)
+    doc = load_document(src)
+    boxes = [cell[:4] for row in doc.blocks[0].meta["pdf"]["cells"] for cell in row]
+    out = tmp_path / "out.pdf"
+    stats = rebuild_pdf(
+        src,
+        doc,
+        {0: "| Đặc điểm | Trạng thái |\n| --- | --- |\n| Máy chủ | 5 |"},
+        out,
+        font_path=unicode_font,
+    )
+
+    assert stats.cells == 4 and stats.cells_kept == 0
+    with pymupdf.open(out) as rebuilt:
+        for word in rebuilt[0].get_text("words"):
+            x0, top, x1, bottom = word[:4]
+            assert any(
+                x0 >= bx0 - 1 and x1 <= bx2 + 1 and top >= btop - 1 and bottom <= bbottom + 1
+                for bx0, btop, bx2, bbottom in boxes
+            ), f"chữ nằm ngoài ô: {word[4]!r}"
+
+
 # ----------------------- markers, contents entries, boxes -------------------
 
 
