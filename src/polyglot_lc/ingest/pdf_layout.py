@@ -18,6 +18,11 @@ This extractor reads the PDF's own typography instead of guessing:
 * **code** is the monospace font runs, with indentation restored from the
   glyph x-offset;
 * **headings** are the oversized runs, level taken from the font size;
+* **emphasis** is read off the same runs: a bold or italic span inside a line is
+  marked with a sentinel pair (``⟦BOLD⟧…⟦/BOLD⟧``) around the words it covers,
+  so the line can be translated and printed with its emphasis intact, while a
+  line set in a single style emits no sentinel at all. See
+  :mod:`polyglot_lc.emphasis`;
 * the **tables** pdfplumber can find are emitted as Markdown pipe tables, and
   the lines inside their bounding boxes are not emitted a second time as prose;
 * the **top margin band** is the running head, and it is a band *of this page*

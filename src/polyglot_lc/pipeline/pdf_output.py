@@ -39,6 +39,17 @@ What is deliberately left alone (and why):
   exhausted leaves its source lines in place rather than blanking the page, so
   a partial run still yields a readable document.
 
+**Emphasis** is the one piece of a block's typography a translation may *add*.
+The ingest marks a bold or italic span with a sentinel pair (``⟦BOLD⟧…⟦/BOLD⟧``;
+see :mod:`polyglot_lc.emphasis`), and a block whose translation keeps those pairs
+is laid out by hand here — greedy word wrap measured run by run, one
+``insert_text`` per run in that run's own face — because PyMuPDF's own layout
+does not read markup and would print the sentinels as they stand. A pair that
+does not match the source is dropped upstream (``settle_emphasis`` in
+:mod:`polyglot_lc.orchestrator.graph`), and a face this machine does not have
+falls back to the regular one, so no sentinel ever reaches the page: the words
+are printed, at worst without their emphasis.
+
 The boxes come from :mod:`polyglot_lc.ingest.pdf_layout`, which records a block's
 source rectangles as it extracts it; see ``block.meta["pdf"]``.
 
