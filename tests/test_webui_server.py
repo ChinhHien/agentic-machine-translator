@@ -10,7 +10,7 @@ import pytest
 
 from webui.runs import RunManager
 from webui.server import Api
-from webui.store import GlossaryStore, RunsStore, SkillsStore
+from webui.store import GlossaryStore, RunsStore
 
 #: A minimal upload body that looks like a PDF, because that is what the route
 #: insists on now: anything else is refused before it is written.
@@ -31,7 +31,6 @@ def api(tmp_path):
         root=tmp_path,
         manager=RunManager(tmp_path, python="PY"),
         runs=RunsStore(tmp_path / "logs" / "webui"),
-        skills=SkillsStore(tmp_path / "skills"),
         glossaries=GlossaryStore(tmp_path / "glossaries"),
         port=8787,
     )
@@ -775,96 +774,29 @@ def test_no_response_ever_echoes_a_credential(api, tmp_path):
     assert detail["problems"][0]["message"].endswith("***")
 
 
-# --- Memory ----------------------------------------------------------------
+# --- The tool drawer's endpoints are gone ----------------------------------
 
 
-def test_memory_report_is_passed_through_and_reused(api, monkeypatch):
-    calls: list = []
+def test_nothing_answers_on_the_drawer_endpoints(api, tmp_path):
+    """The page has no tool drawer, so the routes that fed it are gone too.
 
-    def probe(args):
-        calls.append(args)
-        return {
-            "path": "data/reasoning_bank",
-            "total": 3,
-            "sampled": 3,
-            "pairs": [
-                {
-                    "pair": "en-vi",
-                    "domain": "general",
-                    "traces": 3,
-                    "mean_score": 0.85,
-                    "recent": [],
-                }
-            ],
-        }
-
-    monkeypatch.setattr(api.manager, "probe", probe)
-
-    first = json.loads(call(api, "GET", "/api/memory").body)
-    assert first["cached"] is False and first["memory"]["total"] == 3
-    assert calls == [["--memory"]]
-
-    second = json.loads(call(api, "GET", "/api/memory").body)
-    assert second["cached"] is True and len(calls) == 1
-
-
-def test_memory_report_reports_a_broken_bank(api, monkeypatch):
-    from webui.runs import RunPlanError
-
-    def probe(args):
-        raise RunPlanError("bank unreadable")
-
-    monkeypatch.setattr(api.manager, "probe", probe)
-    r = call(api, "GET", "/api/memory")
-    assert r.status == 502 and b"bank unreadable" in r.body
-
-
-# --- Glossaries and skills -------------------------------------------------
-
-
-def test_glossary_and_skills_endpoints(api, tmp_path):
-    body = json.dumps({"pairs": [["NMT", "dịch máy"]]}).encode()
-    assert call(api, "PUT", "/api/glossaries/g.csv", body=body).status == 200
-    got = json.loads(call(api, "GET", "/api/glossaries/g.csv").body)
-    assert got["pairs"] == [["NMT", "dịch máy"]]
-    assert json.loads(call(api, "GET", "/api/glossaries").body)["files"]
-
-    (tmp_path / "skills" / "en-vi").mkdir(parents=True)
-    (tmp_path / "skills" / "en-vi" / "general.json").write_text(
-        json.dumps(
-            {
-                "instruction": "i",
-                "mean_score": 8.5,
-                "domain": "general",
-                "src_lang": "en",
-                "tgt_lang": "vi",
-            }
-        ),
-        encoding="utf-8",
-    )
-    skills = json.loads(call(api, "GET", "/api/skills").body)["skills"]
-    assert skills[0]["pair"] == "en-vi" and skills[0]["mean_score"] == 8.5
-
-
-def test_skill_detail_includes_history(api, tmp_path):
-    (tmp_path / "skills" / "en-vi").mkdir(parents=True)
-    (tmp_path / "skills" / "en-vi" / "general.json").write_text(
-        json.dumps({"instruction": "i", "mean_score": 8.5}), encoding="utf-8"
-    )
-    (tmp_path / "skills" / "en-vi" / "general.history.jsonl").write_text(
-        '{"score": 7.0, "ts": 1}\n', encoding="utf-8"
-    )
-
-    got = json.loads(call(api, "GET", "/api/skills/en-vi/general").body)
-    assert got["skill"]["mean_score"] == 8.5
-    assert [h["score"] for h in got["history"]] == [7.0]
-    assert call(api, "GET", "/api/skills/en-vi/nope").status == 404
-
-
-def test_glossary_names_and_bodies_are_validated(api, tmp_path):
-    assert call(api, "PUT", "/api/glossaries/..%2F.env", body=b'{"pairs": []}').status == 403
-    assert call(api, "PUT", "/api/glossaries/g.csv", body=b"nope").status == 400
-    assert call(api, "GET", "/api/glossaries/..%2F.env").status == 403
+    What used to be reachable here — the term lists, the memory report and the
+    learned skills — is reporting a reader no longer asks for, and the pipeline
+    keeps a glossary and a reasoning bank of its own without a screen in front
+    of them. A route left behind would be a surface nobody can turn off, so
+    each of them has to 404 like any other name the server does not know.
+    """
+    for method, path in (
+        ("GET", "/api/memory"),
+        ("GET", "/api/glossaries"),
+        ("GET", "/api/glossaries/g.csv"),
+        ("PUT", "/api/glossaries/g.csv"),
+        ("GET", "/api/skills"),
+        ("GET", "/api/skills/en-vi/general"),
+    ):
+        answer = call(api, method, path, body=b'{"pairs": []}')
+        assert answer.status == 404, (method, path, answer.status)
+    # A retired route must not have become a way to write anywhere either.
     assert (tmp_path / ".env").read_text(encoding="utf-8").startswith("CHUNK_MAX_TOKENS")
 
 
@@ -880,7 +812,6 @@ def repo_api():
         root=root,
         manager=RunManager(root, python="PY"),
         runs=RunsStore(root / "logs" / "webui"),
-        skills=SkillsStore(root / "skills"),
         glossaries=GlossaryStore(root / "glossaries"),
         port=8787,
     )
@@ -890,7 +821,6 @@ def test_index_has_the_elements_the_frontend_binds_to():
     html = call(repo_api(), "GET", "/").body.decode("utf-8")
     for element_id in (
         "nav-new",
-        "nav-tools",
         "banner",
         "jobs",
         "jobs-count",
@@ -934,36 +864,38 @@ def test_index_has_the_elements_the_frontend_binds_to():
         "upload-bar",
         "upload-fill",
         "upload-note",
-        "library",
         "src",
         "tgt",
-        "languages",
         "formats",
         "format-md",
         "format-pdf",
         "format-both",
-        "domain",
-        "glossary",
-        "max-tokens",
-        "drawer",
-        "drawer-close",
-        "tab-glossary",
-        "tab-memory",
-        "tab-skills",
-        "panel-glossary",
-        "panel-memory",
-        "panel-skills",
-        "glossary-list",
-        "glossary-note",
-        "glossary-name",
-        "glossary-pairs",
-        "glossary-save",
-        "memory-list",
-        "memory-note",
-        "skills-list",
-        "skills-note",
     ):
         assert f'id="{element_id}"' in html, element_id
+
+
+def test_the_language_choices_name_the_languages_in_full():
+    """A reader picks "Tiếng Việt", not "vi".
+
+    The value stays the code the backend expects; the page is where the name in
+    words lives. Both ends of the run are dropdowns, so the list of accepted
+    codes is the page's own — a typo can no longer be typed in.
+    """
+    import re
+
+    html = call(repo_api(), "GET", "/").body.decode("utf-8")
+    for select_id, chosen in (("src", "auto"), ("tgt", "vi")):
+        block = re.search(rf'<select[^>]*id="{select_id}"[^>]*>(.*?)</select>', html, re.DOTALL)
+        assert block, select_id
+        options = re.findall(r'<option value="([a-z]+)"[^>]*>([^<]+)</option>', block.group(1))
+        codes = [code for code, _ in options]
+        assert chosen in codes, (select_id, codes)
+        assert "en" in codes, "English has to be offered as an input language"
+        for code, label in options:
+            assert label != code, f"{code} should be spelled out"
+        assert re.search(rf'<option value="{chosen}"[^>]*selected', block.group(1))
+    # The abbreviation is not what a reader is asked to pick from.
+    assert "<datalist" not in html
 
 
 def test_stylesheet_defines_the_design_tokens():
@@ -1093,10 +1025,6 @@ def test_app_js_covers_the_steps_the_page_promises():
         "renderPanes",
         "renderProblems",
         "renderBanner",
-        "loadInputs",
-        "loadGlossaries",
-        "loadMemory",
-        "loadSkills",
         "startRun",
         "stopRun",
         "resumeRun",
@@ -1112,9 +1040,11 @@ def test_app_js_covers_the_steps_the_page_promises():
         "/pdf",
         "/bundle",
         "/source",
-        "/api/memory",
     ):
         assert route in js, route
+    # ... and the dialog runs the document the reader dropped, so there is no
+    # library to read and no preference to carry over between runs.
+    assert "/api/glossaries" not in js and "/api/memory" not in js and "/api/skills" not in js
 
 
 def test_output_format_is_one_choice_of_the_three_the_flag_accepts():
@@ -1139,11 +1069,13 @@ def test_output_format_is_one_choice_of_the_three_the_flag_accepts():
     ticked = [tag for tag in inputs if "checked" in tag]
     assert len(ticked) == 1 and 'value="md"' in ticked[0], "Markdown is the default"
 
+    # The script reads the same three radios. Match on the lookups rather than
+    # on the expression, so reformatting the ternary does not fail the check.
     js = (Path(__file__).resolve().parents[1] / "webui" / "static" / "app.js").read_text(
         encoding="utf-8"
     )
-    assert 'byId("format-pdf").checked ? "pdf"' in js
-    assert 'byId("format-both").checked ? "both"' in js
+    for radio in ("format-pdf", "format-both"):
+        assert re.search(rf'byId\("{radio}"\)\.checked', js), radio
     assert "Chọn ít nhất một" not in js
 
 
@@ -1169,6 +1101,7 @@ def test_the_stylesheet_styles_every_state_the_script_sets():
     script writes has to be reachable in the sheet — ``wait`` and ``idle`` are
     the look of a thing that has not happened yet, so they are the default, but
     they are still named in the contract comment at the top of the sheet."""
+    import re
     from pathlib import Path
 
     css = call(repo_api(), "GET", "/static/app.css").body.decode("utf-8")
@@ -1197,5 +1130,7 @@ def test_the_stylesheet_styles_every_state_the_script_sets():
     js = (Path(__file__).resolve().parents[1] / "webui" / "static" / "app.js").read_text(
         encoding="utf-8"
     )
-    for attribute in ("dataset.state", "dataset.kind", 'setAttribute("aria-pressed"'):
+    for attribute in ("dataset.state", "dataset.kind"):
         assert attribute in js, attribute
+    # Same tolerance as above: the call may be wrapped over several lines.
+    assert re.search(r'setAttribute\(\s*"aria-pressed"', js), "aria-pressed"

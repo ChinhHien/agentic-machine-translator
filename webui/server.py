@@ -12,7 +12,9 @@ has no view of ``.env`` — not a value, not a key name, not whether a credentia
 is set. Runs inherit the server's environment, and a human changes that from a
 terminal. The only translation preferences the API accepts are the ones that
 belong to a single run (languages, domain, glossary, chunk budget, output
-format, resume).
+format, resume), and the page sends just the document, its two languages and
+the output format: the domain, the terms and the chunk budget are the
+pipeline's own to work out from the text.
 
 Everything a response quotes back — run notes, step errors, the child's own
 output — is passed through :func:`_redact` first, so a provider error that
@@ -27,7 +29,6 @@ import json
 import logging
 import re
 import sys
-import time
 import zipfile
 from dataclasses import dataclass
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -37,7 +38,7 @@ from urllib.parse import parse_qs, quote, unquote, urlsplit
 
 from webui.paths import REPO_ROOT, is_within, safe_child
 from webui.runs import LOGS_DIR, RunManager, RunPlanError
-from webui.store import GlossaryStore, RunRecord, RunsStore, SkillsStore
+from webui.store import GlossaryStore, RunRecord, RunsStore
 
 logger = logging.getLogger("webui")
 
@@ -116,10 +117,6 @@ _SECRET_RE = re.compile(r"\b(?:sk|pk|rk|api|key|token)[-_][A-Za-z0-9_\-]{6,}\b",
 
 #: How much of a child's output to quote when a run died before any event.
 TAIL_CHARS = 4000
-
-#: How long a memory report is reused, in seconds. Reading the reasoning bank
-#: costs a ChromaDB import; a drawer being reopened should not pay it twice.
-MEMORY_TTL = 60.0
 
 
 def _redact(text: str) -> str:
@@ -208,21 +205,19 @@ class Api:
         root: Path,
         manager: RunManager,
         runs: RunsStore,
-        skills: SkillsStore,
         glossaries: GlossaryStore,
         port: int = DEFAULT_PORT,
     ) -> None:
         self.root = Path(root)
         self.manager = manager
         self.runs = runs
-        self.skills = skills
+        #: Read-only: the run planner resolves a glossary name through it, and
+        #: nothing on this surface can write to it.
         self.glossaries = glossaries
         self.port = port
         #: `(path, size, mtime) -> extracted text`, so flipping between two
         #: panes or reloading the page does not re-read a whole book.
         self._source_cache: dict[tuple[str, int, int], dict[str, Any]] = {}
-        #: `(read_at, payload)` for the memory report (see :data:`MEMORY_TTL`).
-        self._memory_cache: tuple[float, dict[str, Any]] | None = None
 
     # Routing -----------------------------------------------------------
     def handle(
@@ -249,8 +244,6 @@ class Api:
 
     def _api(self, method: str, path: str, query: dict[str, list[str]], body: bytes) -> Response:
         """The API routes, in one table, with no configuration among them."""
-        if method == "GET" and path.rstrip("/") == "/api/memory":
-            return self._memory()
         if path.rstrip("/") == "/api/runs":
             if method == "GET":
                 return self._runs()
@@ -266,14 +259,6 @@ class Api:
             # Unquote *before* validating: otherwise `..%2F.env` would look
             # like a harmless single-segment name and slip past `safe_child`.
             return self._upload(unquote(path[len("/api/inputs/") :]), query, body)
-        if path.startswith("/api/glossaries"):
-            answer = self._glossary_route(method, path, body)
-            if answer is not None:
-                return answer
-        if path.startswith("/api/skills") and method == "GET":
-            answer = self._skill_route(path)
-            if answer is not None:
-                return answer
         return error(404, f"no such route: {method} {path}")
 
     # Origin --------------------------------------------------------------
@@ -725,69 +710,6 @@ class Api:
         self._source_cache[key] = payload
         return json_response({**payload, "cached": False})
 
-    # Memory ---------------------------------------------------------------
-    def _memory(self) -> Response:
-        """What the translation memory holds — read-only, through the probe.
-
-        The report is a sample of the reasoning bank (see ``probe --memory``):
-        it says how many traces exist per language pair and what the recent
-        strategies were. Nothing here can write to the bank.
-        """
-        now = time.monotonic()
-        if self._memory_cache is not None and now - self._memory_cache[0] < MEMORY_TTL:
-            return json_response({"memory": self._memory_cache[1], "cached": True})
-        try:
-            payload = self.manager.probe(["--memory"])
-        except RunPlanError as exc:
-            return error(502, f"could not read the translation memory: {exc}")
-        if not isinstance(payload, dict):
-            return error(502, "the memory report was not an object")
-        self._memory_cache = (now, payload)
-        return json_response({"memory": payload, "cached": False})
-
-    # Glossaries and skills -------------------------------------------------
-    def _glossary_route(self, method: str, path: str, body: bytes) -> Response | None:
-        if path.rstrip("/") == "/api/glossaries" and method == "GET":
-            return json_response({"files": self.glossaries.list_files()})
-        if not path.startswith("/api/glossaries/"):
-            return None
-        name = unquote(path[len("/api/glossaries/") :])
-        try:
-            target = self.glossaries.path_for(name)
-        except ValueError as exc:
-            return error(403, f"refused: {exc}")
-        if method == "GET":
-            if not target.is_file():
-                return error(404, f"no such glossary: {name}")
-            return json_response({"name": target.name, "pairs": self.glossaries.read(name)})
-        if method == "PUT":
-            data = _json_object(body)
-            if data is None:
-                return error(400, "body must be a JSON object")
-            pairs = data.get("pairs")
-            if not isinstance(pairs, list) or not all(isinstance(row, list) for row in pairs):
-                return error(400, "pairs must be a list of [source, target] rows")
-            self.glossaries.write(name, pairs)
-            return json_response({"name": target.name, "pairs": pairs})
-        return None
-
-    def _skill_route(self, path: str) -> Response | None:
-        if path.rstrip("/") == "/api/skills":
-            return json_response({"skills": self.skills.list_skills()})
-        if not path.startswith("/api/skills/"):
-            return None
-        parts = [unquote(part) for part in path[len("/api/skills/") :].split("/")]
-        if len(parts) != 2:
-            return None
-        pair, domain = parts
-        try:
-            skill = self.skills.get_skill(pair, domain)
-        except ValueError:  # a name that could not be a real pair directory
-            skill = None
-        if skill is None:
-            return error(404, f"no skill for {pair}/{domain}")
-        return json_response({"skill": skill, "history": self.skills.history(pair, domain)})
-
     # Static ------------------------------------------------------------
     @property
     def static_dir(self) -> Path:
@@ -892,7 +814,6 @@ def default_api(root: Path = REPO_ROOT, *, port: int = DEFAULT_PORT, **manager_k
         root=root,
         manager=RunManager(root, **manager_kw),
         runs=RunsStore(root / LOGS_DIR),
-        skills=SkillsStore(root / "skills"),
         glossaries=GlossaryStore(root / "glossaries"),
         port=port,
     )

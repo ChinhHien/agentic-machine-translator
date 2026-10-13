@@ -77,7 +77,6 @@
   --sp-6: 32px;
 
   --rail: 304px;
-  --drawer: 400px;
   --measure: 74ch;
   --topbar: 56px;
 }
@@ -764,16 +763,6 @@ code { font-family: var(--font-data); font-size: 0.92em; }
 
 .field-group { margin: 0; padding: 0; border: 0; display: flex; flex-direction: column; gap: var(--sp-2); }
 
-.details > .summary {
-  cursor: pointer;
-  font-size: var(--fs-sm);
-  font-weight: 500;
-  color: var(--soft);
-}
-
-.details[open] > .summary { margin-bottom: var(--sp-2); }
-.details { gap: var(--sp-3); }
-
 .input {
   font: inherit;
   font-size: var(--fs-md);
@@ -786,7 +775,6 @@ code { font-family: var(--font-data); font-size: 0.92em; }
 }
 
 .input:hover { border-color: var(--muted); }
-textarea.input { font-family: var(--font-data); font-size: var(--fs-sm); resize: vertical; }
 
 .seg-group { display: flex; flex-wrap: wrap; gap: var(--sp-2); }
 
@@ -835,89 +823,6 @@ textarea.input { font-family: var(--font-data); font-size: var(--fs-sm); resize:
 .drop[data-state="bad"] { border-color: var(--danger); background: var(--danger-weak); }
 .drop[data-state="bad"] .drop-hint { color: var(--danger); }
 
-/* ------------------------------------------------------------- library */
-
-.library { display: flex; flex-direction: column; gap: var(--sp-1); max-height: 190px; overflow-y: auto; }
-
-/* Two lines per document: the name gets the width it needs and the facts about
-   the file sit under it. On one line a long name and a long date fight, and the
-   name — the only part a reader is choosing between — loses. */
-.lib-row {
-  display: grid;
-  grid-template-columns: auto minmax(0, 1fr);
-  gap: 2px var(--sp-3);
-  align-items: center;
-  padding: var(--sp-2) var(--sp-3);
-  border: 1px solid var(--border);
-  border-radius: var(--radius-sm);
-  font-size: var(--fs-sm);
-  cursor: pointer;
-}
-
-.lib-row:hover { border-color: var(--border-strong); }
-.lib-row input { grid-row: 1 / span 2; accent-color: var(--accent); }
-.lib-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.lib-meta {
-  grid-column: 2;
-  font-family: var(--font-data);
-  font-size: var(--fs-xs);
-  color: var(--muted);
-}
-.lib-row:has(input:checked) { border-color: var(--accent); background: var(--accent-weak); }
-
-/* ------------------------------------------------------------------ drawer */
-
-.drawer {
-  position: fixed;
-  top: var(--topbar);
-  right: 0;
-  bottom: 0;
-  width: min(var(--drawer), 100vw);
-  display: flex;
-  flex-direction: column;
-  gap: var(--sp-4);
-  padding: var(--sp-4);
-  border-left: 1px solid var(--border);
-  background: var(--surface);
-  box-shadow: var(--shadow);
-  overflow-y: auto;
-}
-
-.drawer-head { display: flex; align-items: center; justify-content: space-between; gap: var(--sp-3); }
-
-.tabs { display: flex; gap: var(--sp-1); border-bottom: 1px solid var(--border); }
-
-.tab {
-  font: inherit;
-  font-size: var(--fs-sm);
-  color: var(--muted);
-  background: transparent;
-  border: 0;
-  border-bottom: 2px solid transparent;
-  padding: var(--sp-2) var(--sp-3);
-  cursor: pointer;
-}
-
-.tab:hover { color: var(--soft); }
-.tab[aria-selected="true"] { color: var(--accent); border-bottom-color: var(--accent); font-weight: 500; }
-
-.panel { display: flex; flex-direction: column; gap: var(--sp-3); }
-
-.rows { display: flex; flex-direction: column; gap: var(--sp-2); }
-
-.row {
-  display: grid;
-  grid-template-columns: minmax(0, 1fr) auto;
-  gap: var(--sp-1) var(--sp-3);
-  padding-bottom: var(--sp-2);
-  border-bottom: 1px solid var(--border);
-  font-size: var(--fs-sm);
-}
-
-.row-main { overflow-wrap: anywhere; }
-.row-sub { grid-column: 1 / -1; font-size: var(--fs-xs); color: var(--muted); overflow-wrap: anywhere; }
-.row-aside { font-family: var(--font-data); font-size: var(--fs-xs); color: var(--muted); white-space: nowrap; }
-
 /* -------------------------------------------------------------- responsive */
 
 /* Below this width two reading panes are too narrow to compare, and the
@@ -937,7 +842,6 @@ textarea.input { font-family: var(--font-data); font-size: var(--fs-sm); resize:
   .view { overflow: visible; padding: var(--sp-4); }
   .topbar { padding: 0 var(--sp-4); }
   .grid-2 { grid-template-columns: minmax(0, 1fr); }
-  .drawer { top: 0; width: 100vw; border-left: 0; }
   .job-title { font-size: var(--fs-xl); }
 }
 

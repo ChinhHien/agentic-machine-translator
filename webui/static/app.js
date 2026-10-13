@@ -10,10 +10,10 @@
  * step rail keeps the strongest state it has seen for a step name rather than
  * the last one.
  *
- * The page has no view of the server's configuration: it sends per-run
- * preferences (languages, domain, glossary, chunk budget, output format) and
- * nothing else. There is no settings screen and no key status, because the
- * application does not know them.
+ * The page has no view of the server's configuration: a run is the document,
+ * its two languages and the output format, and nothing else. The domain, the
+ * glossary of terms and the chunk budget are the pipeline's own to work out,
+ * so there is no settings screen and no key status here either.
  *
  * State attributes written here, and styled in app.css:
  *   .job[data-state]  .job-row[data-state]  .badge[data-state]
@@ -105,9 +105,8 @@ const state = {
   targetNote: "",
   sourceMeta: "",
   targetMeta: "",
-  selectedFile: "",
   pendingOverwrite: "",
-  uploaded: "", // a file just written to input/, to select after reloading the list
+  uploaded: "", // the file just written to input/, which the dialog will run
 };
 
 /* ------------------------------------------------------------------ helpers */
@@ -241,10 +240,6 @@ function api(path) {
 
 function post(path, body) {
   return request("POST", path, body === undefined ? {} : body);
-}
-
-function put(path, body) {
-  return request("PUT", path, body === undefined ? {} : body);
 }
 
 async function readText(path) {
@@ -1226,9 +1221,11 @@ function openNewJobDialog() {
   byId("drop").dataset.state = "idle";
   setText(byId("upload-note"), "");
   show(byId("upload-bar"), false);
+  /* Every visit starts from an empty drop zone: nothing carries over from the
+     last dialog, so "Bắt đầu dịch" only ever runs the file just dropped. */
   state.pendingOverwrite = "";
-  loadInputs();
-  loadGlossaries();
+  state.uploaded = "";
+  byId("new-job-start").disabled = true;
   if (typeof dialog.showModal === "function") {
     dialog.showModal();
   } else {
@@ -1254,61 +1251,6 @@ function formAlert(message, kind) {
   alert.dataset.kind = kind || "error";
   setText(alert, message);
   show(alert, true);
-}
-
-async function loadInputs() {
-  let payload;
-  try {
-    payload = await api("/api/inputs");
-  } catch (error) {
-    formAlert(`Không đọc được thư mục input/: ${error.message}`, "error");
-    return;
-  }
-  const library = clear(byId("library"));
-  const files = payload.files || [];
-  if (!files.length) {
-    library.append(
-      element(
-        "p",
-        "note",
-        "input/ chưa có file PDF nào — hãy kéo thả một file vào ô phía trên.",
-      ),
-    );
-    return;
-  }
-  for (const file of files) {
-    const row = element("label", "lib-row");
-    const radio = element("input");
-    radio.type = "radio";
-    radio.name = "lib-file";
-    radio.value = file.name;
-    radio.checked = file.name === state.selectedFile;
-    radio.addEventListener("change", () => selectFile(file.name));
-    row.append(radio);
-    row.append(element("span", "lib-name", file.name));
-    row.append(
-      element(
-        "span",
-        "lib-meta",
-        `${formatSize(file.size)} · ${formatTime(file.mtime)}`,
-      ),
-    );
-    library.append(row);
-  }
-  if (!state.selectedFile && files.length === 1) {
-    selectFile(files[0].name);
-  }
-  setText(byId("new-job-start"), "Bắt đầu dịch");
-}
-
-function selectFile(name) {
-  state.selectedFile = name;
-  const radios = byId("library").querySelectorAll("input[type=radio]");
-  for (const radio of radios) {
-    radio.checked = radio.value === name;
-  }
-  byId("new-job-start").disabled = !name;
-  byId("new-job-start").textContent = "Bắt đầu dịch";
 }
 
 function dropMessage(state_, text) {
@@ -1339,12 +1281,10 @@ async function uploadFile(file, overwrite) {
        replace a document the reader already has. */
     state.pendingOverwrite = "";
     state.uploaded = name;
-    state.selectedFile = name;
     byId("upload-bar").dataset.state = "ok";
     byId("upload-fill").style.width = "100%";
-    dropMessage("idle", `Đã tải ${name} vào input/.`);
-    await loadInputs();
-    selectFile(name);
+    dropMessage("idle", `Đã tải ${name} lên — bấm “Bắt đầu dịch”.`);
+    byId("new-job-start").disabled = false;
   } catch (error) {
     byId("upload-bar").dataset.state = "fail";
     if (error.status === 409) {
@@ -1370,22 +1310,12 @@ async function startRun(event) {
   if (event) {
     event.preventDefault();
   }
-  const file = state.selectedFile || state.uploaded;
+  /* The document is the one just dropped on the page: nothing else can start a
+     run, so there is no stale choice to run by mistake. */
+  const file = state.uploaded;
   if (!file) {
-    formAlert(
-      "Hãy chọn một file PDF trong input/ hoặc kéo thả một file mới.",
-      "warn",
-    );
+    formAlert("Hãy kéo thả một file PDF vào ô trên.", "warn");
     return;
-  }
-  const tokens = byId("max-tokens").value.trim();
-  let maxTokens = null;
-  if (tokens) {
-    maxTokens = Number.parseInt(tokens, 10);
-    if (!Number.isFinite(maxTokens)) {
-      formAlert("Token mỗi chunk phải là một số nguyên.", "warn");
-      return;
-    }
   }
   const format = byId("format-pdf").checked
     ? "pdf"
@@ -1394,11 +1324,8 @@ async function startRun(event) {
       : "md";
   const body = {
     file: file,
-    src: byId("src").value.trim() || "auto",
-    tgt: byId("tgt").value.trim() || "vi",
-    domain: byId("domain").value.trim() || "general",
-    glossary: byId("glossary").value || null,
-    max_tokens: maxTokens,
+    src: byId("src").value || "auto",
+    tgt: byId("tgt").value || "vi",
     format: format,
   };
   const button = byId("new-job-start");
@@ -1413,245 +1340,8 @@ async function startRun(event) {
   } catch (error) {
     formAlert(`Không bắt đầu được lượt dịch: ${error.message}`, "error");
   } finally {
-    button.disabled = !state.selectedFile;
+    button.disabled = !state.uploaded;
     button.textContent = "Bắt đầu dịch";
-  }
-}
-
-/* ------------------------------------------------------------------ drawer */
-
-function toggleDrawer(force) {
-  const drawer = byId("drawer");
-  const visible = typeof force === "boolean" ? force : drawer.hidden;
-  show(drawer, visible);
-  byId("nav-tools").setAttribute("aria-expanded", visible ? "true" : "false");
-  if (visible) {
-    showTab(currentTab());
-  }
-}
-
-function currentTab() {
-  for (const name of ["glossary", "memory", "skills"]) {
-    if (byId(`tab-${name}`).getAttribute("aria-selected") === "true") {
-      return name;
-    }
-  }
-  return "glossary";
-}
-
-function showTab(name) {
-  for (const other of ["glossary", "memory", "skills"]) {
-    byId(`tab-${other}`).setAttribute(
-      "aria-selected",
-      other === name ? "true" : "false",
-    );
-    show(byId(`panel-${other}`), other === name);
-  }
-  if (name === "glossary") {
-    loadGlossaries();
-  } else if (name === "memory") {
-    loadMemory();
-  } else {
-    loadSkills();
-  }
-}
-
-async function loadGlossaries(message) {
-  let payload;
-  try {
-    payload = await api("/api/glossaries");
-  } catch (error) {
-    setText(byId("glossary-note"), `Không đọc được từ điển: ${error.message}`);
-    return;
-  }
-  const files = payload.files || [];
-  const list = clear(byId("glossary-list"));
-  if (!files.length) {
-    list.append(
-      element(
-        "li",
-        "note",
-        "Chưa có từ điển nào. Đặt tên và dán các cặp thuật ngữ ở dưới để tạo một file.",
-      ),
-    );
-  }
-  for (const file of files) {
-    const item = element("li", "row");
-    const open = element("button", "row-main btn btn--ghost", file.name);
-    open.type = "button";
-    open.addEventListener("click", () => openGlossary(file.name));
-    item.append(open);
-    item.append(
-      element("span", "row-aside", `${formatCount(file.entries)} cặp`),
-    );
-    list.append(item);
-  }
-  /* A fresh message from the caller — "đã lưu 3 cặp" — is the more useful
-     thing on screen, so the standing hint steps aside for it. */
-  setText(
-    byId("glossary-note"),
-    message ||
-      (files.length ? "Bấm một từ điển để xem và sửa nội dung của nó." : ""),
-  );
-
-  const select = byId("glossary");
-  const chosen = select.value;
-  clear(select);
-  const none = element("option", null, "— không dùng từ điển —");
-  none.value = "";
-  select.append(none);
-  for (const file of files) {
-    const option = element(
-      "option",
-      null,
-      `${file.name} (${formatCount(file.entries)} cặp)`,
-    );
-    option.value = file.name;
-    select.append(option);
-  }
-  select.value =
-    chosen && files.some((file) => file.name === chosen) ? chosen : "";
-}
-
-async function openGlossary(name) {
-  try {
-    const payload = await api(`/api/glossaries/${encodeURIComponent(name)}`);
-    byId("glossary-name").value = payload.name || name;
-    const lines = (payload.pairs || []).map((row) => row.join(", "));
-    byId("glossary-pairs").value = lines.join("\n");
-    setText(
-      byId("glossary-note"),
-      `Đang sửa ${payload.name || name}: ${formatCount(lines.length)} cặp.`,
-    );
-  } catch (error) {
-    setText(byId("glossary-note"), `Không mở được từ điển: ${error.message}`);
-  }
-}
-
-function parsePairs(text) {
-  const pairs = [];
-  for (const line of text.split(/\r?\n/)) {
-    const trimmed = line.trim();
-    if (!trimmed) {
-      continue;
-    }
-    const cells = trimmed
-      .split(/,|\t/)
-      .map((cell) => cell.trim())
-      .filter((cell) => cell !== "");
-    if (cells.length < 2) {
-      continue;
-    }
-    pairs.push([cells[0], cells[1]]);
-  }
-  return pairs;
-}
-
-async function saveGlossary() {
-  const name = byId("glossary-name").value.trim();
-  if (!name) {
-    setText(
-      byId("glossary-note"),
-      "Hãy đặt tên cho file từ điển (ví dụ: legal).",
-    );
-    return;
-  }
-  const pairs = parsePairs(byId("glossary-pairs").value);
-  if (!pairs.length) {
-    setText(
-      byId("glossary-note"),
-      "Cần ít nhất một dòng dạng “thuật ngữ gốc, thuật ngữ dịch”.",
-    );
-    return;
-  }
-  try {
-    const saved = await put(`/api/glossaries/${encodeURIComponent(name)}`, {
-      pairs: pairs,
-    });
-    byId("glossary-name").value = "";
-    byId("glossary-pairs").value = "";
-    await loadGlossaries(
-      `Đã lưu ${formatCount((saved.pairs || pairs).length)} cặp vào ${saved.name || name}.`,
-    );
-  } catch (error) {
-    setText(byId("glossary-note"), `Không lưu được từ điển: ${error.message}`);
-  }
-}
-
-async function loadMemory() {
-  const note = byId("memory-note");
-  setText(note, "Đang đọc bộ nhớ dịch…");
-  let payload;
-  try {
-    payload = await api("/api/memory");
-  } catch (error) {
-    setText(note, `Không đọc được bộ nhớ dịch: ${error.message}`);
-    clear(byId("memory-list"));
-    return;
-  }
-  const memory = payload.memory || {};
-  const pairs = memory.pairs || [];
-  const list = clear(byId("memory-list"));
-  setText(
-    note,
-    memory.total
-      ? `${formatCount(memory.total)} trace đã lưu, xếp theo ${formatCount(pairs.length)} cặp ngôn ngữ.`
-      : "Bộ nhớ dịch đang trống: chưa có lượt dịch nào đủ điểm để lưu lại.",
-  );
-  for (const bucket of pairs) {
-    const item = element("li", "row");
-    item.append(
-      element("span", "row-main", `${bucket.pair} · ${bucket.domain}`),
-    );
-    item.append(
-      element("span", "row-aside", `${formatCount(bucket.traces)} trace`),
-    );
-    const recent = (bucket.recent || [])[0];
-    const sub = element(
-      "span",
-      "row-sub",
-      recent
-        ? `điểm ${bucket.mean_score} · ${String(recent.strategy || "").slice(0, 140)}`
-        : `điểm ${bucket.mean_score}`,
-    );
-    item.append(sub);
-    list.append(item);
-  }
-}
-
-async function loadSkills() {
-  const note = byId("skills-note");
-  setText(note, "Đang đọc skill…");
-  let payload;
-  try {
-    payload = await api("/api/skills");
-  } catch (error) {
-    setText(note, `Không đọc được skill: ${error.message}`);
-    clear(byId("skills-list"));
-    return;
-  }
-  const skills = payload.skills || [];
-  const list = clear(byId("skills-list"));
-  setText(
-    note,
-    skills.length
-      ? `${formatCount(skills.length)} skill đã được học từ các lượt dịch trước.`
-      : "Chưa có skill nào: chúng xuất hiện sau khi một cặp ngôn ngữ đạt điểm đủ cao.",
-  );
-  for (const skill of skills) {
-    const item = element("li", "row");
-    item.append(element("span", "row-main", `${skill.pair} · ${skill.domain}`));
-    const score =
-      skill.mean_score === undefined || skill.mean_score === null
-        ? "chưa có điểm"
-        : `điểm ${skill.mean_score}`;
-    item.append(element("span", "row-aside", score));
-    if (skill.instruction) {
-      item.append(
-        element("span", "row-sub", String(skill.instruction).slice(0, 200)),
-      );
-    }
-    list.append(item);
   }
 }
 
@@ -1659,12 +1349,6 @@ async function loadSkills() {
 
 function wire() {
   byId("nav-new").addEventListener("click", openNewJobDialog);
-  byId("nav-tools").addEventListener("click", () => toggleDrawer());
-  byId("drawer-close").addEventListener("click", () => toggleDrawer(false));
-  for (const name of ["glossary", "memory", "skills"]) {
-    byId(`tab-${name}`).addEventListener("click", () => showTab(name));
-  }
-  byId("glossary-save").addEventListener("click", saveGlossary);
 
   byId("new-job-cancel").addEventListener("click", closeNewJobDialog);
   byId("new-job-form").addEventListener("submit", startRun);
@@ -1724,12 +1408,6 @@ function wire() {
     state.view = "target";
     renderView();
   });
-
-  document.addEventListener("keydown", (event) => {
-    if (event.key === "Escape" && !byId("drawer").hidden) {
-      toggleDrawer(false);
-    }
-  });
 }
 
 function boot() {
@@ -1738,7 +1416,6 @@ function boot() {
   renderFilters();
   renderView();
   loadRuns();
-  loadGlossaries();
 }
 
 if (document.readyState === "loading") {

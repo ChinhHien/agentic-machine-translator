@@ -21,5 +21,5 @@ skills/**/session_*.json
 *.pdf
 
 .superpowers/
-.output/*
-.input/*
+output/
+input/

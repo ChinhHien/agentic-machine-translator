@@ -12,9 +12,6 @@
 <header class="topbar">
   <p class="brand">polyglot-lc</p>
   <div class="topbar-actions">
-    <button id="nav-tools" class="btn" type="button" aria-expanded="false" aria-controls="drawer">
-      Công cụ
-    </button>
     <button id="nav-new" class="btn btn--primary" type="button">Dịch tài liệu mới</button>
   </div>
 </header>
@@ -110,36 +107,37 @@
       <p id="upload-note" class="note"></p>
     </div>
 
-    <fieldset class="field-group">
-      <legend class="legend">Tài liệu có sẵn trong input/</legend>
-      <div id="library" class="library"></div>
-    </fieldset>
-
+    <!-- The value stays the language code the backend expects; what the reader
+         picks is the language's own name, in full. -->
     <div class="grid-2">
       <p class="field">
         <label class="label" for="src">Ngôn ngữ nguồn</label>
-        <input id="src" class="input" value="auto" list="languages" autocomplete="off"
-               spellcheck="false">
+        <select id="src" class="input">
+          <option value="auto" selected>Auto (Tự động nhận diện)</option>
+          <option value="vi">Tiếng Việt</option>
+          <option value="en">Tiếng Anh</option>
+          <option value="ja">Tiếng Nhật</option>
+          <option value="ko">Tiếng Hàn</option>
+          <option value="zh">Tiếng Trung</option>
+          <option value="fr">Tiếng Pháp</option>
+          <option value="de">Tiếng Đức</option>
+          <option value="es">Tiếng Tây Ban Nha</option>
+        </select>
       </p>
       <p class="field">
         <label class="label" for="tgt">Ngôn ngữ đích</label>
-        <input id="tgt" class="input" value="vi" list="languages" autocomplete="off"
-               spellcheck="false">
+        <select id="tgt" class="input">
+          <option value="vi" selected>Tiếng Việt</option>
+          <option value="en">Tiếng Anh</option>
+          <option value="ja">Tiếng Nhật</option>
+          <option value="ko">Tiếng Hàn</option>
+          <option value="zh">Tiếng Trung</option>
+          <option value="fr">Tiếng Pháp</option>
+          <option value="de">Tiếng Đức</option>
+          <option value="es">Tiếng Tây Ban Nha</option>
+        </select>
       </p>
     </div>
-    <datalist id="languages">
-      <!-- The value stays the language code the backend expects; the label is
-           only the web UI's display name, so the run is unaffected. -->
-      <option value="auto" label="Tự động"></option>
-      <option value="en" label="Tiếng Anh"></option>
-      <option value="vi" label="Tiếng Việt"></option>
-      <option value="ja" label="Tiếng Nhật"></option>
-      <option value="ko" label="Tiếng Hàn"></option>
-      <option value="zh" label="Tiếng Trung"></option>
-      <option value="fr" label="Tiếng Pháp"></option>
-      <option value="de" label="Tiếng Đức"></option>
-      <option value="es" label="Tiếng Tây Ban Nha"></option>
-    </datalist>
 
     <fieldset id="formats" class="field-group">
       <legend class="legend">Kết quả xuất ra</legend>
@@ -158,23 +156,6 @@
         </label>
       </div>
     </fieldset>
-
-    <details class="field-group details">
-      <summary class="summary">Nâng cao</summary>
-      <p class="field">
-        <label class="label" for="domain">Lĩnh vực</label>
-        <input id="domain" class="input" value="general" autocomplete="off" spellcheck="false">
-      </p>
-      <p class="field">
-        <label class="label" for="glossary">Từ điển thuật ngữ</label>
-        <select id="glossary" class="input"></select>
-      </p>
-      <p class="field">
-        <label class="label" for="max-tokens">Token mỗi chunk (không bắt buộc)</label>
-        <input id="max-tokens" class="input" type="number" min="64" step="16"
-               inputmode="numeric" placeholder="theo cấu hình">
-      </p>
-    </details>
 
     <div class="dialog-actions">
       <button id="new-job-cancel" class="btn" type="button">Hủy</button>
@@ -198,47 +179,6 @@
     </div>
   </form>
 </dialog>
-
-<aside id="drawer" class="drawer" hidden aria-labelledby="drawer-title">
-  <header class="drawer-head">
-    <h2 id="drawer-title" class="section-title">Công cụ</h2>
-    <button id="drawer-close" class="btn btn--ghost" type="button">Đóng</button>
-  </header>
-
-  <div class="tabs" role="tablist" aria-label="Công cụ dịch">
-    <button id="tab-glossary" class="tab" role="tab" type="button" aria-selected="true"
-            aria-controls="panel-glossary">Từ điển</button>
-    <button id="tab-memory" class="tab" role="tab" type="button" aria-selected="false"
-            aria-controls="panel-memory">Bộ nhớ dịch</button>
-    <button id="tab-skills" class="tab" role="tab" type="button" aria-selected="false"
-            aria-controls="panel-skills">Skill đã học</button>
-  </div>
-
-  <section id="panel-glossary" class="panel" role="tabpanel" aria-labelledby="tab-glossary">
-    <p id="glossary-note" class="note"></p>
-    <ul id="glossary-list" class="rows"></ul>
-    <p class="field">
-      <label class="label" for="glossary-name">Tên file</label>
-      <input id="glossary-name" class="input" placeholder="legal.csv" autocomplete="off"
-             spellcheck="false">
-    </p>
-    <p class="field">
-      <label class="label" for="glossary-pairs">Mỗi dòng một cặp nguồn, đích</label>
-      <textarea id="glossary-pairs" class="input" rows="5" spellcheck="false"></textarea>
-    </p>
-    <button id="glossary-save" class="btn" type="button">Lưu từ điển</button>
-  </section>
-
-  <section id="panel-memory" class="panel" role="tabpanel" aria-labelledby="tab-memory" hidden>
-    <p id="memory-note" class="note"></p>
-    <ul id="memory-list" class="rows"></ul>
-  </section>
-
-  <section id="panel-skills" class="panel" role="tabpanel" aria-labelledby="tab-skills" hidden>
-    <p id="skills-note" class="note"></p>
-    <ul id="skills-list" class="rows"></ul>
-  </section>
-</aside>
 
 <noscript>
   <p class="banner" data-kind="warn">
