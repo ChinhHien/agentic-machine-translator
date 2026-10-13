@@ -295,3 +295,14 @@ def test_assemble_never_drops_fresh_content_on_collapsed_paras():
     out = assemble([c0, c1], {"c0": "P0\n\nP1", "c1": "merged-P1P2"})
     # drop=min(1, len(paras)-1)=min(1,0)=0 -> nothing stripped.
     assert "merged-P1P2" in out
+
+
+# ------------------------- emphasis in the Markdown output ------------------
+def test_the_markdown_output_has_markdown_emphasis():
+    """Vocab gửi cho model là sentinel, nhưng tài liệu giao cho người đọc là Markdown."""
+    from polyglot_lc.pipeline.assembler import assemble
+
+    chunks = [_FakeChunk("c0", [0, 1])]
+    out = assemble(chunks, {"c0": "A ⟦BOLD⟧B⟦/BOLD⟧ C"}, {})
+    assert "**B**" in out
+    assert "⟦" not in out

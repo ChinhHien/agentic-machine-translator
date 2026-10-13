@@ -9,6 +9,7 @@ import threading
 from pathlib import Path
 from typing import Any
 
+from polyglot_lc import emphasis
 from polyglot_lc.ingest.md import restore_code
 
 #: Separator between two assembled chunks (matches the previous behaviour).
@@ -206,7 +207,11 @@ def assemble(
         text = _chunk_emission(chunk, prev, translations.get(chunk.id, ""), default="")
         parts.append(restore_code(text, code_map or {}))
     assembled = CHUNK_SEPARATOR.join(parts)
-    return _deduplicate_paragraphs(assembled)
+    # The sentinels are the vocabulary the *model* is given; a reader gets real
+    # Markdown, so they are rendered here, last, after code has been restored.
+    # ``to_markdown`` only touches its own four tokens, so restored code — which
+    # may contain anything, brackets included — cannot be damaged by it.
+    return emphasis.to_markdown(_deduplicate_paragraphs(assembled))
 
 
 def block_translations(
@@ -278,7 +283,9 @@ def assemble_partial(
             parts.append(f"<!-- {chunk.id}: pending -->")
         else:
             parts.append(restore_code(text, code_map or {}))
-    return CHUNK_SEPARATOR.join(parts)
+    # The incremental file is read by the same eyes as the final one, so it
+    # carries real Markdown too (see :func:`assemble`).
+    return emphasis.to_markdown(CHUNK_SEPARATOR.join(parts))
 
 
 def _deduplicate_paragraphs(text: str) -> str:
