@@ -53,29 +53,42 @@ class VerifierAgent(Agent):
         translation: str,
         src_lang: str,
         tgt_lang: str,
+        glossary_md: str = "",
     ) -> VerifyResult:
-        """Run hard checks first, then an LLM adequacy verdict."""
+        """Run hard checks first, then an LLM adequacy verdict.
+
+        The whole chunk is sent: a truncation would leave the tail of a long
+        chunk unverified, and the chunker has already bounded the size. When
+        *glossary_md* is supplied the verdict also covers terminology, which is
+        otherwise only policed document-wide by the consistency pass.
+        """
         problems = hard_checks(source, translation)
         if problems:
             return VerifyResult(ok=False, reasons=problems)
 
+        glossary = ""
+        if glossary_md and glossary_md.strip() and glossary_md.strip() != "(none)":
+            glossary = f"Glossary (the agreed target form of each term):\n{glossary_md}\n\n"
         prompt = (
             "You are a translation QA verifier. Decide whether this chunk is "
             "safe to ship.\n"
-            f"Source ({src_lang}):\n{source[:2000]}\n\n"
-            f"Translation ({tgt_lang}):\n{translation[:2000]}\n\n"
-            "Check, in order:\n"
+            f"Source ({src_lang}):\n{source}\n\n"
+            f"Translation ({tgt_lang}):\n{translation}\n\n" + glossary + "Check, in order:\n"
             "1. Completeness - every sentence of the source is represented.\n"
             "2. No additions - nothing was invented that the source does not "
             "say.\n"
             "3. Language - the translation is in the target language, reads "
             "naturally, and leaves no source-language text behind.\n"
-            "4. Structure - headings, lists, placeholders (e.g. ⟦CODE_1⟧) "
+            "4. Structure - headings, lists, placeholders (e.g. ⟦CODE_1⟧), "
+            "the emphasis pairs (⟦BOLD⟧...⟦/BOLD⟧, ⟦ITALIC⟧...⟦/ITALIC⟧) "
             "and Markdown table rows are intact.\n"
-            "Pass only when all four hold. Fail only for a defect a reader "
-            "would notice, never for a style preference you would have "
-            "phrased differently. Name the exact text at fault in each "
-            "reason: a failure costs one re-translation of this chunk.\n"
+            "5. Terminology - every glossary term that occurs in the source "
+            "appears in the translation in the glossary's own target form. "
+            "Skip this check when no glossary is given.\n"
+            "Pass only when all the applicable checks hold. Fail only for a "
+            "defect a reader would notice, never for a style preference you "
+            "would have phrased differently. Name the exact text at fault in "
+            "each reason: a failure costs one re-translation of this chunk.\n"
             "Reply ONLY with JSON:\n"
             '{"pass": true|false, "reasons": ["..."]}'
         )

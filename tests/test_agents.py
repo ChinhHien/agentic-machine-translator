@@ -126,7 +126,9 @@ def _capture_critic_prompt(critic) -> str:
     return captured["prompt"]
 
 
-def _capture_verifier_prompt(verifier) -> str:
+def _capture_verifier_prompt(
+    verifier, source: str = "hello", translation: str = "xin chào", **kwargs
+) -> str:
     captured: dict[str, str] = {}
 
     def fake_chat(messages, **kw):
@@ -134,7 +136,7 @@ def _capture_verifier_prompt(verifier) -> str:
         return LLMResponse(text='{"pass": true, "reasons": []}', model="m")
 
     verifier.chat = fake_chat  # type: ignore[assignment]
-    verifier.verify("hello", "xin chào", "en", "vi")
+    verifier.verify(source, translation, "en", "vi", **kwargs)
     return captured["prompt"]
 
 
@@ -154,6 +156,38 @@ def test_verifier_prompt_lists_the_checks_it_runs(mock_env):
     assert "No additions" in prompt
     # The reasons feed the single bounded retranslate, so they must be usable.
     assert "costs one re-translation" in prompt
+
+
+def test_verifier_prompt_carries_the_glossary(mock_env):
+    """A term the glossary fixes is a defect only if the verifier can see it."""
+    from polyglot_lc.config import get_agent_config
+
+    v = VerifierAgent(get_agent_config("VERIFIER"))
+    prompt = _capture_verifier_prompt(v, glossary_md="- NMT -> dịch máy nơ-ron")
+    assert "Terminology" in prompt
+    assert "dịch máy nơ-ron" in prompt
+
+
+def test_verifier_prompt_skips_an_empty_glossary(mock_env):
+    """``(none)`` is the planner's "no glossary", not a term to match."""
+    from polyglot_lc.config import get_agent_config
+
+    v = VerifierAgent(get_agent_config("VERIFIER"))
+    assert "Glossary" not in _capture_verifier_prompt(v, glossary_md="(none)")
+    assert "Glossary" not in _capture_verifier_prompt(v)
+
+
+def test_verifier_sees_the_whole_chunk(mock_env):
+    """A truncation would leave the tail of a long chunk unverified."""
+    from polyglot_lc.config import get_agent_config
+
+    tail = "The final clause is only here."
+    source = "".join(f"Sentence number {i} of the chunk. " for i in range(120)) + tail
+    assert len(source) > 2000
+    v = VerifierAgent(get_agent_config("VERIFIER"))
+    prompt = _capture_verifier_prompt(v, source=source, translation="xin chào")
+    assert tail in prompt
+    assert source in prompt
 
 
 def test_retranslate_prompt_names_the_rejection(mock_env):
@@ -201,3 +235,23 @@ def test_mock_dispatcher_still_recognises_the_live_prompts(mock_env):
 
     verifier = VerifierAgent(get_agent_config("VERIFIER"))
     assert "pass" in _mock_json_reply(_capture_verifier_prompt(verifier))
+
+
+def test_the_translator_prompt_describes_the_emphasis_tokens(mock_env):
+    """The tokens only survive if the model is told they are structure."""
+    from polyglot_lc.config import get_agent_config
+
+    t = TranslatorAgent(get_agent_config("TRANSLATOR"))
+    prompt = t.build_prompt("A ⟦BOLD⟧B⟦/BOLD⟧ C.", "en", "vi", "literal")
+    joined = "\n".join(m["content"] for m in prompt)
+    assert "⟦BOLD⟧" in joined and "⟦/BOLD⟧" in joined
+    assert "never translate or rename the tokens" in joined
+
+
+def test_the_verifier_prompt_names_the_emphasis_tokens_as_structure(mock_env):
+    """Otherwise "No additions" could report the tokens as invented content."""
+    from polyglot_lc.config import get_agent_config
+
+    v = VerifierAgent(get_agent_config("VERIFIER"))
+    prompt = _capture_verifier_prompt(v)
+    assert "⟦BOLD⟧" in prompt
