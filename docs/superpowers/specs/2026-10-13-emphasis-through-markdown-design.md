@@ -165,8 +165,12 @@ Bất biến:
      ghim vẫn thắng (khi ghim, mọi run dùng mặt đã ghim — đúng như `placements` đang làm với
      `match_style=False`).
    - Trả `"block"` khi đã in hết, `None` khi ngay ở sàn vẫn không vừa (đếm vào `failures` như hiện nay).
-4. **Không** có nhánh tràn xuống lề dưới cho block có run: layout tự viết đã biết chiều cao của chính
-   nó, nên "vừa" là điều kiện thật; giữ nguyên nhánh tràn cho block thường để không đổi hành vi cũ.
+4. Nhánh cuối của block thường — **in ở cỡ sàn, dùng hết chỗ xuống tới lề dưới** — được giữ nguyên
+   cho **cả hai** đường, kể cả đường run. Lý do là một sự thật đã kiểm trong code: `rebuild_pdf`
+   **xoá chữ nguồn trước khi in** (`add_redact_annot` + `apply_redactions`, rồi mới `_insert` — xem
+   `pdf_output.py:rebuild_pdf`), nên một block không in được sẽ **trống hẳn**, chứ không phải để lại
+   chữ nguồn. Tiêu chí "không mất chữ" (§1) đứng trên chuyện khung đẹp: đường run cũng phải chịu
+   tràn xuống lề dưới ở cỡ sàn trước khi chịu thua.
 5. Phần vá ToUnicode (§2 của lượt trước) **đã** phủ trường hợp này: nó sửa map của **mọi** font mà ta
    chèn trên trang, kể cả nhiều mặt đậm/nghiêng khác nhau. Không cần sửa gì thêm.
 6. `_insert_cell`, lưới bảng, `_toc_line`, `_marked_text` **không đổi**. Dấu đầu dòng của mục danh sách
@@ -191,6 +195,8 @@ mạnh chuẩn Markdown thay vì token. PDF **không** dùng đường này (nó
 | Token trong **ô bảng** (chỉ có thể do model tự thêm, vì ingest không phát token cho bảng) | `_table_placements` gỡ token trước khi tách ô — v1 chưa in run trong ô; chữ trong ô không đổi, chỉ mất nhấn mạnh |
 | Token trong block `code` / cả dòng `⟦CODE_n⟧` | Không xảy ra: hai loại này không được phát token (§5.5) và không dịch |
 | Không tìm được mặt đậm/nghiêng trên máy | Run đó in bằng mặt mặc định → mất nhấn mạnh, **không** mất chữ; ghi `logger.debug` |
+| Block có run không vừa ở cỡ sàn | In hết chỗ tới lề dưới ở cỡ sàn, **như block thường** (xem §7.4); chỉ khi đó vẫn không xong mới trả `None` và ghi vào `failures` — vùng đó không bao giờ bị để trắng |
+| Lỗi sentinel cần một `cause` mới | `record_error` chỉ nhận cause trong tập đóng `CAUSES` (`ui/trace.py:59`) và **đổi mọi giá trị lạ thành `unknown`**; vì vậy `CAUSES` phải nhận thêm `"emphasis"`, kéo theo test ghim số lượng cause (`tests/test_trace.py:50`) |
 | Đoạn chỉ có một từ đậm, không có chữ thường | Chuỗi run có hai kiểu → có token; layout chạy bình thường |
 | Nhấn mạnh vắt qua mối nối dòng nguồn | Run được gộp ở §5.3 → một cặp token, không sinh cặp thừa |
 | Block không dịch (chunk hết lượt thử lại) | Nhánh `kept` không in và không gỡ gì; token chỉ tồn tại ở tầng chuỗi, còn trang gốc là chữ thật nên không có token nào trên trang |
