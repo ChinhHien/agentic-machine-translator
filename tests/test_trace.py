@@ -47,7 +47,10 @@ def test_every_cause_comes_from_the_closed_set():
         TimeoutError("t"),
     ):
         assert cause_for(exc) in CAUSES
-    assert len(CAUSES) == 11
+    # A closed set, and this number is part of what closing it means: it moved
+    # from 11 to 12 because `emphasis` is a real cause a writer records (a chunk
+    # whose sentinel pairs do not match the source is printed plain).
+    assert len(CAUSES) == 12
 
 
 def test_ingest_step_unclassified_failure_is_an_input_cause():

@@ -22,6 +22,7 @@ from typing import Any
 from langgraph.graph import END, StateGraph
 from loguru import logger
 
+from polyglot_lc import emphasis
 from polyglot_lc.agents import (
     CriticAgent,
     PlannerAgent,
@@ -46,6 +47,21 @@ from polyglot_lc.orchestrator.state import ChunkState
 PATH_FAST = "fast"
 PATH_STANDARD = "standard"
 PATH_DEEP = "deep"
+
+
+def settle_emphasis(chunk_text: str, translation: str) -> tuple[str, bool]:
+    """Drop the chunk's emphasis tokens unless they match the source exactly.
+
+    The tokens mark spans, not content, so a mismatch is not worth a
+    re-translation — but a lopsided pair left in place would put a ``⟦`` on the
+    page, so it is removed at the last point that sees the whole chunk.
+
+    Module level, and not a closure in ``collect_node``, so the rule can be
+    tested without standing up a graph.
+    """
+    if emphasis.agrees_with(chunk_text, translation):
+        return translation, False
+    return emphasis.strip(translation), True
 
 
 class GraphContext:
@@ -111,7 +127,7 @@ class GraphContext:
         """Write one problem with its cause, kept inside the closed set.
 
         An unknown cause is replaced by ``unknown`` rather than written as-is:
-        the file's guarantee is that every cause is one of eleven values, and a
+        the file's guarantee is that every cause is one of twelve values, and a
         reader that trusts it must not be able to find a twelfth.
         """
         from polyglot_lc.ui.trace import CAUSES
@@ -385,6 +401,7 @@ def make_chunk_graph(ctx: GraphContext):
                 translation=draft,
                 src_lang=state["src_lang"],
                 tgt_lang=state["tgt_lang"],
+                glossary_md=state.get("glossary_md", ""),
             )
             return {"draft": draft, "verify_result": vr}
 
@@ -437,6 +454,21 @@ def make_chunk_graph(ctx: GraphContext):
                 chunk_id=state["chunk"].id,
                 cause="placeholder",
                 message=f"{len(repaired)} code marker(s) re-inserted before saving",
+            )
+        # Emphasis tokens mark spans, not content: a chunk whose pairs do not
+        # match the source is printed plain rather than translated again (spec
+        # section 2.1), but the mismatch is recorded so a reader can see it.
+        translated, dropped_emphasis = settle_emphasis(state["chunk"].text, translated)
+        if dropped_emphasis:
+            logger.warning(
+                "chunk={} emphasis tokens did not match the source; printing this chunk plain",
+                state["chunk"].id,
+            )
+            ctx.record_error(
+                step="collect",
+                chunk_id=state["chunk"].id,
+                cause="emphasis",
+                message="emphasis tokens dropped: counts do not match the source",
             )
         return {"translated": translated, "path": path}
 

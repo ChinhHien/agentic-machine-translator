@@ -66,6 +66,7 @@ CAUSES: frozenset[str] = frozenset(
         "parse",
         "verify",
         "placeholder",
+        "emphasis",
         "config",
         "input",
         "unknown",

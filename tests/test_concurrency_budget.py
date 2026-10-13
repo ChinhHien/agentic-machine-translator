@@ -410,3 +410,61 @@ def test_cache_fingerprint_stable_and_sensitive():
         [{"role": "system", "content": "other prefix"}], model="m1"
     )
     assert "shared prefix" not in fp  # only a digest is exposed, never raw text
+
+
+# ----------------------- emphasis mismatch at the chunk level ---------------
+def test_settle_emphasis_drops_a_lopsided_pair():
+    from polyglot_lc.orchestrator.graph import settle_emphasis
+
+    text, dropped = settle_emphasis("A ⟦BOLD⟧B⟦/BOLD⟧ C", "A B ⟦BOLD⟧C")
+    assert text == "A B C"
+    assert dropped is True
+
+
+def test_settle_emphasis_keeps_a_matching_pair():
+    from polyglot_lc.orchestrator.graph import settle_emphasis
+
+    text, dropped = settle_emphasis("A ⟦BOLD⟧B⟦/BOLD⟧ C", "A ⟦BOLD⟧B⟦/BOLD⟧ C")
+    assert text == "A ⟦BOLD⟧B⟦/BOLD⟧ C"
+    assert dropped is False
+
+
+def test_a_lopsided_emphasis_pair_is_recorded_as_an_emphasis_error(mock_env, tmp_path, monkeypatch):
+    """Không tốn lượt dịch lại vì kiểu chữ, nhưng phải thấy được trong trace."""
+    import json
+
+    from pdfdoc import write_styled_pdf
+
+    from polyglot_lc.llm.client import LLMResponse
+    from polyglot_lc.orchestrator.graph import make_chunk_graph
+    from polyglot_lc.ui.events import EventSink
+
+    path = write_styled_pdf(tmp_path / "styled.pdf", "Alpha ", "Beta", " Gamma")
+    chunks, _ = _expected_chunks(path)
+    assert "⟦BOLD⟧" in chunks[0].text, "nguồn thật phải mang token"
+    sink = EventSink(tmp_path, enabled=True)
+    ctx = _ctx(mock_env, _BoomRB())
+    ctx.sink = sink
+    # Bản dịch mock làm mất token đóng → lệch → phải bị gỡ và ghi lại.
+    monkeypatch.setattr(
+        ctx.translator,
+        "chat",
+        lambda *a, **k: LLMResponse(text="Alpha ⟦BOLD⟧Beta Gamma", model="m"),
+    )
+    out = make_chunk_graph(ctx).invoke(
+        {
+            "chunk": chunks[0],
+            "src_lang": "en",
+            "tgt_lang": "vi",
+            "domain": "general",
+            "strategy": "literal",
+            "few_shot": [],
+            "pitfalls": [],
+            "glossary_md": "",
+        },
+        config={"recursion_limit": 100},
+    )
+
+    assert "⟦" not in out["translated"]
+    records = [json.loads(line) for line in sink.path.read_text(encoding="utf-8").splitlines()]
+    assert any(r.get("cause") == "emphasis" for r in records), records
