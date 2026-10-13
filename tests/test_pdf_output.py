@@ -791,3 +791,105 @@ def test_a_heading_block_with_tokens_does_not_print_its_hashes():
 
     assert items[0].runs == [("A", True, False), (" B", False, False)]
     assert "#" not in items[0].text
+
+
+# ------------------------- emphasis: printing the runs ----------------------
+
+
+def _spans(pdf_path) -> list[tuple[str, int, str]]:
+    """``(text, flags, font)`` của mọi span trên trang đầu.
+
+    Bit 16 là đậm, bit 2 là nghiêng. Cờ này sống sót khi nhúng bằng ``fontfile``
+    **chỉ khi mỗi mặt có resource name riêng** — trùng tên thì PyMuPDF in bằng
+    mặt đăng ký trước đó, nên `_resource_name` băm theo đường dẫn tệp font.
+    """
+    import pymupdf
+
+    with pymupdf.open(pdf_path) as rebuilt:
+        return [
+            (span["text"], span["flags"], span["font"])
+            for block in rebuilt[0].get_text("dict")["blocks"]
+            if block.get("type") == 0
+            for line in block["lines"]
+            for span in line["spans"]
+        ]
+
+
+def test_a_bold_span_is_printed_bold_and_the_rest_plain(tmp_path, unicode_font):
+    """Đã kiểm bằng tay: Times New Roman cho flags 4 (thường) / 20 (đậm)."""
+    from pdfdoc import write_styled_pdf
+
+    src = write_styled_pdf(tmp_path / "in.pdf", "Alpha ", "Beta", " Gamma")
+    doc = load_document(src)
+    assert "⟦BOLD⟧" in doc.blocks[0].text, "ingest phải phát token cho dòng trộn kiểu"
+    rebuild_pdf(
+        src, doc, {0: "Alpha ⟦BOLD⟧Beta⟦/BOLD⟧ Gamma"}, tmp_path / "out.pdf", font_path=unicode_font
+    )
+
+    spans = _spans(tmp_path / "out.pdf")
+    assert any("Beta" in text and flags & 16 for text, flags, _ in spans), spans
+    assert any("Alpha" in text and not flags & 16 for text, flags, _ in spans)
+    assert "⟦" not in "".join(text for text, _, _ in spans), "token không được lộ lên trang"
+
+
+def test_the_bold_run_uses_a_second_face_not_the_plain_one(tmp_path, unicode_font):
+    """Hai lần in phải cho ra hai font **khác nhau** khi đọc lại.
+
+    Nếu chúng trùng tên, một trang thật có hai mặt cùng tên sẽ âm thầm in bằng
+    mặt thứ nhất, và nhấn mạnh biến mất mà không có lỗi nào.
+    """
+    from pdfdoc import write_styled_pdf
+
+    src = write_styled_pdf(tmp_path / "in.pdf", "Alpha ", "Beta", " Gamma")
+    doc = load_document(src)
+    rebuild_pdf(
+        src, doc, {0: "Alpha ⟦BOLD⟧Beta⟦/BOLD⟧ Gamma"}, tmp_path / "out.pdf", font_path=unicode_font
+    )
+
+    spans = _spans(tmp_path / "out.pdf")
+    bold = {font for text, flags, font in spans if "Beta" in text and flags & 16}
+    plain = {font for text, flags, font in spans if "Alpha" in text and not flags & 16}
+    assert bold and plain and bold.isdisjoint(plain), spans
+
+
+def test_a_missing_local_bold_face_loses_the_emphasis_but_not_the_text(
+    tmp_path, unicode_font, monkeypatch
+):
+    """Máy không có mặt đậm cục bộ: mất nhấn mạnh, chữ còn nguyên, không raise."""
+    from pdfdoc import write_styled_pdf
+
+    monkeypatch.setattr(pdf_output, "match_font", lambda *a, **k: None)
+    src = write_styled_pdf(tmp_path / "in.pdf", "Alpha ", "Beta", " Gamma")
+    doc = load_document(src)
+    stats = rebuild_pdf(
+        src, doc, {0: "Alpha ⟦BOLD⟧Beta⟦/BOLD⟧ Gamma"}, tmp_path / "out.pdf", font_path=unicode_font
+    )
+
+    spans = _spans(tmp_path / "out.pdf")
+    assert stats.failures == []
+    assert any("Beta" in text for text, _, _ in spans), "chữ không được mất"
+    assert not any(flags & 16 for _, flags, _ in spans), "không có mặt đậm thì không có cờ đậm"
+    assert "⟦" not in "".join(text for text, _, _ in spans)
+
+
+def test_a_long_translation_uses_the_room_below_before_giving_up(tmp_path, unicode_font):
+    """`rebuild_pdf` xoá chữ nguồn **trước** khi in, nên một block không in được là
+    mất sạch chữ chứ không để lại chữ nguồn. Đường run phải dùng hết chỗ tới lề
+    dưới ở cỡ sàn trước khi chịu thua."""
+    import pymupdf
+    from pdfdoc import write_styled_pdf
+
+    src = write_styled_pdf(tmp_path / "in.pdf", "Alpha ", "Beta", " Gamma")
+    doc = load_document(src)
+    long_text = "Alpha ⟦BOLD⟧" + "rất dài " * 12 + "⟦/BOLD⟧ Gamma"
+    stats = rebuild_pdf(src, doc, {0: long_text}, tmp_path / "out.pdf", font_path=unicode_font)
+
+    assert stats.failures == [], "chữ dài vẫn phải in được, chỉ là tràn xuống dưới"
+    with pymupdf.open(tmp_path / "out.pdf") as rebuilt:
+        words = rebuilt[0].get_text("words")
+        height = rebuilt[0].rect.height
+    assert words, "trang phải còn chữ"
+    assert all(word[1] >= 0 and word[3] <= height for word in words), (
+        "chữ không được rời khỏi trang"
+    )
+    assert not any("⟦" in word[4] for word in words)

@@ -428,6 +428,10 @@ class _Placement:
     #: The translation split into runs of one style, or ``None`` to print the
     #: whole block in one face with ``insert_textbox`` (the usual case).
     runs: list[tuple[str, bool, bool]] | None = None
+    #: Whether the source's family may be matched to a local face. A pinned font
+    #: opts out, and the runs have to respect that too: otherwise a font the
+    #: caller chose on purpose would come back for the bold names only.
+    match_style: bool = True
 
 
 #: How far a one-line block may be stretched, in points, from the text column.
@@ -747,6 +751,7 @@ def placements(
             kept += 1
             continue
         item.face = str(geo.get("font") or "")
+        item.match_style = match_style
         if match_style:
             item.font_file = match_font(
                 item.face,
@@ -799,6 +804,22 @@ def _toc_line(item: _Placement, font_file: str, pymupdf: Any) -> str:
     if count < 3:
         return f"{title} {number}"
     return f"{title} " + "." * count + f" {number}"
+
+
+def _heading_is_centred(page: Any, item: _Placement) -> bool:
+    """Whether a heading sits clear of both margins and near the page's centre.
+
+    Left-aligning a centred title is the one change a reader notices, so the
+    decision lives in one place: the textbox path and the run path both ask here.
+    Measured on the *source* box — a box stretched to the text column is centred
+    on the page whatever the source did.
+    """
+    if item.kind != "heading":
+        return False
+    sx0, _stop, sx1, _sbottom = item.source_box or item.box
+    return (
+        sx0 > 40 and sx1 < page.rect.width - 40 and abs((sx0 + sx1) / 2 - page.rect.width / 2) < 18
+    )
 
 
 def _align_of(item: _Placement, pymupdf: Any) -> int:
@@ -878,6 +899,8 @@ def _insert(page: Any, item: _Placement, pymupdf: Any, default_font: Path | str)
     """
     if item.kind == "cell":
         return _insert_cell(page, item, pymupdf, default_font)
+    if item.runs is not None:
+        return _insert_runs(page, item, pymupdf, default_font)
     font_file = str(item.font_file or default_font)
     fontname = _resource_name(font_file)
     text = item.text
@@ -887,15 +910,8 @@ def _insert(page: Any, item: _Placement, pymupdf: Any, default_font: Path | str)
     limit = max(page.rect.height - _BOTTOM_MARGIN, bottom)
     box = pymupdf.Rect(x0, top, x1, min(bottom, limit))
     align = _align_of(item, pymupdf)
-    if item.kind == "heading":
-        # A title that sits clear of both margins and near the page's centre is
-        # a centred title; left-aligning it is the one change a reader notices.
-        # Measured on the *source* box: a box stretched to the text column is
-        # centred on the page whatever the source did.
-        sx0, _stop, sx1, _sbottom = item.source_box or item.box
-        page_center = page.rect.width / 2
-        if sx0 > 40 and sx1 < page.rect.width - 40 and abs((sx0 + sx1) / 2 - page_center) < 18:
-            align = pymupdf.TEXT_ALIGN_CENTER
+    if _heading_is_centred(page, item):
+        align = pymupdf.TEXT_ALIGN_CENTER
     floor = max(item.size * _MIN_SCALE, 4.0)
     size = item.size
     while size >= floor:
@@ -925,6 +941,140 @@ def _insert(page: Any, item: _Placement, pymupdf: Any, default_font: Path | str)
         color=item.color,
     )
     return "block" if unused >= 0 else None
+
+
+#: Line advance of the hand-laid-out run path, in multiples of the type size.
+_RUN_LEADING = 1.15
+
+
+def _insert_runs(page: Any, item: _Placement, pymupdf: Any, default_font: Path | str) -> str | None:
+    """Print a block that mixes styles, one run at a time.
+
+    PyMuPDF's layout does not read markup, so ``insert_textbox`` would print the
+    emphasis sentinels as they stand. A block carrying them is laid out here
+    instead: greedy word wrap measured with the metrics of the face each word is
+    printed in, then one ``insert_text`` per word. Blocks without runs keep the
+    textbox path, which hyphenates and aligns better than anything hand-rolled.
+
+    Returns ``"block"`` once the text is on the page; ``None`` when the layout
+    would not fit even the room down to the bottom margin at the floor size.
+    """
+    x0, top, x1, bottom = item.box
+    limit = max(page.rect.height - _BOTTOM_MARGIN, bottom)
+    width = max(x1 - x0, 1.0)
+
+    metrics: dict[str, Any] = {}
+
+    def font_of(font_file: str) -> Any:
+        """The measuring font, or ``None`` when it cannot be mounted."""
+        if font_file not in metrics:
+            try:
+                metrics[font_file] = pymupdf.Font(fontfile=font_file)
+            except Exception:  # noqa: BLE001 - an unmountable font is not worth a crash
+                metrics[font_file] = None
+        return metrics[font_file]
+
+    # Which family to look for the other faces in. The source's own family is the
+    # usual answer, but a caller who pinned a font gets that font's family
+    # instead: otherwise a chosen font loses *every* emphasis, because no local
+    # face matches the source's family and the whole block prints plain.
+    base = str(item.font_file or default_font)
+    styled = item.face if item.match_style and item.face else ""
+    if not styled:
+        base_font = font_of(base)
+        styled = str(base_font.name) if base_font is not None else ""
+
+    # One face per style. Each style is matched separately, so bold text is not
+    # printed in the regular face of the same family — a failure the page shows
+    # no error for.
+    faces: dict[tuple[bool, bool], str] = {}
+    for _text, bold, italic in item.runs or []:
+        style = (bold, italic)
+        if style in faces:
+            continue
+        found = match_font(styled, bold, italic) if styled else None
+        if found is None and style != (False, False):
+            logger.debug(
+                "PDF rebuild: no local {} face; printing that run plain",
+                "bold" if bold else "italic",
+            )
+        faces[style] = str(found or base)
+
+    def advance(text: str, font_file: str, size: float) -> float:
+        font = font_of(font_file)
+        if font is None:
+            return len(text) * size * 0.5
+        return float(font.text_length(text, fontsize=size))
+
+    words: list[tuple[str, str]] = []
+    for text, bold, italic in item.runs or []:
+        face = faces[(bold, italic)]
+        words.extend((word, face) for word in text.split())
+
+    def layout(size: float) -> list[list[tuple[str, str, float, float]]]:
+        """Greedy word wrap at *size*: per line, ``(word, face, width, gap)``.
+
+        The gap is the space *before* the word, measured in that word's own
+        face, so printing a line is a matter of adding the two up.
+        """
+        lines: list[list[tuple[str, str, float, float]]] = []
+        line: list[tuple[str, str, float, float]] = []
+        used = 0.0
+        for word, face in words:
+            word_width = advance(word, face, size)
+            gap = advance(" ", face, size) if line else 0.0
+            if line and used + gap + word_width > width:
+                lines.append(line)
+                line, used, gap = [], 0.0, 0.0
+            line.append((word, face, word_width, gap))
+            used += gap + word_width
+        if line:
+            lines.append(line)
+        return lines
+
+    def fits(lines: list[list[tuple[str, str, float, float]]], size: float, height: float) -> bool:
+        """Whether a laid-out block has room in *height*.
+
+        Half a line of slack: the last line's descender may hang a little below
+        a source box that hugged the English one, and refusing a layout the
+        textbox path would have accepted is worse than a glyph two points low.
+        """
+        return bool(lines) and len(lines) * size * _RUN_LEADING <= height + size * 0.5
+
+    floor = max(item.size * _MIN_SCALE, 4.0)
+    size = item.size
+    lines: list[list[tuple[str, str, float, float]]] = []
+    while size >= floor:
+        lines = layout(size)
+        if fits(lines, size, min(bottom, limit) - top):
+            break
+        size -= max(item.size * 0.05, 0.25)
+    else:
+        # Same last resort as the textbox path: borrow the room down to the
+        # bottom margin at the floor size rather than dropping the text.
+        size = floor
+        lines = layout(size)
+        if not fits(lines, size, limit - top):
+            return None
+
+    align = _align_of(item, pymupdf)
+    centered = align == pymupdf.TEXT_ALIGN_CENTER or _heading_is_centred(page, item)
+    for index, line in enumerate(lines):
+        natural = sum(word_width + gap for _word, _face, word_width, gap in line)
+        x = x0 + max((width - natural) / 2.0, 0.0) if centered else x0
+        baseline = top + size + index * size * _RUN_LEADING
+        for word, face, _word_width, gap in line:
+            x += gap
+            page.insert_text(
+                (x, baseline),
+                word,
+                fontname=_resource_name(face),
+                fontfile=face,
+                fontsize=size,
+                color=item.color,
+            )
+            x += advance(word, face, size)
+    return "block"
 
 
 def _font_xrefs(page: Any) -> set[int]:

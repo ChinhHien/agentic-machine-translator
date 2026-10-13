@@ -160,3 +160,34 @@ def write_table_pdf(
     doc.save(str(out))
     doc.close()
     return out
+
+
+def write_styled_pdf(
+    path: str | Path, before: str, bold: str, after: str, *, size: float = _BODY_SIZE
+) -> Path:
+    """One body line whose middle words are set in bold, then plain again.
+
+    The three runs are drawn on **one baseline** — pdfplumber groups glyphs into
+    a line by baseline, so this is a single source line that mixes styles, which
+    is the only thing the emphasis sentinels need from a real PDF. Widths come
+    from ``pymupdf.get_text_length`` so the runs abut the way word spacing does.
+    """
+    import pymupdf
+
+    doc = pymupdf.open()
+    page = doc.new_page(width=_WIDTH, height=_HEIGHT)
+    x = _LEFT
+    for text, font in ((before, _BODY_FONT), (bold, _HEADING_FONT), (after, _BODY_FONT)):
+        page.insert_text((x, _TOP), text, fontname=font, fontsize=size)
+        x += pymupdf.get_text_length(text, fontname=font, fontsize=size)
+    # A second line, so the page has a paragraph rather than a lone line whose
+    # own gap would become the norm for paragraph-break detection.
+    page.insert_text(
+        (_LEFT, _TOP + _ADVANCE), "A plain following line.", fontname=_BODY_FONT, fontsize=size
+    )
+
+    out = Path(path)
+    out.parent.mkdir(parents=True, exist_ok=True)
+    doc.save(str(out))
+    doc.close()
+    return out
