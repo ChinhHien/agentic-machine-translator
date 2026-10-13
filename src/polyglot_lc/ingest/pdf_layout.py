@@ -60,6 +60,7 @@ from typing import Any
 
 from loguru import logger
 
+from polyglot_lc import emphasis
 from polyglot_lc.ingest.md import markdown_table, parse_markdown
 from polyglot_lc.ingest.model import Document
 
@@ -278,6 +279,122 @@ def looks_like_code(text: str) -> bool:
     return any(ch in stripped for ch in _CODE_CHARS)
 
 
+def line_spans(chars: Iterable[dict[str, Any]]) -> list[tuple[str, bool, bool]]:
+    """A line's text split into runs of one style, in reading order.
+
+    Every glyph carries its own face, so a mixed-style line is a lossless source
+    of emphasis: a title line that reads "**Eocortex ST** được thiết kế để"
+    arrives here as three runs and leaves as three, where the block-level font
+    record would keep only the majority face and lose the bold phrase entirely.
+
+    Spaces are inserted on the same rule as :func:`line_text` — a gap wider than
+    :data:`_SPACE_GAP_RATIO` of the size is a word gap — so a uniform line yields
+    exactly the same characters as before, in one run.
+    """
+    runs: list[tuple[str, bool, bool]] = []
+    prev: dict[str, Any] | None = None
+    for ch in sorted(chars, key=lambda c: c["x0"]):
+        style = _font_style(_font_of(ch))
+        gap = ""
+        if prev is not None and float(ch["x0"]) - float(prev["x1"]) > _SPACE_GAP_RATIO * max(
+            float(prev["size"]), 1.0
+        ):
+            gap = " "
+        text = gap + str(ch["text"])
+        if runs and runs[-1][1:] == style:
+            runs[-1] = (runs[-1][0] + text, *style)
+        else:
+            runs.append((text, *style))
+        prev = ch
+    return [(normalize_glyphs(text), bold, italic) for text, bold, italic in runs]
+
+
+def _join_wrapped_runs(
+    parts: list[list[tuple[str, bool, bool]]],
+) -> list[tuple[str, bool, bool]]:
+    """Join the style runs of the source lines of one paragraph.
+
+    The same rule as :func:`_join_wrapped` — separate two lines with a space, and
+    heal a word hyphenated across the break — applied to runs, so that a bold
+    phrase wrapped over two source lines becomes **one** run (and so one pair of
+    tokens) instead of a pair closing and reopening at every line end.
+    """
+    out: list[tuple[str, bool, bool]] = []
+    for part in parts:
+        runs = _trim_runs(part)
+        if not runs:
+            continue
+        if out:
+            tail, bold, italic = out[-1]
+            head = runs[0][0]
+            if tail.endswith("-") and head[:1].islower():
+                out[-1] = (tail[:-1], bold, italic)  # "previ-" + "ous"
+            else:
+                out[-1] = (tail + " ", bold, italic)
+        for text, bold, italic in runs:
+            if out and out[-1][1:] == (bold, italic):
+                out[-1] = (out[-1][0] + text, bold, italic)
+            else:
+                out.append((text, bold, italic))
+    return [(text, bold, italic) for text, bold, italic in out if text]
+
+
+def _trim_runs(
+    runs: list[tuple[str, bool, bool]],
+) -> list[tuple[str, bool, bool]]:
+    """Drop a line's edge whitespace without touching the gaps inside it.
+
+    Only the first run's left edge and the last run's right edge are trimmed: a
+    run's leading space is the word gap *inside* the line, and stripping it would
+    glue two words together across a style change.
+    """
+    kept = [(text, bold, italic) for text, bold, italic in runs if text]
+    if not kept:
+        return []
+    if len(kept) == 1:
+        text = kept[0][0].strip()
+        return [(text, kept[0][1], kept[0][2])] if text else []
+    head = (kept[0][0].lstrip(), kept[0][1], kept[0][2])
+    tail = (kept[-1][0].rstrip(), kept[-1][1], kept[-1][2])
+    return [head, *kept[1:-1], tail]
+
+
+def _wrap_run(text: str, bold: bool, italic: bool) -> str:
+    """*text* wrapped in the token pair its style earns.
+
+    A run's leading whitespace stays outside the pair. That space is the word gap
+    between two runs, not part of the emphasised phrase, and inside the pair it
+    would read as though the emphasis covered the gap too.
+    """
+    body = text.lstrip()
+    space = text[: len(text) - len(body)]
+    if not body:
+        return text
+    if bold and italic:
+        return (
+            f"{space}{emphasis.ITALIC_OPEN}{emphasis.BOLD_OPEN}{body}"
+            f"{emphasis.BOLD_CLOSE}{emphasis.ITALIC_CLOSE}"
+        )
+    if bold:
+        return f"{space}{emphasis.BOLD_OPEN}{body}{emphasis.BOLD_CLOSE}"
+    if italic:
+        return f"{space}{emphasis.ITALIC_OPEN}{body}{emphasis.ITALIC_CLOSE}"
+    return text
+
+
+def mark_emphasis(runs: list[tuple[str, bool, bool]]) -> str:
+    """The paragraph's text, with a token pair around each emphasised run.
+
+    A paragraph set in a single style gets no tokens at all. Marking it would
+    put four extra tokens through every prompt for nothing — there is no
+    emphasis to carry — so only a genuinely mixed line pays for them.
+    """
+    kept = [(text, bold, italic) for text, bold, italic in runs if text]
+    if len({(bold, italic) for _, bold, italic in kept}) < 2:
+        return "".join(text for text, _, _ in kept)
+    return "".join(_wrap_run(text, bold, italic) for text, bold, italic in kept)
+
+
 def line_text(chars: Iterable[dict[str, Any]]) -> str:
     """Rebuild a line's text, inserting a space wherever glyphs are far apart.
 
@@ -312,6 +429,7 @@ class _RawLine:
         "level",
         "page",
         "size",
+        "spans",
         "text",
         "top",
         "x0",
@@ -335,6 +453,7 @@ class _RawLine:
         italic: bool = False,
         color: tuple[float, ...] | None = None,
         cells: list[list[list | None]] | None = None,
+        spans: list[tuple[str, bool, bool]] | None = None,
     ) -> None:
         self.page = page
         self.top = top
@@ -352,6 +471,11 @@ class _RawLine:
         #: A table's cells, one entry per cell: box, inset, size, alignment,
         #: weight. Empty for every other kind of line.
         self.cells: list[list[list | None]] = cells or []
+        #: The line's style runs, one per stretch of one ``(bold, italic)`` pair.
+        #: ``font``/``bold``/``italic`` above stay the line's *dominant* face,
+        #: which is what the rebuilt page prints a translation in when the block
+        #: carries no emphasis at all.
+        self.spans: list[tuple[str, bool, bool]] = spans or []
 
 
 #: (page, x0, top, x1, bottom) in PDF points, origin at the top-left corner.
@@ -470,6 +594,7 @@ def _classify(
     x1 = max(float(c["x1"]) for c in chars)
     bottom = float(line.get("bottom") or top)
     face = _face(chars)
+    spans = line_spans(chars)
 
     def raw(
         kind: str,
@@ -479,14 +604,17 @@ def _classify(
         size: float,
         x1: float = 0.0,
         bottom: float = 0.0,
+        spans: list[tuple[str, bool, bool]] | None = None,
     ) -> _RawLine:
-        return _RawLine(page_no, top, kind, level, text, x0, size, x1, bottom, **face)
+        return _RawLine(
+            page_no, top, kind, level, text, x0, size, x1, bottom, **face, spans=spans or []
+        )
 
     # Oversized first: the first line of a page is often a section title, and
     # dropping it as a running head is how a document loses every heading.
     if size >= heading_min:
         level = 1 if size >= h1_min else 2
-        return raw("heading", level, text, x0, size, x1, bottom)
+        return raw("heading", level, text, x0, size, x1, bottom, spans=spans)
 
     if top < header_band and _looks_like_running_head(text):
         return raw("header", 0, text, 0.0, 0.0)
@@ -498,7 +626,8 @@ def _classify(
         # contain plain sentences (compiler output, numeric data). The run
         # context decides — see _resolve_mono_runs().
         kind = "code" if looks_like_code(text) else "mono"
-        return raw(kind, 0, text, x0, size, x1, bottom)
+        # Code is never translated, so its runs would never be read.
+        return raw(kind, 0, text, x0, size, x1, bottom, spans=None if kind == "code" else spans)
 
     kind = "body"
     stripped = text.lstrip()
@@ -510,7 +639,7 @@ def _classify(
         kind = "bullet"
     elif len(stripped) > 3 and stripped[0] in _NUMBERED_PREFIX and stripped[1:3] in (". ", ") "):
         kind = "numbered"
-    return raw(kind, 0, text, x0, size, x1, bottom)
+    return raw(kind, 0, text, x0, size, x1, bottom, spans=spans)
 
 
 def _resolve_mono_runs(lines: list[_RawLine]) -> None:
@@ -933,10 +1062,23 @@ def _build_units(pages: list[Any]) -> list[_Unit]:
         nonlocal pending, pending_kind
         if not pending:
             return
-        text = _join_wrapped([rendered for _, rendered, _ in pending])
+        lines = [line for line, _, _ in pending]
+        parts = [list(line.spans) for line in lines]
+        # Markdown needs its marker back for the parser to see a list, and the
+        # glyph was redacted with the item, so `_marked_text` prints it again.
+        # Here the source's own bullet is stripped **once**, as a run of its own,
+        # so a bold item does not drag "- " inside its token pair.
+        if pending_kind == "list" and lines and lines[0].kind == "bullet" and parts and parts[0]:
+            head = parts[0][0]
+            stripped = _bullet_text(head[0])
+            prefix: list[tuple[str, bool, bool]] = [("- ", False, False)]
+            if stripped:
+                prefix.append((stripped, head[1], head[2]))
+            parts[0] = prefix + parts[0][1:]
+        text = mark_emphasis(_join_wrapped_runs(parts))
         if text:
             unit = _Unit(pending_kind, text)
-            unit.take([line for line, _, _ in pending])
+            unit.take(lines)
             unit.markers = [marker for _, _, marker in pending if marker]
             units.append(unit)
         pending, pending_kind = [], "body"

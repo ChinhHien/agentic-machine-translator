@@ -548,3 +548,76 @@ def test_a_numbered_list_records_its_labels(tmp_path):
     geo = _geometry("Một câu mở đầu.\n\n1. mục đầu\n2. mục sau\n", tmp_path)
     assert geo[1]["kind"] == "list"
     assert geo[1]["markers"] == ["1.", "2."]
+
+
+# ------------------------- emphasis spans in a line -------------------------
+#: Faces whose names `_font_style` reads as bold/italic (it looks for substrings,
+#: which is what a real PDF carries: "ABCDEF+Verdana-Bold").
+BOLD_FACE = "STUVWX+Verdana-Bold"
+ITALIC_FACE = "YZABCD+Verdana-Italic"
+
+
+def _styled_line(
+    parts: list[tuple[list[str], str]], top: float, x0: float = 100.0, size: float = 12.0
+) -> dict:
+    """One source line set in several styles: each part is (words, face).
+
+    pdfplumber reports one flat list of glyphs per line, each carrying its own
+    font, so a mixed-style line is exactly this: glyphs that disagree about their
+    face, with a word gap between the runs.
+    """
+    chars: list[dict] = []
+    x = x0
+    for tokens, font in parts:
+        piece = _chars(tokens, x, size, font)
+        chars.extend(piece)
+        x = max(ch["x1"] for ch in piece) + 3.0
+    return {"chars": chars, "top": top}
+
+
+def test_a_mixed_style_line_marks_only_the_bold_span():
+    page = _StubPage(
+        [_styled_line([(["Alpha"], BODY), (["Beta"], BOLD_FACE), (["Gamma"], BODY)], top=150.0)],
+        height=595.0,
+    )
+    assert _build_units([page])[0].text == "Alpha ⟦BOLD⟧Beta⟦/BOLD⟧ Gamma"
+
+
+def test_an_italic_span_is_marked_with_its_own_pair():
+    page = _StubPage(
+        [_styled_line([(["Alpha"], BODY), (["Beta"], ITALIC_FACE), (["Gamma"], BODY)], top=150.0)],
+        height=595.0,
+    )
+    assert _build_units([page])[0].text == "Alpha ⟦ITALIC⟧Beta⟦/ITALIC⟧ Gamma"
+
+
+def test_a_uniform_style_line_gets_no_tokens():
+    page = _StubPage([_line(["Alpha", "Beta", "Gamma"], top=150.0)], height=595.0)
+    assert "⟦" not in _build_units([page])[0].text
+
+
+def test_a_bold_span_wrapped_over_two_lines_becomes_one_pair():
+    """Cụm đậm vắt qua mối nối dòng phải thành MỘT cặp, không hai."""
+    page = _StubPage(
+        [
+            _styled_line([(["Alpha"], BODY), (["Beta"], BOLD_FACE)], top=150.0),
+            _styled_line([(["Gamma"], BOLD_FACE), (["Delta"], BODY)], top=162.0),
+        ],
+        height=595.0,
+    )
+    assert _build_units([page])[0].text == "Alpha ⟦BOLD⟧Beta Gamma⟦/BOLD⟧ Delta"
+
+
+def test_geometry_and_block_font_are_unchanged():
+    """Sentinel là thông tin THÊM: meta["pdf"] phải y như trước."""
+    page = _StubPage(
+        [_styled_line([(["Alpha"], BODY), (["Beta"], BOLD_FACE)], top=150.0)], height=595.0
+    )
+    units = _build_units([page])
+    doc = parse_markdown(render_markdown(units), source_format="pdf")
+    bind_page_geometry(doc, units)
+    geo = doc.blocks[0].meta["pdf"]
+    # `_face` reads the bare name (it drops the subset prefix), and the first
+    # line of this block is the plain one, so the block stays regular.
+    assert geo["font"] == BODY.split("+")[-1] and geo["bold"] is False
+    assert set(geo) == {"rects", "size", "kind", "font", "bold", "italic", "color", "markers"}
