@@ -274,11 +274,72 @@ def test_the_rebuilt_pdf_replaces_the_text_and_keeps_every_page(tmp_path, unicod
     with pymupdf.open(out) as rebuilt, pymupdf.open(src) as original:
         assert rebuilt.page_count == original.page_count
         text = rebuilt[0].get_text()
-    # The embedded font's space extracts as a non-breaking space; normalise it
-    # before comparing words rather than asserting on the encoder's choice.
-    text = text.replace("\xa0", " ")
     assert "Nội dung đã dịch" in text
     assert "Hello world" not in text
+
+
+def test_copied_text_keeps_real_spaces_and_hyphens(tmp_path, unicode_font):
+    """What is copied out of a rebuilt page is part of the output.
+
+    PyMuPDF builds an inserted font's ToUnicode map by inverting the font's
+    cmap; the space glyph carries both U+0020 and U+00A0 there, and the hyphen
+    both U+002D and U+00AD, so the higher code point used to win and a copied
+    page came back full of non-breaking spaces and soft hyphens. The rebuild
+    repairs the map of the fonts it inserts.
+    """
+    from pdfdoc import write_pdf
+
+    pymupdf = pytest.importorskip("pymupdf")
+    src = write_pdf(tmp_path / "in.pdf", "Hello world from the source page.\n")
+    doc = load_document(src)
+    translated = "Bản dịch Eocortex ST - một cột, có gạch nối."
+    texts = {index: translated for index in range(len(doc.blocks))}
+
+    out = tmp_path / "out.pdf"
+    stats = rebuild_pdf(src, doc, texts, out, font_path=unicode_font)
+
+    assert stats.repaired_maps >= 1
+    with pymupdf.open(out) as rebuilt:
+        copied = rebuilt[0].get_text()
+    assert "\xa0" not in copied, "dấu cách bị mã hoá thành NO-BREAK SPACE"
+    assert "\xad" not in copied, "gạch nối bị mã hoá thành SOFT HYPHEN"
+    assert "Eocortex ST - một cột" in " ".join(copied.split())
+
+
+def test_the_source_pages_own_font_map_is_not_repaired(tmp_path, unicode_font):
+    """A block kept in the source language must copy out as it always did.
+
+    The repair is applied to the fonts the rebuild *inserts*; rewriting the
+    source document's own maps would change text it never touched.
+    """
+    from pdfdoc import write_pdf
+
+    pymupdf = pytest.importorskip("pymupdf")
+    first = (
+        "First paragraph gets translated here. It holds enough words to wrap "
+        "over several lines, which is what tells the extractor where one "
+        "paragraph ends."
+    )
+    kept = (
+        "Second paragraph stays in the source language. It wraps over several "
+        "lines for exactly the same reason as the first one does."
+    )
+    src = write_pdf(tmp_path / "in.pdf", f"{first}\n\n{kept}\n")
+    doc = load_document(src)
+    assert len(doc.blocks) == 2
+    texts = {0: "Đoạn đầu đã dịch."}  # block 1 has no translation: it stays put
+
+    out = tmp_path / "out.pdf"
+    rebuild_pdf(src, doc, texts, out, font_path=unicode_font)
+
+    with pymupdf.open(src) as original, pymupdf.open(out) as rebuilt:
+        # The page wraps its own lines, so compare the words, not the breaks.
+        before = " ".join(original[0].get_text().split())
+        after = " ".join(rebuilt[0].get_text().split())
+    assert kept in before
+    assert kept in after, "chữ nguồn phải copy ra y như trước khi dựng lại"
+    assert "Đoạn đầu đã dịch" in after
+    assert "First paragraph" not in after
 
 
 def test_an_untranslated_document_rebuilds_nothing(tmp_path, unicode_font):
@@ -324,7 +385,7 @@ def test_a_cell_that_cannot_fit_keeps_its_source_text(tmp_path, unicode_font):
     assert stats.cells == 3 and stats.cells_kept == 1
     assert stats.failures == []
     with pymupdf.open(tmp_path / "out.pdf") as rebuilt:
-        text = rebuilt[0].get_text().replace("\xa0", " ")
+        text = rebuilt[0].get_text()
         assert "Servers" in text
         assert "Đặc điểm" in text
 
@@ -621,10 +682,10 @@ def test_a_real_table_page_is_rebuilt_with_its_cells_translated(tmp_path, unicod
 
     with pymupdf.open(src) as original, pymupdf.open(out) as rebuilt:
         assert len(rebuilt[0].get_drawings()) == len(original[0].get_drawings()), "lưới còn nguyên"
-        # The embedded font's encoder writes a non-breaking space for a space and
-        # the extractor breaks some cells after the colon; both are choices of the
-        # extraction, not text on the page, so normalise them before comparing.
-        text = rebuilt[0].get_text().replace("\xa0", " ").replace("VI: ", "VI:")
+        # The extractor breaks some cells after the colon; that is a choice of
+        # the extraction, not text on the page, so normalise it before comparing.
+        text = rebuilt[0].get_text().replace("VI: ", "VI:")
+        assert "\xa0" not in text
         assert "VI:Feature" in text and "VI:Yes" in text
         assert "Feature" not in text.replace("VI:Feature", "")
         boxes = [cell[:4] for row in cells for cell in row]
@@ -634,3 +695,99 @@ def test_a_real_table_page_is_rebuilt_with_its_cells_translated(tmp_path, unicod
                 x0 >= bx0 - 1 and x1 <= bx2 + 1 and top >= btop - 1 and bottom <= bbottom + 1
                 for bx0, btop, bx2, bbottom in boxes
             ), f"chữ nằm ngoài ô: {word[4]!r}"
+
+
+# ------------------------------- emphasis -----------------------------------
+
+
+def test_plain_text_drops_emphasis_tokens():
+    """The printed page never carries a token, whatever the block's kind."""
+    assert plain_text("a ⟦BOLD⟧b⟦/BOLD⟧ c", "body") == "a b c"
+    assert plain_text("⟦BOLD⟧a⟦/BOLD⟧b", "heading") == "ab"
+    assert plain_text("- ⟦ITALIC⟧a⟦/ITALIC⟧", "list") == "a"
+
+
+def _emphasis_doc(source_text: str, *, kind: str = "body") -> Document:
+    """One block whose source line mixed styles, with the geometry to print it."""
+    return Document(
+        blocks=[
+            Block(
+                kind="paragraph",
+                text=source_text,
+                meta={
+                    "pdf": {
+                        "rects": [(0, 72.0, 100.0, 300.0, 112.0)],
+                        "size": 10.0,
+                        "kind": kind,
+                        "font": "CMR12",
+                        "bold": False,
+                        "italic": False,
+                        "color": (0.0, 0.0, 0.0),
+                        "markers": [],
+                    }
+                },
+            )
+        ]
+    )
+
+
+def test_a_body_block_with_balanced_tokens_gets_runs():
+    """The runs come from the translation *with* its tokens: stripping first
+    would leave one plain run and lose the emphasis the tokens describe."""
+    doc = _emphasis_doc("A ⟦BOLD⟧B⟦/BOLD⟧ C")
+    items, _ = placements(doc, {0: "A ⟦BOLD⟧B⟦/BOLD⟧ C"}, match_style=False)
+
+    assert items[0].runs == [("A ", False, False), ("B", True, False), (" C", False, False)]
+    assert items[0].text == "A B C"
+    assert items[0].face == "CMR12"
+
+
+def test_a_block_whose_translation_lost_a_token_gets_no_runs():
+    """Guard ở tầng dựng: lệch token thì in thường, và im lặng (lỗi ghi ở tầng
+    pipeline, một lần cho cả chunk)."""
+    doc = _emphasis_doc("A ⟦BOLD⟧B⟦/BOLD⟧ C")
+    items, _ = placements(doc, {0: "A B ⟦BOLD⟧C"}, match_style=False)
+
+    assert items[0].runs is None
+    assert "⟦" not in items[0].text
+
+
+def test_a_block_whose_source_had_no_tokens_gets_no_runs():
+    """Model tự thêm cặp token: nguồn không nhấn mạnh thì không in nhấn mạnh."""
+    doc = _emphasis_doc("A B C")
+    items, _ = placements(doc, {0: "A ⟦BOLD⟧B⟦/BOLD⟧ C"}, match_style=False)
+
+    assert items[0].runs is None
+    assert items[0].text == "A B C"
+
+
+def test_a_list_block_keeps_one_face_and_its_source_markers():
+    """V1 chỉ in run cho block thân bài và heading.
+
+    Một mục danh sách còn phải nhận lại dấu đầu dòng của nguồn (``_marked_text``)
+    và dấu ``-`` của Markdown; đi đường run sẽ bỏ qua cả hai.
+    """
+    doc = _emphasis_doc("- ⟦BOLD⟧A⟦/BOLD⟧ B", kind="list")
+    doc.blocks[0].meta["pdf"]["markers"] = ["•"]
+    items, _ = placements(doc, {0: "- ⟦BOLD⟧A⟦/BOLD⟧ B"}, match_style=False)
+
+    assert items[0].runs is None
+    assert items[0].text == "• A B"
+
+
+def test_tokens_inside_a_cell_are_stripped_before_the_cell_is_split():
+    doc = _table_doc()
+    table = "| ⟦BOLD⟧a⟦/BOLD⟧ | b |\n| --- | --- |\n| c | d |"
+    items, _ = placements(doc, {0: table}, match_style=False)
+
+    assert [item.text for item in items] == ["a", "b", "c", "d"]
+    assert all("⟦" not in item.text for item in items)
+
+
+def test_a_heading_block_with_tokens_does_not_print_its_hashes():
+    """``plain_text`` strips the ``#``, so the run path must strip it too."""
+    doc = _emphasis_doc("# ⟦BOLD⟧A⟦/BOLD⟧ B", kind="heading")
+    items, _ = placements(doc, {0: "# ⟦BOLD⟧A⟦/BOLD⟧ B"}, match_style=False)
+
+    assert items[0].runs == [("A", True, False), (" B", False, False)]
+    assert "#" not in items[0].text

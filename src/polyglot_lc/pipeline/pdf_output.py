@@ -41,6 +41,17 @@ What is deliberately left alone (and why):
 
 The boxes come from :mod:`polyglot_lc.ingest.pdf_layout`, which records a block's
 source rectangles as it extracts it; see ``block.meta["pdf"]``.
+
+One artefact of the rebuild is worth naming. PyMuPDF builds an inserted font's
+``ToUnicode`` map by inverting the font's ``cmap``, and where a ``cmap`` gives
+one glyph two code points — the space and the no-break space, the hyphen and the
+soft hyphen — the higher one wins. Text copied out of a rebuilt page would then
+carry U+00A0 where the page shows a space and U+00AD where it shows a hyphen.
+The maps of the fonts *this module inserts* are repaired back to the ASCII code
+points (:func:`_repair_tounicode`); the source document's own maps are left
+alone, so a block kept in the source language copies out exactly as before. The
+glyph is shared, so a genuine no-break space in a translation cannot survive
+this: it reads as a space, which is the better of the two defaults for prose.
 """
 
 from __future__ import annotations
@@ -55,6 +66,7 @@ from typing import Any
 
 from loguru import logger
 
+from polyglot_lc import emphasis
 from polyglot_lc.ingest.model import Document
 from polyglot_lc.pipeline.assembler import block_translations
 
@@ -171,6 +183,15 @@ _MIN_SCALE = 0.55
 #: much smaller than the source's would read as a different document's table.
 _CELL_MIN_SCALE = 0.70
 
+#: Two code points that share one glyph in most text faces, and whose ToUnicode
+#: map PyMuPDF therefore gets wrong: the ASCII code point is what a reader's
+#: search box expects, so the no-break space and the soft hyphen are rewritten
+#: to it. See the module docstring.
+_TOUNICODE_SHARED_GLYPHS: dict[str, str] = {"00a0": "0020", "00ad": "002d"}
+
+#: One ``beginbfchar``/``beginbfrange`` entry whose target is such a code point.
+_TOUNICODE_ENTRY_RE = re.compile(r"<([0-9A-Fa-f]{4})>\s*<(00a0|00ad)>")
+
 
 class PdfOutputError(RuntimeError):
     """The PDF could not be rebuilt (usually: no Unicode font is available)."""
@@ -187,6 +208,9 @@ class RebuildStats:
     #: their own source text because the translation would not fit the box.
     cells: int = 0
     cells_kept: int = 0
+    #: Inserted fonts whose copied-text map was repaired (see
+    #: :func:`_repair_tounicode`).
+    repaired_maps: int = 0
     font: str = ""
     failures: list[str] = field(default_factory=list)
 
@@ -327,15 +351,50 @@ def match_font(name: str, bold: bool, italic: bool) -> str | None:
 
 
 def plain_text(markdown_text: str, kind: str) -> str:
-    """The text to print on the page: the translation without Markdown syntax."""
+    """The text to print on the page: the translation without Markdown syntax.
+
+    Emphasis tokens are Markdown syntax too, so they are dropped here as well:
+    a token that reaches this function has no run to be printed with (a list, a
+    table cell, a block the model invented tokens for) and must not show up.
+    """
     lines = markdown_text.splitlines() or [markdown_text]
     out: list[str] = []
     for line in lines:
         stripped = _HEADING_RE.sub("", line) if kind == "heading" else line
         if kind == "list":
             stripped = _LIST_ITEM_RE.sub("", stripped)
-        out.append(stripped.strip())
+        out.append(emphasis.strip(stripped).strip())
     return "\n".join(line for line in out if line).strip()
+
+
+#: Kinds whose translation may be printed run by run. A list item still needs
+#: its source bullet re-inserted by :func:`_marked_text` and a contents entry
+#: its rebuilt dot leader, and neither happens on the run path — so both keep
+#: one face, as they did before.
+_RUN_KINDS: frozenset[str] = frozenset({"body", "heading"})
+
+
+def _has_tokens(text: str) -> bool:
+    """True when *text* carries at least one emphasis token."""
+    return any(token in text for token in emphasis.TOKENS)
+
+
+def _runs_without_heading_marker(
+    runs: list[tuple[str, bool, bool]],
+) -> list[tuple[str, bool, bool]]:
+    """Drop a heading's leading ``#``/``## `` marker from its first run.
+
+    ``plain_text`` strips that marker; the run path prints the runs themselves,
+    so it has to be stripped here or a translated title would print its hashes.
+    """
+    if not runs:
+        return runs
+    text, bold, italic = runs[0]
+    stripped = _HEADING_RE.sub("", text)
+    rest = runs[1:]
+    if not stripped:
+        return rest
+    return [(stripped, bold, italic), *rest]
 
 
 @dataclass
@@ -363,6 +422,12 @@ class _Placement:
     #: A cell's own source text, printed in its place when the translation does
     #: not fit the box the source fitted in.
     source_text: str | None = None
+    #: The source family name, which is what picks the bold/italic face of the
+    #: same family (``match_font`` needs a name, not a font file path).
+    face: str = ""
+    #: The translation split into runs of one style, or ``None`` to print the
+    #: whole block in one face with ``insert_textbox`` (the usual case).
+    runs: list[tuple[str, bool, bool]] | None = None
 
 
 #: How far a one-line block may be stretched, in points, from the text column.
@@ -545,7 +610,9 @@ def _table_placements(
     items: list[_Placement] = []
     for row_index, (row, boxes) in enumerate(zip(rows, cells, strict=True)):
         for column, cell in enumerate(boxes):
-            text = row[column]
+            # v1 prints one face per cell, so a token inside a cell has no run to
+            # be printed with and is dropped rather than printed literally.
+            text = emphasis.strip(row[column])
             if cell is None or not text:
                 continue
             x0, top, x1, bottom, pad, size, align, bold, italic = cell
@@ -679,14 +746,24 @@ def placements(
         if item is None:
             kept += 1
             continue
+        item.face = str(geo.get("font") or "")
         if match_style:
             item.font_file = match_font(
-                str(geo.get("font") or ""),
+                item.face,
                 bool(geo.get("bold")),
                 bool(geo.get("italic")),
             )
         if item.font_file is None and default_font is not None:
             item.font_file = str(default_font)
+        if kind in _RUN_KINDS and _has_tokens(block.text) and emphasis.agrees_with(block.text, raw):
+            # The tokens are the model's own placement, and they are only trusted
+            # because the source's counts match; two distinct styles are what a
+            # run path is for, and a single one prints identically either way.
+            runs = emphasis.to_runs(raw)
+            if kind == "heading":
+                runs = _runs_without_heading_marker(runs)
+            if len({(bold, italic) for text, bold, italic in runs if text}) >= 2:
+                item.runs = runs
         built.append(item)
     return built, kept
 
@@ -850,6 +927,42 @@ def _insert(page: Any, item: _Placement, pymupdf: Any, default_font: Path | str)
     return "block" if unused >= 0 else None
 
 
+def _font_xrefs(page: Any) -> set[int]:
+    """The object ids of a page's fonts; an empty set when it has none."""
+    try:
+        return {int(entry[0]) for entry in page.get_fonts(full=True)}
+    except Exception:  # noqa: BLE001 - a page without resources simply has none
+        return set()
+
+
+def _repair_tounicode(document: Any, page: Any, before: set[int]) -> int:
+    """Point the inserted fonts' copied-text map back at the ASCII code points.
+
+    Only the fonts this page *gained* are rewritten (the ids in *before* are the
+    source page's own), so a block left in the source language still copies out
+    exactly as it did. Returns the number of maps repaired.
+    """
+    repaired = 0
+    for entry in page.get_fonts(full=True):
+        xref = int(entry[0])
+        if xref in before:
+            continue
+        kind, value = document.xref_get_key(xref, "ToUnicode")
+        if kind != "xref":
+            continue
+        stream_xref = int(value.split()[0])
+        raw = document.xref_stream(stream_xref).decode("latin-1")
+        fixed = _TOUNICODE_ENTRY_RE.sub(
+            lambda m: f"<{m.group(1)}> <{_TOUNICODE_SHARED_GLYPHS[m.group(2).lower()]}>", raw
+        )
+        if fixed != raw:
+            document.update_stream(stream_xref, fixed.encode("latin-1"), compress=True)
+            repaired += 1
+    if repaired:
+        logger.debug("PDF rebuild: repaired {} ToUnicode map(s) on this page", repaired)
+    return repaired
+
+
 def rebuild_pdf(
     source: str | Path,
     doc: Document,
@@ -886,6 +999,9 @@ def rebuild_pdf(
             stats.failures.append(f"page {page_no} is outside the document")
             continue
         page = document[page_no]
+        # The page's own fonts, so the ToUnicode repair below can tell them from
+        # the ones our insertion adds.
+        fonts_before = _font_xrefs(page)
         for item in page_items:
             for x0, top, x1, bottom in item.redact:
                 page.add_redact_annot(pymupdf.Rect(x0, top, x1, bottom), fill=None, text=None)
@@ -908,6 +1024,9 @@ def rebuild_pdf(
                 stats.cells += 1
             else:
                 stats.cells_kept += 1
+        # Copied text is part of the output: repair the map of the fonts we
+        # just inserted before the document is written.
+        stats.repaired_maps += _repair_tounicode(document, page, fonts_before)
 
     out = Path(out_path)
     out.parent.mkdir(parents=True, exist_ok=True)
@@ -915,12 +1034,13 @@ def rebuild_pdf(
     document.close()
     logger.info(
         "PDF rebuild: {} block(s) placed ({} cell(s) translated, {} kept in source), "
-        "{} kept as source, {} page(s) -> {}",
+        "{} kept as source, {} page(s), {} font map(s) repaired -> {}",
         stats.placed,
         stats.cells,
         stats.cells_kept,
         stats.kept,
         stats.pages,
+        stats.repaired_maps,
         out,
     )
     return stats
