@@ -25,7 +25,7 @@ from typing import Any, Self
 
 from rich.console import Console
 
-from polyglot_lc.llm.client import TokenUsage
+from polyglot_lc.llm.client import TokenUsage, active_api_calls
 from polyglot_lc.ui.events import Event, EventSink
 from polyglot_lc.ui.trace import cause_for
 
@@ -53,8 +53,16 @@ class SimpleStep:
         self._t0 = time.monotonic()
         self._tokens0 = TokenUsage.snapshot()
         self.ui._print_step(self.index, self.name, self.chunk_id)
+        calls = active_api_calls()
         self.ui.sink.emit(
-            Event(step=self.name, chunk_id=self.chunk_id, status="start", type="step_start")
+            Event(
+                step=self.name,
+                chunk_id=self.chunk_id,
+                status="start",
+                type="step_start",
+                active_api_calls=calls.get("active"),
+                max_active_api_calls=calls.get("peak"),
+            )
         )
         return self
 
@@ -140,6 +148,30 @@ class SimpleUI:
     def add_error(self, message: str) -> None:
         if message:
             self.errors.append(message)
+
+    def retry(self, step: str, chunk_id: str, message: str) -> None:
+        """Say that a chunk is being waited for and will run again.
+
+        A wait measured in minutes must not look like a hang, so it is printed
+        and written as a ``retry`` event — the status the web UI reads to keep
+        the chunk out of its "failed" state and to caption the progress bar.
+        """
+        where = f"{step} ({chunk_id})".strip()
+        if self.verbose:
+            with self._lock:
+                self.console.print(f"  Waiting: {where} - {message}", highlight=False, markup=False)
+        calls = active_api_calls()
+        self.sink.emit(
+            Event(
+                step=step,
+                chunk_id=chunk_id,
+                status="retry",
+                error=message,
+                type="retry_wait",
+                active_api_calls=calls.get("active"),
+                max_active_api_calls=calls.get("peak"),
+            )
+        )
 
     def set_total_chunks(self, n: int) -> None:
         self._total_chunks = n

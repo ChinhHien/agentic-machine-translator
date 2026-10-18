@@ -319,7 +319,7 @@ class AppConfig(BaseModel):
     rb_top_k: int = Field(default=4, ge=1)
     #: Bounded concurrency across independent chunks (each chunk keeps its
     #: internal Translate->Critic->Refiner->Verify order). Conservative default.
-    max_concurrency: int = Field(default=2, ge=1, le=16)
+    max_concurrency: int = Field(default=1, ge=1, le=16)
     #: Adaptive refiner gate: a draft scoring >= this skips the Refiner and goes
     #: straight to the Verifier. Defaults to ``critic_threshold`` so behaviour is
     #: unchanged unless raised explicitly.
@@ -362,6 +362,12 @@ class AppConfig(BaseModel):
     consistency_check: bool = True
     #: Upper bound on consistency patch requests per document.
     consistency_max_patches: int = Field(default=5, ge=0, le=100)
+    #: How long to wait before a chunk whose step hit provider errors is run
+    #: again; doubles with each attempt (see ``CHUNK_RETRY_MAX_DELAY``).
+    chunk_retry_base_delay: float = Field(default=5.0, gt=0)
+    #: Ceiling on that wait. A chunk is never abandoned, so this is the pace at
+    #: which an outage is waited out rather than a deadline for giving up.
+    chunk_retry_max_delay: float = Field(default=120.0, gt=0)
 
     @field_validator("output_format")
     @classmethod
@@ -409,7 +415,8 @@ class RetryConfig(BaseModel):
 
     Env vars: ``LLM_MAX_RETRIES``, ``LLM_RETRY_BASE_DELAY``,
     ``LLM_RETRY_MAX_DELAY``, ``LLM_RETRY_BUFFER_SECONDS``, ``LLM_RETRY_JITTER``,
-    ``LLM_RETRY_CONCURRENCY_WAIT`` and ``LLM_PROVIDER_CONCURRENCY``.
+    ``LLM_RETRY_CONCURRENCY_WAIT``, ``LLM_RETRY_SLOT_REBUILD_AFTER`` and
+    ``LLM_PROVIDER_CONCURRENCY``.
     """
 
     max_retries: int = Field(default=3, ge=0, le=10)
@@ -424,6 +431,11 @@ class RetryConfig(BaseModel):
     #: (2 s) only re-collides with the request that is still running server
     #: side, so this floor is deliberately much longer than the base delay.
     concurrency_wait: float = Field(default=10.0, ge=0.0, le=120.0)
+    #: Consecutive 429 "another request still holds the slot" rejections that
+    #: trigger rebuilding the HTTP client with a fresh connection pool. A
+    #: stalled request abandoned mid-flight can leave the provider counting it,
+    #: and retries through the same keep-alive connection keep colliding.
+    slot_rebuild_after: int = Field(default=3, ge=1, le=10)
     #: Most requests this process keeps in flight per provider ``base_url``.
     #: ``1`` matches a free tier that serves a single simultaneous request;
     #: raise it to the provider's real limit. This is a queue, not a throttle:
@@ -441,6 +453,7 @@ def get_retry_config() -> RetryConfig:
             buffer_seconds=_get_float_env("LLM_RETRY_BUFFER_SECONDS", 2.0),
             jitter=_get_float_env("LLM_RETRY_JITTER", 0.2),
             concurrency_wait=_get_float_env("LLM_RETRY_CONCURRENCY_WAIT", 10.0),
+            slot_rebuild_after=_get_int_env("LLM_RETRY_SLOT_REBUILD_AFTER", 3),
             provider_concurrency=_get_int_env("LLM_PROVIDER_CONCURRENCY", 1),
         )
     except ValidationError as exc:
@@ -541,7 +554,7 @@ def get_app_config() -> AppConfig:
     if os.getenv("RB_TOP_K"):
         kwargs["rb_top_k"] = _get_int_env("RB_TOP_K", 4)
     if os.getenv("MAX_CONCURRENCY"):
-        kwargs["max_concurrency"] = _get_int_env("MAX_CONCURRENCY", 2)
+        kwargs["max_concurrency"] = _get_int_env("MAX_CONCURRENCY", 1)
     if os.getenv("REFINE_MIN_SCORE"):
         kwargs["refine_min_score"] = _get_float_env("REFINE_MIN_SCORE", 7.0)
     if os.getenv("SUMMARY_TREE_CHUNK_SUMMARIES"):
@@ -575,6 +588,10 @@ def get_app_config() -> AppConfig:
         kwargs["consistency_check"] = _get_bool_env("CONSISTENCY_CHECK", True)
     if os.getenv("CONSISTENCY_MAX_PATCHES"):
         kwargs["consistency_max_patches"] = _get_int_env("CONSISTENCY_MAX_PATCHES", 5)
+    if os.getenv("CHUNK_RETRY_BASE_DELAY"):
+        kwargs["chunk_retry_base_delay"] = _get_float_env("CHUNK_RETRY_BASE_DELAY", 5.0)
+    if os.getenv("CHUNK_RETRY_MAX_DELAY"):
+        kwargs["chunk_retry_max_delay"] = _get_float_env("CHUNK_RETRY_MAX_DELAY", 120.0)
     try:
         return AppConfig(**kwargs)
     except ValidationError as exc:

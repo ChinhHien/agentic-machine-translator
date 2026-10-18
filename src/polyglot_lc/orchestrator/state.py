@@ -37,6 +37,10 @@ class ChunkState(TypedDict, total=False):
 
     # Per-chunk working set
     draft: str
+    #: The draft a failed attempt already produced, handed to the next attempt
+    #: so a chunk that is run again is not translated again. Declared here
+    #: because LangGraph drops any key this state does not carry.
+    kept_draft: str
     critique: Any  # Critique | None
     refine_round: int
     verify_result: Any  # VerifyResult | None

@@ -12,9 +12,11 @@ has no view of ``.env`` — not a value, not a key name, not whether a credentia
 is set. Runs inherit the server's environment, and a human changes that from a
 terminal. The only translation preferences the API accepts are the ones that
 belong to a single run (languages, domain, glossary, chunk budget, output
-format, resume), and the page sends just the document, its two languages and
+format), and the page sends just the document, its two languages and
 the output format: the domain, the terms and the chunk budget are the
-pipeline's own to work out from the text.
+pipeline's own to work out from the text. Continuing a run ("Tiếp tục") accepts
+none of those preferences: it carries the id of the run being continued, and
+what gets relaunched is that run's own stored command with ``--resume``.
 
 Everything a response quotes back — run notes, step errors, the child's own
 output — is passed through :func:`_redact` first, so a provider error that
@@ -27,6 +29,7 @@ import argparse
 import io
 import json
 import logging
+import os
 import re
 import sys
 import zipfile
@@ -37,7 +40,13 @@ from typing import Any
 from urllib.parse import parse_qs, quote, unquote, urlsplit
 
 from webui.paths import REPO_ROOT, is_within, safe_child
-from webui.runs import LOGS_DIR, RunManager, RunPlanError
+from webui.runs import (
+    LOGS_DIR,
+    PROBLEM_STATUSES,
+    RunManager,
+    RunPlanError,
+    start_sweeper,
+)
 from webui.store import GlossaryStore, RunRecord, RunsStore
 
 logger = logging.getLogger("webui")
@@ -52,6 +61,8 @@ STATIC_TYPES = {
     ".css": "text/css; charset=utf-8",
     ".js": "text/javascript; charset=utf-8",
     ".svg": "image/svg+xml",
+    # The mark the page opens under. It is the one asset here that is not text.
+    ".png": "image/png",
     ".woff2": "font/woff2",
 }
 
@@ -107,9 +118,6 @@ RUN_SUMMARY_FIELDS = (
     "output_path",
     "note",
 )
-
-#: Event statuses that mean something went wrong, for the "problems" block.
-PROBLEM_STATUSES = frozenset({"fail", "retry"})
 
 #: A credential-shaped run of characters. OpenAI's own 401 message quotes the
 #: first characters of the key it rejected, so error text is not trustworthy.
@@ -302,12 +310,11 @@ class Api:
         return json_response({"files": files})
 
     def _upload(self, name: str, query: dict[str, list[str]], body: bytes) -> Response:
-        """Write a PDF into ``input/``, refusing to clobber one by accident.
+        """Write a PDF into ``input/``, overwriting any previous version.
 
         Validation runs in the order that produces the clearest message: a name
         that is really a path is refused as a path attempt, then what the bytes
-        are, then whether it would overwrite something. Nothing is written until
-        all of that passes.
+        are. Nothing is written until all of that passes.
         """
         try:
             path = safe_child(self.root / INPUT_DIR, name)
@@ -324,8 +331,6 @@ class Api:
             )
         if PDF_MAGIC not in body[:1024]:
             return error(422, "this is not a PDF file (no %PDF- header)")
-        if path.exists() and not _flagged(query, "overwrite"):
-            return error(409, f"{name} already exists; pass ?overwrite=1 to replace it")
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_bytes(body)
         logger.info("uploaded %s (%d bytes)", name, len(body))
@@ -371,6 +376,8 @@ class Api:
                 return self._run_bundle(run_id)
             if parts[1] == "source":
                 return self._run_source(run_id)
+            if parts[1] == "partial":
+                return self._run_partial(run_id)
         if len(parts) == 2 and method == "POST" and parts[1] == "stop":
             return self._stop_run(run_id)
         return None
@@ -382,9 +389,14 @@ class Api:
         except KeyError:
             return error(404, f"no such run: {run_id}")
         md, pdf = self._md_path(record), self._pdf_path(record)
+        # The model the run actually ran under, from its own first event: a
+        # stopped run's "Tiếp tục" must keep the same model, or the checkpoint
+        # key it reuses changes and the resume starts over from scratch.
+        translator_model = self.manager.translator_model(run_id)
         return json_response(
             {
                 "run": _public_record(record),
+                "translator_model": translator_model,
                 "md": md is not None,
                 "md_path": str(md) if md else "",
                 "pdf": pdf is not None,
@@ -394,43 +406,8 @@ class Api:
                 "pdf_path": str(pdf) if pdf else "",
                 "artifacts": self._artifacts(record),
                 "problems": self._problems(record),
-                "routes": self._routes(record),
             }
         )
-
-    def _routes(self, record: RunRecord) -> dict[str, int]:
-        """How many chunks took each route, from the run's own decisions.
-
-        Same reading as :meth:`_problems`: the decisions the pipeline recorded,
-        reduced to a tally. A run with no decisions at all reports zeros rather
-        than pretending every chunk was standard.
-        """
-        counts = {"fast": 0, "standard": 0, "deep": 0}
-        try:
-            events, _next, _malformed = self.manager.events(record.run_id, 0)
-        except Exception:  # noqa: BLE001 - a broken log must not hide the run
-            return counts
-        fast: set[str] = set()
-        refined: set[str] = set()
-        seen: set[str] = set()
-        for event in events:
-            if str(event.get("type") or "") != "decision":
-                continue
-            chunk_id = str(event.get("chunk_id") or "")
-            seen.add(chunk_id)
-            kind = str(event.get("kind") or "")
-            if kind == "fast_path" and event.get("chosen"):
-                fast.add(chunk_id)
-            elif kind == "refine_gate" and event.get("chosen"):
-                refined.add(chunk_id)
-        for chunk_id in seen:
-            if chunk_id in fast:
-                counts["fast"] += 1
-            elif chunk_id in refined:
-                counts["deep"] += 1
-            else:
-                counts["standard"] += 1
-        return counts
 
     def _md_path(self, record: RunRecord) -> Path | None:
         """The run's Markdown, when it exists inside the repository."""
@@ -537,9 +514,17 @@ class Api:
         )
 
     def _start_run(self, body: bytes) -> Response:
+        """Start a new run, or continue an existing one ("Tiếp tục").
+
+        The two are answered before anything else is read from the body: a
+        resumed run carries only the id of the run being continued, so none of
+        the new-run preferences apply to it and none of them are required.
+        """
         data = _json_object(body)
         if data is None:
             return error(400, "body must be a JSON object")
+        if bool(data.get("resume")):
+            return self._resume_run(data)
         file = str(data.get("file") or "").strip()
         if not file:
             return error(400, "file is required")
@@ -572,13 +557,42 @@ class Api:
                 # the terminal; the page never sends it (see the module doc).
                 mock=bool(data.get("mock")),
                 output_format=output_format,
-                resume=bool(data.get("resume")),
             )
         except RunPlanError as exc:
             # The document could not be read or planned: nothing was started.
             return error(422, str(exc))
         except ValueError as exc:
             return error(403, f"refused: {exc}")
+        return self._started(record)
+
+    def _resume_run(self, data: dict[str, Any]) -> Response:
+        """Continue the run named by ``run_id``, in place.
+
+        Everything the child needs — document, languages, domain, glossary,
+        token budget, output path, Translator model — is stored on that run's
+        own record, so the page sends only its id. The run keeps its identity:
+        same run_id, same log directory, same output file, and its earlier
+        events stay readable, which is what "continue in the current session"
+        means. Nothing is created, so the answer is a 200 naming that same run.
+        """
+        run_id = str(data.get("run_id") or "").strip()
+        if not run_id:
+            return error(400, "resume needs the run_id of the run to continue")
+        try:
+            record = self.manager.resume(run_id)
+        except KeyError:
+            return error(404, f"no such run: {run_id}")
+        except RuntimeError as exc:
+            return error(409, f"cannot resume: {exc}")
+        return self._started(record, 200)
+
+    def _started(self, record: RunRecord, status: int = 201) -> Response:
+        """The answer to a launch: which run, how long, what it writes.
+
+        A fresh launch answers 201 — something was created. Continuing a run
+        answers 200 with the same run_id the page already had, because nothing
+        new came into being.
+        """
         return json_response(
             {
                 "run_id": record.run_id,
@@ -586,7 +600,7 @@ class Api:
                 "output_path": record.output_path,
                 "artifacts": self._artifacts(record),
             },
-            201,
+            status,
         )
 
     def _stop_run(self, run_id: str) -> Response:
@@ -676,6 +690,20 @@ class Api:
         return Response(
             200, buffer.getvalue(), ZIP_TYPE, _content_disposition(f"{record.run_id}-ket-qua.zip")
         )
+
+    def _run_partial(self, run_id: str) -> Response:
+        """The translation so far, chunk by chunk, while the run is writing it.
+
+        The column a reader compares against fills in behind a running
+        translation instead of staying empty until one file lands at the end:
+        a run writes each finished chunk's own text as that chunk completes, and
+        says where. A run with nothing translated yet answers with an empty
+        text and a piece count of zero, which is not an error — it is a run that
+        has not finished its first chunk.
+        """
+        if self.runs.read_record(run_id) is None:
+            return error(404, f"no such run: {run_id}")
+        return json_response(self.manager.partial(run_id))
 
     def _run_source(self, run_id: str) -> Response:
         """The source document's own text, for the pane a reader compares to.
@@ -794,8 +822,30 @@ class Handler(BaseHTTPRequestHandler):
         logger.debug("%s - %s", self.address_string(), fmt % args)
 
 
+class _Server(ThreadingHTTPServer):
+    """Loopback server that will not share its port with a second instance.
+
+    On Windows ``SO_REUSEADDR`` lets another process bind a port this server is
+    already listening on, so two copies of the app can run side by side and
+    silently split requests between them — one of them possibly an old build
+    whose routes no longer match the page the browser was served. Two servers
+    have no reason to share a port, so the reuse flag is turned off there and
+    the second start fails with "address already in use" instead of shadowing
+    the first. POSIX already refuses a second active listener (that needs
+    ``SO_REUSEPORT``, which we never set), so its reuse flag is kept: a prompt
+    restart must not be blocked by sockets still in ``TIME_WAIT``.
+    """
+
+    allow_reuse_address = os.name != "nt"
+
+
 def make_server(api: Api, port: int = DEFAULT_PORT) -> ThreadingHTTPServer:
-    """A threaded server bound to loopback on *port*."""
+    """A threaded server bound to loopback on *port*.
+
+    Raises ``OSError`` when the port is already held, which is the desired
+    behaviour: two copies of this server on one port would answer as two
+    different builds, and the older one would keep serving old routes.
+    """
 
     class _Handler(Handler):
         # `handle()` runs during BaseHTTPRequestHandler.__init__, so the
@@ -804,7 +854,7 @@ def make_server(api: Api, port: int = DEFAULT_PORT) -> ThreadingHTTPServer:
             self.api = api
             super().__init__(*args, **kwargs)
 
-    return ThreadingHTTPServer((HOST, port), _Handler)
+    return _Server((HOST, port), _Handler)
 
 
 def default_api(root: Path = REPO_ROOT, *, port: int = DEFAULT_PORT, **manager_kw) -> Api:
@@ -850,7 +900,22 @@ def main(argv: list[str] | None = None) -> int:
         sys.stdout.reconfigure(errors="replace")
 
     api = default_api(root=args.root, port=args.port)
-    server = make_server(api, args.port)
+    try:
+        server = make_server(api, args.port)
+    except OSError as exc:
+        # A port already in use is almost always another copy of this server —
+        # possibly an old build. Refuse clearly instead of a bare traceback,
+        # and bind before starting the supervisor so a failed start spawns no
+        # background thread at all.
+        print(
+            f"cannot start: {HOST}:{args.port} is already in use ({exc}); "
+            "is another web UI server already running?",
+            file=sys.stderr,
+        )
+        return 1
+    # Beside the server, not inside a route: a run that died on a temporary
+    # provider failure is continued even with no page open to press "Tiếp tục".
+    start_sweeper(api.manager)
     print(f"polyglot-lc web UI on http://{HOST}:{args.port}  (Ctrl+C to stop)")
     try:
         server.serve_forever()

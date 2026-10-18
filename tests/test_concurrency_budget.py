@@ -88,7 +88,9 @@ def _calls(by_agent, name):
 def test_max_concurrency_default_and_override(mock_env, monkeypatch):
     from polyglot_lc.config import get_app_config
 
-    assert get_app_config().max_concurrency == 2
+    # The default is 1: a free tier serves one request at a time, so the
+    # sequential run is the honest default and parallelism is opted into.
+    assert get_app_config().max_concurrency == 1
     monkeypatch.setenv("MAX_CONCURRENCY", "5")
     assert get_app_config().max_concurrency == 5
 
@@ -309,6 +311,75 @@ def test_chunk_failure_propagates_under_concurrency(mock_env, tmp_path, monkeypa
     with pytest.raises(RuntimeError, match="chunk boom"):
         _run(mock_env, monkeypatch, path, concurrency=4, out=str(out))
     assert not out.exists()  # a failed run writes no partial output file
+
+
+def test_the_run_end_record_carries_the_api_call_concurrency(mock_env, tmp_path, monkeypatch):
+    """The Report tab's "Api calls" reads the run's own
+    records; for a finished run the last one to carry the count is ``run_end``.
+    The counter itself is a process-wide reading (pinned in
+    ``tests/test_llm_client.py``), so what is pinned here is the other half: the
+    coordinator writes down the snapshot it read rather than dropping it, which
+    is what keeps the page off its "chưa đo được" fallback for a fresh run.
+    """
+
+    import json
+    from pathlib import Path
+
+    from polyglot_lc.pipeline import coordinator
+
+    monkeypatch.setenv("LOG_JSONL", "1")
+    monkeypatch.setattr(coordinator, "active_api_calls", lambda: {"active": 2, "peak": 3})
+    path = _write(tmp_path, PLAIN)
+    result, _snap, _by = _run(mock_env, monkeypatch, path)
+
+    records = [
+        json.loads(line) for line in Path(result.log_path).read_text(encoding="utf-8").splitlines()
+    ]
+    end = [record for record in records if record.get("type") == "run_end"][-1]
+    assert (end["active_api_calls"], end["max_active_api_calls"]) == (2, 3)
+
+
+# ------------------- LLM_PROVIDER_CONCURRENCY: provider-boundary queue ------
+# These mock-mode tests exercise LLM_PROVIDER_CONCURRENCY directly (no real
+# provider). Worker pool (MAX_CONCURRENCY) and provider queue (LLM_PROVIDER_
+# CONCURRENCY) stay separate by design: the queue bounds how many requests are
+# in flight at the provider; the worker pool may run more workers in parallel.
+
+
+def test_provider_concurrency_respects_configured_limit(mock_env, monkeypatch):
+    """LLM_PROVIDER_CONCURRENCY stands as configured.
+
+    The user sets a larger limit for a paid/self-hosted provider and the
+    config honours it; the pipeline can then run as many requests in flight
+    as the limit allows. The default (no explicit value) stays at the safe 1.
+    """
+    from polyglot_lc.config import get_retry_config
+
+    monkeypatch.setenv("LLM_PROVIDER_CONCURRENCY", "4")
+    assert get_retry_config().provider_concurrency == 4
+    monkeypatch.delenv("LLM_PROVIDER_CONCURRENCY", raising=False)
+    assert get_retry_config().provider_concurrency == 1
+
+
+def test_provider_concurrency_survives_pipeline_run(mock_env, tmp_path, monkeypatch):
+    """The queue limit is a config value, not a behaviour gate.
+
+    Ingest a 3-chunk document and run it with concurrency=4 (workers > chunks
+    is legal); the provider queue runs at its configured limit regardless, so
+    the run succeeds end-to-end. The queue did not change the number of
+    requests made — workers can still overlap their work; only the
+    provider-boundary concurrency is bound.
+    """
+    from polyglot_lc.config import get_retry_config
+
+    monkeypatch.setenv("LLM_PROVIDER_CONCURRENCY", "2")
+    assert get_retry_config().provider_concurrency == 2
+    path = _write(tmp_path, PLAIN)
+    chunks, _ = _expected_chunks(path)
+    assert len(chunks) == EXPECTED_CHUNKS  # ingest worked; 3 chunks
+    result, _snap, _by = _run(mock_env, monkeypatch, path, concurrency=4)
+    assert result.chunks == EXPECTED_CHUNKS
+    assert _calls(_by, "TRANSLATOR") == EXPECTED_CHUNKS
 
 
 # --------------------------- best-effort subsystems -------------------------

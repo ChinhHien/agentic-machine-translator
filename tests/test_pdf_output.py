@@ -25,11 +25,14 @@ from polyglot_lc.pipeline.pdf_output import (
 
 
 class _FakeChunk:
-    """Just what the assembler reads off a chunk: its id and its blocks."""
+    """Just what the assembler reads off a chunk: its id, its blocks, and the
+    source text it was built from — one piece per block, which is what the
+    translator was given and what the paragraphs are aligned against."""
 
-    def __init__(self, cid: str, block_refs: list[int]) -> None:
+    def __init__(self, cid: str, block_refs: list[int], text: str = "") -> None:
         self.id = cid
         self.block_refs = block_refs
+        self.text = text
 
 
 @pytest.fixture(scope="module")
@@ -45,20 +48,22 @@ def unicode_font():
 
 
 def test_paragraphs_map_to_their_own_blocks():
-    c0 = _FakeChunk("c0", [0, 1])
+    c0 = _FakeChunk("c0", [0, 1], "S0\n\nS1")
     assert block_translations([c0], {"c0": "P0\n\nP1"}) == {0: "P0", 1: "P1"}
 
 
 def test_the_overlapped_head_is_not_emitted_twice():
     """The earlier chunk owns the shared block, exactly as `assemble` decides."""
-    c0 = _FakeChunk("c0", [0, 1])
-    c1 = _FakeChunk("c1", [1, 2])  # re-covers block 1 as its head
+    c0 = _FakeChunk("c0", [0, 1], "S0\n\nS1")
+    c1 = _FakeChunk("c1", [1, 2], "S1\n\nS2")  # re-covers block 1 as its head
     out = block_translations([c0, c1], {"c0": "P0\n\nP1", "c1": "P1\n\nP2"})
     assert out == {0: "P0", 1: "P1", 2: "P2"}
 
 
 def test_blocks_the_translation_has_no_text_for_are_left_out():
-    """A merged translation must not print the same paragraph over two blocks."""
+    """Without the source text there is nothing to align on, so the paragraphs
+    stay where their position puts them and the blocks beyond them are left
+    out."""
     c0 = _FakeChunk("c0", [0, 1, 2])
     assert block_translations([c0], {"c0": "Only one paragraph"}) == {0: "Only one paragraph"}
 
@@ -72,6 +77,87 @@ def test_extra_paragraphs_stay_with_the_last_block():
 
 def test_a_chunk_without_a_translation_contributes_nothing():
     assert block_translations([_FakeChunk("c0", [0])], {}) == {}
+
+
+def test_a_title_the_source_wrapped_over_two_blocks_keeps_them_together():
+    """The translator returns one paragraph for a block that is half a title.
+
+    Blocks 1 and 2 are one sentence — the second has no full stop of its own —
+    and the paragraph carries both of their words. Block 1 owns it and block 2
+    is left empty, because those words are already printed where block 1 is;
+    what must *not* happen is the paragraphs after it moving up one block, which
+    is what printed every later paragraph of the page in its neighbour's place.
+    """
+    c0 = _FakeChunk(
+        "c0",
+        [0, 1, 2, 3],
+        "Introduction.\n\n1.7. Better Graph Data for Rapidly Changing\n\n"
+        "Data Model\n\nThe rest of the chapter follows.",
+    )
+    out = block_translations(
+        [c0],
+        {
+            "c0": "Giới thiệu.\n\n1.7. Dữ liệu đồ thị tốt hơn cho mô hình dữ liệu thay đổi "
+            "nhanh chóng\n\nPhần còn lại của chương tiếp theo sau."
+        },
+    )
+    assert out[0] == "Giới thiệu."
+    assert out[1].startswith("1.7.")
+    assert out[2] is None, "the half-title is covered by block 1's paragraph"
+    assert out[3] == "Phần còn lại của chương tiếp theo sau."
+
+
+def test_a_block_that_came_back_as_two_paragraphs_keeps_both():
+    """The translator wraps one long entry over two paragraphs, and the second
+    of them still belongs to that entry — its page number says so — rather than
+    being pushed onto the entry below it."""
+    c0 = _FakeChunk(
+        "c0",
+        [0, 1],
+        "1.1. A … 3\n\n1.2. A very long entry title that goes on and on … 5",
+    )
+    out = block_translations(
+        [c0],
+        {"c0": "1.1. A … 3\n\n1.2. Một tiêu đề rất dài kéo dài mãi\n\nvà vẫn tiếp tục … 5"},
+    )
+    assert out[0] == "1.1. A … 3"
+    assert out[1] == "1.2. Một tiêu đề rất dài kéo dài mãi\n\nvà vẫn tiếp tục … 5"
+
+
+def test_contents_entries_keep_their_own_page_numbers():
+    """A translator that drops one entry must not renumber the others.
+
+    Every entry ends in its page number, and that number survives translation:
+    it is the evidence that says which paragraph belongs to which entry. Ran on
+    the book this was written for, reading them position by position left 37 of
+    128 entries — the whole contents page — showing their neighbour's number.
+    """
+    c0 = _FakeChunk(
+        "c0",
+        [0, 1, 2, 3],
+        "1.1. Why use RDF? … 3\n\n1.2. Who is this Book Written for? … 5\n\n"
+        "1.3. Why is the PDF Free? … 5\n\n1.4. Book Software … 6",
+    )
+    out = block_translations(
+        [c0],
+        {
+            "c0": "1.1. Tại sao dùng RDF? … 3\n\n1.2. Cuốn sách này dành cho ai? … 5\n\n"
+            "1.4. Phần mềm đi kèm sách … 6"
+        },
+    )
+    assert out[0].endswith("3")
+    assert out[1].endswith("5")
+    assert out[3].endswith("6")
+    # The entry the translator left out keeps its English line rather than
+    # borrowing the paragraph of the entry below it.
+    assert 2 not in out
+
+
+def test_a_chunk_missing_its_own_text_keeps_the_old_pairing():
+    """Without the source text there is no evidence to align on, so the
+    paragraphs stay where their position puts them."""
+    c0 = _FakeChunk("c0", [0, 1])
+    assert block_translations([c0], {"c0": "P0\n\nP1"}) == {0: "P0", 1: "P1"}
 
 
 # ------------------------------ plain text ----------------------------------
@@ -122,7 +208,7 @@ def _doc_with_geometry() -> Document:
 
 
 def test_cells_and_code_and_geometryless_blocks_are_kept_as_source():
-    items, kept = placements(_doc_with_geometry(), {0: "Xin chào", 1: "x", 2: "x", 3: "x"})
+    items, kept, _ = placements(_doc_with_geometry(), {0: "Xin chào", 1: "x", 2: "x", 3: "x"})
     assert [item.text for item in items] == ["Xin chào"]
     assert kept == 3  # the table has no cell boxes here, and code is never translated
 
@@ -166,7 +252,7 @@ TRANSLATED_TABLE = "| Tính năng | Trạng thái |\n| --- | --- |\n| Máy chủ
 
 
 def test_table_cells_are_placed_cell_by_cell():
-    items, kept = placements(_table_doc(), {0: TRANSLATED_TABLE})
+    items, kept, _ = placements(_table_doc(), {0: TRANSLATED_TABLE})
 
     assert kept == 0
     assert [item.text for item in items] == ["Tính năng", "Trạng thái", "Máy chủ", "5"]
@@ -184,7 +270,7 @@ def test_table_cells_are_placed_cell_by_cell():
 
 
 def test_a_translated_table_with_a_different_shape_keeps_the_source_table():
-    items, kept = placements(_table_doc(), {0: "| Tính năng |\n| --- |\n| Máy chủ |"})
+    items, kept, _ = placements(_table_doc(), {0: "| Tính năng |\n| --- |\n| Máy chủ |"})
     assert items == [] and kept == 1
 
 
@@ -192,31 +278,31 @@ def test_a_translation_that_splits_a_cell_on_a_pipe_keeps_the_table():
     # A `|` inside a translated cell makes the Markdown parse report an extra
     # column; lining cells up by position would then print them into the wrong
     # boxes, so the whole table stays in the source language instead.
-    items, kept = placements(_table_doc(), {0: "| a | b |\n| --- | --- |\n| c | d | e |"})
+    items, kept, _ = placements(_table_doc(), {0: "| a | b |\n| --- | --- |\n| c | d | e |"})
     assert items == [] and kept == 1
 
 
 def test_a_table_without_a_translation_is_kept():
-    items, kept = placements(_table_doc(), {})
+    items, kept, _ = placements(_table_doc(), {})
     assert items == [] and kept == 1
 
 
 def test_a_cell_without_translation_is_not_printed():
-    items, _kept = placements(_table_doc(), {0: "| a |  |\n| --- | --- |\n| c | d |"})
+    items, _kept, _ = placements(_table_doc(), {0: "| a |  |\n| --- | --- |\n| c | d |"})
     assert [item.text for item in items] == ["a", "c", "d"]
     # The cell we skip is not redacted either: its source text has to survive.
     assert [item.redact for item in items][1] == [(40.0, 146.0, 270.0, 172.0)]
 
 
 def test_a_cell_holding_a_code_placeholder_prints_it_as_text():
-    items, kept = placements(_table_doc(), {0: "| ⟦CODE_1⟧ | b |\n| --- | --- |\n| c | d |"})
+    items, kept, _ = placements(_table_doc(), {0: "| ⟦CODE_1⟧ | b |\n| --- | --- |\n| c | d |"})
     assert kept == 0 and items[0].text == "⟦CODE_1⟧"
 
 
 def test_a_cell_without_a_box_is_left_alone():
     doc = _table_doc()
     doc.blocks[0].meta["pdf"]["cells"][1][1] = None
-    items, _kept = placements(doc, {0: "| a | b |\n| --- | --- |\n| c | d |"})
+    items, _kept, _ = placements(doc, {0: "| a | b |\n| --- | --- |\n| c | d |"})
     assert [item.text for item in items] == ["a", "b", "c"]
 
 
@@ -224,14 +310,57 @@ def test_an_overlapping_cell_is_printed_once():
     doc = _table_doc()
     cells = doc.blocks[0].meta["pdf"]["cells"]
     cells[1][0] = list(cells[0][0])  # a row merge pdfplumber did not collapse
-    items, _kept = placements(doc, {0: "| a | b |\n| --- | --- |\n| c | d |"})
+    items, _kept, _ = placements(doc, {0: "| a | b |\n| --- | --- |\n| c | d |"})
     assert [item.text for item in items] == ["a", "b", "d"]
 
 
 def test_a_block_without_a_translation_keeps_its_source_text():
-    items, kept = placements(_doc_with_geometry(), {})
+    items, kept, _ = placements(_doc_with_geometry(), {})
     assert items == []
     assert kept == 4
+
+
+def _wrapped_title(top: float = 200.0, gap: float = 12.0) -> Document:
+    """Two blocks the source wrapped one title over: a plain line and its rest."""
+
+    def line(text: str, at: float) -> Block:
+        return Block(
+            kind="paragraph",
+            text=text,
+            meta={
+                "pdf": {
+                    "rects": [(0, 72.0, at, 300.0, at + 12.0)],
+                    "size": 10.0,
+                    "kind": "body",
+                }
+            },
+        )
+
+    return Document(blocks=[line("Rapidly Changing Data", top), line("Model", top + gap)])
+
+
+def test_a_merged_block_gives_its_lines_to_the_paragraph_printed_above_it():
+    """One block, one paragraph: the second line's English words are covered by
+    that paragraph, so they are cleared and its box grows over them — otherwise
+    the translation prints over the English line it replaces."""
+    items, kept, merged = placements(
+        _wrapped_title(), {0: "Mô hình dữ liệu thay đổi nhanh", 1: None}
+    )
+    assert merged == 1
+    assert kept == 0
+    assert len(items) == 1
+    assert items[0].box == (72.0, 200.0, 300.0, 224.0)
+    assert items[0].redact == [(72.0, 200.0, 300.0, 212.0), (72.0, 212.0, 300.0, 224.0)]
+
+
+def test_a_merged_block_the_paragraph_does_not_reach_keeps_its_source_text():
+    """The paragraph was printed high up the page, so this block is not part of
+    that sentence: clearing it would delete text nothing replaced."""
+    items, kept, merged = placements(_wrapped_title(gap=120.0), {0: "Mô hình", 1: None})
+    assert merged == 0
+    assert kept == 1
+    assert len(items) == 1
+    assert items[0].redact == [(72.0, 200.0, 300.0, 212.0)]
 
 
 # --------------------------------- fonts ------------------------------------
@@ -304,6 +433,39 @@ def test_copied_text_keeps_real_spaces_and_hyphens(tmp_path, unicode_font):
     assert "\xa0" not in copied, "dấu cách bị mã hoá thành NO-BREAK SPACE"
     assert "\xad" not in copied, "gạch nối bị mã hoá thành SOFT HYPHEN"
     assert "Eocortex ST - một cột" in " ".join(copied.split())
+
+
+def test_the_map_repair_only_rewrites_standalone_entries():
+    """The rewrite must never cross a line break.
+
+    The entry regex used to allow any whitespace between the two codes, so a
+    line ending in a hex code followed by a line starting with ``<00a0>``
+    fused into one malformed entry. The saved map then parsed as garbage and
+    extraction returned U+00C3 for glyphs whose input was correct — every
+    ``JavaScript`` came back as ``ÃavaScript``. A bfrange head whose ``hi``
+    is ``00ad`` was rewritten too, leaving ``hi < lo``.
+    """
+    stream = "\n".join(
+        [
+            "<0003> <00a0>",  # standalone nbsp target: rewritten
+            "<0010> <00ad>",  # standalone soft-hyphen target: rewritten
+            "<009f> <2126>",  # next line starts with <00a0>: must not fuse
+            "<00a0> <00e6>",  # 00a0 as source, other target: untouched
+            "<00ac> <00ad> <00c3>",  # bfrange head with hi=00ad: untouched
+            "<0011> <00c3>",  # the U+00C3 mapping itself: untouched
+        ]
+    )
+
+    fixed = pdf_output._fix_tounicode_targets(stream)
+
+    assert fixed.splitlines() == [
+        "<0003> <0020>",
+        "<0010> <002d>",
+        "<009f> <2126>",
+        "<00a0> <00e6>",
+        "<00ac> <00ad> <00c3>",
+        "<0011> <00c3>",
+    ]
 
 
 def test_the_source_pages_own_font_map_is_not_repaired(tmp_path, unicode_font):
@@ -474,7 +636,7 @@ def _styled_doc() -> Document:
 
 
 def test_a_translated_list_gets_the_source_markers_back():
-    items, _ = placements(
+    items, _, _ = placements(
         _styled_doc(),
         {0: "Giới thiệu về Eocortex … 4", 1: "một\nhai", 2: "Dòng ngắn.", 3: "Dòng khác."},
         match_style=False,
@@ -483,7 +645,7 @@ def test_a_translated_list_gets_the_source_markers_back():
 
 
 def test_a_contents_entry_is_split_for_its_leader_and_number():
-    items, _ = placements(_styled_doc(), {0: "Giới thiệu về Eocortex … 4"}, match_style=False)
+    items, _, _ = placements(_styled_doc(), {0: "Giới thiệu về Eocortex … 4"}, match_style=False)
     assert items[0].toc == ("Giới thiệu về Eocortex", "4")
     assert items[0].text == "Giới thiệu về Eocortex … 4"
 
@@ -491,7 +653,7 @@ def test_a_contents_entry_is_split_for_its_leader_and_number():
 def test_a_short_line_may_use_the_column_next_to_it():
     """A translation of a short line is longer than the English one far more
     often than not, and shrinking the type is what that otherwise costs."""
-    items, _ = placements(
+    items, _, _ = placements(
         _styled_doc(),
         {2: "Câu dịch dài hơn hẳn câu gốc.", 3: "x"},
         match_style=False,
@@ -512,7 +674,7 @@ def test_a_line_with_a_neighbour_beside_it_is_left_alone():
             },
         )
     )
-    items, _ = placements(
+    items, _, _ = placements(
         doc, {2: "Câu dịch dài hơn hẳn câu gốc.", 4: "Bên cạnh."}, match_style=False
     )
     short = next(item for item in items if item.text.startswith("Câu dịch"))
@@ -542,7 +704,7 @@ def test_a_centred_title_widens_both_ways_so_it_stays_centred():
             ),
         ]
     )
-    items, _ = placements(doc, {0: "Tiêu đề tài liệu", 1: "Thân bài."}, match_style=False)
+    items, _, _ = placements(doc, {0: "Tiêu đề tài liệu", 1: "Thân bài."}, match_style=False)
     item = next(item for item in items if item.kind == "heading")
     assert item.box[0] == 60.0 and item.box[2] == 540.0
 
@@ -592,7 +754,9 @@ def test_a_pinned_font_is_not_second_guessed(tmp_path):
     """``--font-path``/``PDF_FONT_PATH`` means \"this face\", not \"a face like it\"."""
     pinned = tmp_path / "pinned.ttf"
     pinned.write_bytes(b"\x00\x01")
-    items, _ = placements(_styled_doc(), {2: "Dòng ngắn."}, default_font=pinned, match_style=False)
+    items, _, _ = placements(
+        _styled_doc(), {2: "Dòng ngắn."}, default_font=pinned, match_style=False
+    )
     assert items[0].font_file == str(pinned)
 
 
@@ -735,7 +899,7 @@ def test_a_body_block_with_balanced_tokens_gets_runs():
     """The runs come from the translation *with* its tokens: stripping first
     would leave one plain run and lose the emphasis the tokens describe."""
     doc = _emphasis_doc("A ⟦BOLD⟧B⟦/BOLD⟧ C")
-    items, _ = placements(doc, {0: "A ⟦BOLD⟧B⟦/BOLD⟧ C"}, match_style=False)
+    items, _, _ = placements(doc, {0: "A ⟦BOLD⟧B⟦/BOLD⟧ C"}, match_style=False)
 
     assert items[0].runs == [("A ", False, False), ("B", True, False), (" C", False, False)]
     assert items[0].text == "A B C"
@@ -746,7 +910,7 @@ def test_a_block_whose_translation_lost_a_token_gets_no_runs():
     """Guard ở tầng dựng: lệch token thì in thường, và im lặng (lỗi ghi ở tầng
     pipeline, một lần cho cả chunk)."""
     doc = _emphasis_doc("A ⟦BOLD⟧B⟦/BOLD⟧ C")
-    items, _ = placements(doc, {0: "A B ⟦BOLD⟧C"}, match_style=False)
+    items, _, _ = placements(doc, {0: "A B ⟦BOLD⟧C"}, match_style=False)
 
     assert items[0].runs is None
     assert "⟦" not in items[0].text
@@ -755,7 +919,7 @@ def test_a_block_whose_translation_lost_a_token_gets_no_runs():
 def test_a_block_whose_source_had_no_tokens_gets_no_runs():
     """Model tự thêm cặp token: nguồn không nhấn mạnh thì không in nhấn mạnh."""
     doc = _emphasis_doc("A B C")
-    items, _ = placements(doc, {0: "A ⟦BOLD⟧B⟦/BOLD⟧ C"}, match_style=False)
+    items, _, _ = placements(doc, {0: "A ⟦BOLD⟧B⟦/BOLD⟧ C"}, match_style=False)
 
     assert items[0].runs is None
     assert items[0].text == "A B C"
@@ -769,7 +933,7 @@ def test_a_list_block_keeps_one_face_and_its_source_markers():
     """
     doc = _emphasis_doc("- ⟦BOLD⟧A⟦/BOLD⟧ B", kind="list")
     doc.blocks[0].meta["pdf"]["markers"] = ["•"]
-    items, _ = placements(doc, {0: "- ⟦BOLD⟧A⟦/BOLD⟧ B"}, match_style=False)
+    items, _, _ = placements(doc, {0: "- ⟦BOLD⟧A⟦/BOLD⟧ B"}, match_style=False)
 
     assert items[0].runs is None
     assert items[0].text == "• A B"
@@ -778,7 +942,7 @@ def test_a_list_block_keeps_one_face_and_its_source_markers():
 def test_tokens_inside_a_cell_are_stripped_before_the_cell_is_split():
     doc = _table_doc()
     table = "| ⟦BOLD⟧a⟦/BOLD⟧ | b |\n| --- | --- |\n| c | d |"
-    items, _ = placements(doc, {0: table}, match_style=False)
+    items, _, _ = placements(doc, {0: table}, match_style=False)
 
     assert [item.text for item in items] == ["a", "b", "c", "d"]
     assert all("⟦" not in item.text for item in items)
@@ -787,7 +951,7 @@ def test_tokens_inside_a_cell_are_stripped_before_the_cell_is_split():
 def test_a_heading_block_with_tokens_does_not_print_its_hashes():
     """``plain_text`` strips the ``#``, so the run path must strip it too."""
     doc = _emphasis_doc("# ⟦BOLD⟧A⟦/BOLD⟧ B", kind="heading")
-    items, _ = placements(doc, {0: "# ⟦BOLD⟧A⟦/BOLD⟧ B"}, match_style=False)
+    items, _, _ = placements(doc, {0: "# ⟦BOLD⟧A⟦/BOLD⟧ B"}, match_style=False)
 
     assert items[0].runs == [("A", True, False), (" B", False, False)]
     assert "#" not in items[0].text
@@ -872,24 +1036,81 @@ def test_a_missing_local_bold_face_loses_the_emphasis_but_not_the_text(
     assert "⟦" not in "".join(text for text, _, _ in spans)
 
 
-def test_a_long_translation_uses_the_room_below_before_giving_up(tmp_path, unicode_font):
-    """`rebuild_pdf` xoá chữ nguồn **trước** khi in, nên một block không in được là
-    mất sạch chữ chứ không để lại chữ nguồn. Đường run phải dùng hết chỗ tới lề
-    dưới ở cỡ sàn trước khi chịu thua."""
+def test_a_long_block_continues_on_a_new_page_at_the_same_size(tmp_path, unicode_font):
+    """Chữ dài hơn hộp thì **tràn sang trang sau ở đúng cỡ gốc**.
+
+    `rebuild_pdf` xoá chữ nguồn trước khi in, nên một block in hụt là mất chữ
+    chứ không để lại chữ nguồn; còn thu nhỏ cỡ chữ cho vừa hộp thì 10 pt thành
+    5.5 pt, đè lên block dưới. Cách đúng là in phần vừa hộp ở cỡ gốc rồi nối
+    tiếp phần còn lại sang trang mới, cũng ở cỡ gốc.
+    """
     import pymupdf
     from pdfdoc import write_styled_pdf
 
     src = write_styled_pdf(tmp_path / "in.pdf", "Alpha ", "Beta", " Gamma")
     doc = load_document(src)
+    source_size = doc.blocks[0].meta["pdf"]["size"]
     long_text = "Alpha ⟦BOLD⟧" + "rất dài " * 12 + "⟦/BOLD⟧ Gamma"
     stats = rebuild_pdf(src, doc, {0: long_text}, tmp_path / "out.pdf", font_path=unicode_font)
 
-    assert stats.failures == [], "chữ dài vẫn phải in được, chỉ là tràn xuống dưới"
+    assert stats.failures == [], "chữ dài vẫn phải in được, chỉ là tràn sang trang sau"
+    assert stats.continued >= 1, "phần không vừa hộp phải được in tiếp ở trang mới"
     with pymupdf.open(tmp_path / "out.pdf") as rebuilt:
-        words = rebuilt[0].get_text("words")
-        height = rebuilt[0].rect.height
-    assert words, "trang phải còn chữ"
-    assert all(word[1] >= 0 and word[3] <= height for word in words), (
-        "chữ không được rời khỏi trang"
+        assert rebuilt.page_count == stats.pages
+        first, second = rebuilt[0], rebuilt[1]
+        size = first.get_text("dict")["blocks"][0]["lines"][0]["spans"][0]["size"]
+        assert abs(size - source_size) < 0.5, f"chữ phải giữ nguyên cỡ gốc: {size} vs {source_size}"
+        words = first.get_text("words") + second.get_text("words")
+        height = first.rect.height
+        assert all(word[1] >= 0 and word[3] <= height for word in words), (
+            "chữ không được rời khỏi trang"
+        )
+        assert not any("⟦" in word[4] for word in words), "token không được lộ lên trang"
+        assert "rất" in first.get_text() and "rất dài" in second.get_text(), (
+            "chữ phải liền mạch qua hai trang, không mất chữ"
+        )
+
+
+def test_spilling_blocks_share_one_overleaf_page(tmp_path, unicode_font):
+    """Hai block cùng tràn vào **một** trang chèn dùng chung, không phải mỗi
+    block một trang gần như trống — 48 trang như vậy từng làm cuốn 69 trang
+    thành 117.
+
+    Đồng thời đó là test hồi quy cho refetch: sau khi block đầu tràn, block thứ
+    hai vẫn phải in trên **trang nguồn** (index của trang nguồn không dịch chuyển
+    khi trang chèn được thêm vào), ngược với bản cũ refetch lấy ngay trang chèn
+    cuối và để một lỗ trống trên trang nguồn.
+    """
+    import pymupdf
+    from pdfdoc import write_pdf
+
+    # Đoạn phải wrap qua vài dòng: extractor tách block theo khoảng cách dòng,
+    # và một đoạn đúng một dòng sẽ tự biến ước lượng đó thành norm (xem pdfdoc).
+    _PARA_ONE = (
+        "Alpha first paragraph wraps over several lines in the source, which "
+        "is what marks it as its own block for the extractor to read."
     )
-    assert not any("⟦" in word[4] for word in words)
+    _PARA_TWO = (
+        "Beta second paragraph also wraps over several lines in the source, "
+        "so the blank line between the two is clearly larger than the norm."
+    )
+
+    src = write_pdf(tmp_path / "in.pdf", f"{_PARA_ONE}\n\n{_PARA_TWO}\n")
+    doc = load_document(src)
+    assert len(doc.blocks) == 2, "cần đúng hai block trên một trang nguồn"
+    texts = {0: "Alpha mở rộng " + "lời " * 80, 1: "Beta rất dài " + "câu " * 600}
+    stats = rebuild_pdf(src, doc, texts, tmp_path / "out.pdf", font_path=unicode_font)
+
+    assert stats.failures == []
+    assert stats.continued == 1, "hai block tràn phải dùng chung một trang chèn"
+    with pymupdf.open(tmp_path / "out.pdf") as rebuilt:
+        assert rebuilt.page_count == stats.pages == 2, "chỉ thêm một trang chèn"
+        source_text = rebuilt[0].get_text()
+        cont_text = rebuilt[1].get_text()
+        assert "Beta" in source_text, "block dưới phải in trên trang nguồn sau khi block đầu tràn"
+        assert "Alpha" in source_text, "đầu block đầu vẫn ở trang nguồn"
+        # Hai tail xếp chồng theo thứ tự block trên cột chèn dùng chung.
+        assert "lời" in cont_text and "câu" in cont_text, "cả hai tail phải có mặt trên trang chèn"
+        assert cont_text.index("lời") < cont_text.index("câu"), (
+            "tail phải giữ đúng thứ tự block"
+        )

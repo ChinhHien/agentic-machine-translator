@@ -19,7 +19,8 @@ skills/**/session_*.json
 !README.md
 !docs/**/*.md
 *.pdf
-
+.tmp-webui
 .superpowers/
 output/
 input/
+%SystemDrive%/

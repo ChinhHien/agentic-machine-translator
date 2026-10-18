@@ -31,6 +31,15 @@ This extractor reads the PDF's own typography instead of guessing:
 * **headings and running heads are told apart** by the page number: a line is a
   running head when it *is* a page number or ends/starts with one, so a section
   title sitting in the margin band survives as a heading;
+* the **bottom band** is the running foot (the folio), and a line there that is
+  *nothing but* a page number is dropped like a running head — it is furniture
+  repeated on every page, and left in the flow it glues itself to the first line
+  of the next page: the next page's first line is above this page's last one in
+  its own coordinates, so the gap between them reads as no gap at all. The block
+  that came out of that pair owned only the folio's rectangle, a few points wide;
+* a **page break** is therefore a text question, not a geometric one: the page's
+  last line and the next page's first are one paragraph only when the sentence
+  reads on (no full stop, and the new line starts mid-sentence);
 * both **font-size thresholds are derived from the document**, since the size
   that means "heading" differs by typesetter (see :func:`_font_thresholds`);
 * **paragraph breaks** are the vertical gaps that are clearly larger than the
@@ -61,6 +70,7 @@ import unicodedata
 from collections import Counter
 from collections.abc import Iterable
 from dataclasses import dataclass
+from functools import lru_cache
 from typing import Any
 
 from loguru import logger
@@ -108,13 +118,36 @@ _HEADER_BAND = 110.0
 #: inside them ("Windows Server 2016 / 2019 / 2022").
 _MAX_HEAD_CHARS = 60
 
+#: Fraction of the page height that may hold a running foot — the *folio*, the
+#: page number set below the text block. The symmetric band to
+#: `_HEADER_BAND_RATIO`, and a fraction for the same reason: 52 pt is a twelfth
+#: of a book page but a quarter of a landscape sheet, so a fixed band cannot
+#: serve both.
+_FOOTER_BAND_RATIO = 0.08
+
 #: A standalone page-number token: arabic digits or a roman numeral.
 _PAGE_NUM_RE = re.compile(r"(?<![\w.])(?:\d{1,4}|[IVXLCDM]{1,7})(?![\w.])", re.IGNORECASE)
 _PAGE_NUM_ONLY_RE = re.compile(r"(?:\d{1,4}|[IVXLCDM]{1,7})", re.IGNORECASE)
 
+#: A line that ends here ends a paragraph. Used where the *geometry* of a break
+#: says nothing: the page's last line to the next page's first.
+_SENTENCE_END = ".!?:;…"
 #: Vertical gap (as a multiple of the page's line spacing) that breaks a
 #: paragraph.
 _PARAGRAPH_GAP = 1.35
+
+#: Two gaps within this many points of each other are the same rhythm: a page's
+#: leading is one measurement repeated, so near-equal values are the same run of
+#: lines jittered by the PDF's own rounding rather than two different rhythms.
+_GAP_TOLERANCE = 1.0
+
+#: A figure's own label is set this many points *below* the page's body size, and
+#: is no wider than this share of the page's text block. Both tests are needed: a
+#: smaller face alone is also a footnote or a caption, and a narrow line alone is
+#: also the last line of a paragraph — which sits right *at* the body size, and is
+#: what the size test keeps out.
+_LABEL_SIZE_STEP = 0.8
+_LABEL_WIDTH_SHARE = 0.45
 
 #: Bullet glyphs: unmapped PDF bullets plus real bullet characters.  A dash or
 #: asterisk only counts when a space follows it, so a wrapped line is not
@@ -431,6 +464,7 @@ class _RawLine:
         "font",
         "italic",
         "kind",
+        "label",
         "level",
         "page",
         "size",
@@ -463,6 +497,11 @@ class _RawLine:
         self.page = page
         self.top = top
         self.kind = kind  # heading | code | body | bullet | numbered | header
+        #: True when this line is a figure's own label, not prose: set smaller
+        #: and narrower than the page's body text (see :func:`_mark_labels`).
+        #: The kind is left alone, so a label is still translated and printed as
+        #: the body line it is; the flag only keeps it out of a paragraph.
+        self.label = False
         self.level = level
         self.text = text
         self.x0 = x0
@@ -560,6 +599,23 @@ def _header_band(page: Any) -> float:
     return _HEADER_BAND_RATIO * height
 
 
+def _footer_band(page: Any) -> float:
+    """The *y* below which a line is in the page's foot, in points.
+
+    A threshold, not a height: the band is measured from the page's bottom edge
+    and compared against a line's ``top`` (PDF coordinates run downwards).
+    ``inf`` when the page reports no height, so nothing is taken for a running
+    foot and every content line of a page we cannot measure is kept.
+    """
+    try:
+        height = float(getattr(page, "height", 0.0) or 0.0)
+    except (TypeError, ValueError):
+        height = 0.0
+    if height <= 0:
+        return float("inf")
+    return height * (1.0 - _FOOTER_BAND_RATIO)
+
+
 def _looks_like_running_head(text: str) -> bool:
     """True when a top-of-page line is a running head rather than content.
 
@@ -584,6 +640,7 @@ def _classify(
     line: dict[str, Any],
     *,
     header_band: float = _HEADER_BAND,
+    footer_band: float = float("inf"),
     heading_min: float = _HEADING_SIZE,
     h1_min: float = _H1_SIZE,
 ) -> _RawLine | None:
@@ -623,6 +680,18 @@ def _classify(
 
     if top < header_band and _looks_like_running_head(text):
         return raw("header", 0, text, 0.0, 0.0)
+
+    # The page's own folio, dropped the way a running head is. Leaving it in the
+    # flow is what makes a block that carries half of *this* page and half of the
+    # next: the first line of the next page is above the last line of this one in
+    # its own coordinates, so the gap test reads the folio and that line as one
+    # paragraph — and the pair then owns only the folio's rectangle, a sliver a
+    # few points wide, which is a page of one letter per line once it is rebuilt.
+    # The rule is deliberately narrower than the head's: a foot that carries
+    # words as well as its number is something the reader can see, and dropping
+    # it would lose those words. A bare number below the text block is furniture.
+    if top >= footer_band and _PAGE_NUM_ONLY_RE.fullmatch(text):
+        return raw("footer", 0, text, 0.0, 0.0)
 
     mono = sum(1 for c in chars if _is_mono(_font_of(c)))
     if mono / len(chars) >= _CODE_RATIO:
@@ -668,16 +737,19 @@ def _text_lines(page: Any) -> list[dict[str, Any]]:
     return list(page.extract_text_lines(layout=False))
 
 
-def _font_thresholds(pages: list[Any]) -> tuple[float, float]:
-    """``(heading_min, h1_min)`` derived from the document's own font sizes.
+def _font_thresholds(pages: list[Any]) -> tuple[float, float, float]:
+    """``(heading_min, h1_min, body)`` from the document's own font sizes.
 
     The body size is the size most lines are set in; a heading is a couple of
     points larger. Deriving it beats a constant: a book may set headings at
     15 pt while this specification uses 14 pt over a 10 pt body, so any single
-    threshold either loses one document's headings or invents the other's.
+    threshold either loses one document's headings or invents the other's. The
+    body size is read for the same reason — it is what a figure's labels are
+    judged smaller *than* (see :func:`_mark_labels`).
 
     Returns the fallback constants when the document is too small to have a
-    meaningful distribution (short documents, unit-test stubs).
+    meaningful distribution (short documents, unit-test stubs); ``body`` is then
+    ``0.0``, which tells the caller to measure each page on its own.
     """
     sizes: Counter[float] = Counter()
     for page in pages:
@@ -687,10 +759,10 @@ def _font_thresholds(pages: list[Any]) -> tuple[float, float]:
                 continue
             sizes[round(max(float(c["size"]) for c in chars), 1)] += 1
     if sum(sizes.values()) < _MIN_SIZE_SAMPLE or len(sizes) < 2:
-        return _HEADING_SIZE, _H1_SIZE
+        return _HEADING_SIZE, _H1_SIZE, 0.0
     body = sizes.most_common(1)[0][0]
     heading_min = body + _HEADING_STEP
-    return heading_min, max(body * 1.9, heading_min + 4.0)
+    return heading_min, max(body * 1.9, heading_min + 4.0), body
 
 
 #: One cell's own box: ``(x0, top, x1, bottom)``, same frame as :data:`Rect`.
@@ -814,7 +886,7 @@ def _cell_entry(lines: list[_RawLine], box: Cell | None) -> list | None:
     inside = [
         line
         for line in lines
-        if line.kind not in {"table", "header"}
+        if line.kind not in {"table", "header", "footer"}
         and x0 <= (line.x0 + line.x1) / 2 <= x1
         and top <= line.top <= bottom
     ]
@@ -882,12 +954,14 @@ def _page_lines(
     a row is emitted once, as a row, instead of being flattened into prose.
     """
     header_band = _header_band(page)
+    footer_band = _footer_band(page)
     lines: list[_RawLine] = []
     for line in _text_lines(page):
         classified = _classify(
             page_no,
             line,
             header_band=header_band,
+            footer_band=footer_band,
             heading_min=heading_min,
             h1_min=h1_min,
         )
@@ -930,23 +1004,123 @@ def _line_spacing(lines: list[_RawLine]) -> float:
     """Typical vertical gap between consecutive content lines of a page.
 
     Used as the yardstick for "this gap is a paragraph break": a TeX page has a
-    uniform leading (15.2 pt here) and paragraph skips are clearly larger. The
-    *lower quartile* is the estimator, not the median — on a page whose lines
-    are mostly paragraph starts the median would drift up towards the paragraph
-    gap and stop recognising breaks.
+    uniform leading (15.2 pt here) and paragraph skips are clearly larger.
+
+    The yardstick is the gap that *repeats* — a page of prose measures its
+    leading over and over, so the value the most lines share is that leading.
+    The lower quartile was the old answer, and a scatter of gaps that happen to
+    be small (3.1, 6.4, 8.2 pt on one page of the book this was written against)
+    dragged it *below* the real leading; since a break is "more than 1.35 x the
+    yardstick", every line of every real paragraph then read as a fresh one.
+
+    Only the lines set in the page's own body size are asked, because a figure's
+    labels are set smaller and tighter, and on a diagram page they can outnumber
+    the prose outright: page 11 gives eleven 8.45 pt gaps between 7.2 pt labels
+    against twelve 11.96 pt gaps between 10 pt prose lines. Counting every gap
+    hands back the labels' rhythm there; the prose's own is what the paragraphs
+    are measured against, so the body size decides which gaps are asked.
     """
-    tops = [ln.top for ln in lines if ln.kind not in {"header", "table"}]
-    deltas = sorted(b - a for a, b in itertools.pairwise(tops) if 0 < b - a < 60)
+    content = [ln for ln in lines if ln.kind not in {"header", "table"}]
+    if not content:
+        return 0.0
+    # The size most of the page is set in: its body text, not a figure's labels.
+    body_size = Counter(round(ln.size, 1) for ln in content).most_common(1)[0][0]
+    deltas = _gap_deltas(content, body_size)
+    if len(deltas) < 2:
+        # Too few body-sized lines to trust (a title page, a plate of figures):
+        # every gap there is, which is what the page has to offer.
+        deltas = _gap_deltas(content, None)
     if not deltas:
         return 0.0
-    if len(deltas) == 1:
-        return deltas[0]
-    return statistics.quantiles(deltas, n=4)[0]
+    runs = _gap_runs(deltas)
+    # The tallest run wins, and the smaller value breaks a tie: a page of
+    # paragraphs can repeat its paragraph gap as often as its leading, and the
+    # yardstick has to stay on the leading's side of the break.
+    repeated = max(runs, key=lambda run: (len(run), -statistics.median(run)))
+    return statistics.median(repeated)
+
+
+def _gap_deltas(content: list[_RawLine], size: float | None) -> list[float]:
+    """Sorted gaps between consecutive lines, optionally only *size* ones.
+
+    Both ends of a gap have to be set at *size*, so a gap to a heading or a
+    caption is not counted as part of the body rhythm. ``None`` asks for every
+    gap: the fallback for a page with too few body-sized lines to measure.
+    """
+    return sorted(
+        b.top - a.top
+        for a, b in itertools.pairwise(content)
+        if 0 < b.top - a.top < 60
+        and (size is None or (round(a.size, 1) == size and round(b.size, 1) == size))
+    )
+
+
+def _gap_runs(deltas: list[float]) -> list[list[float]]:
+    """Split sorted *deltas* into runs of near-equal values, smallest first.
+
+    A run is chained from its own first value, so it cannot drift arbitrarily
+    wide: 12.0, 12.9 and 13.8 are two rhythms, not one.
+    """
+    runs: list[list[float]] = [[deltas[0]]]
+    for delta in deltas[1:]:
+        if delta - runs[-1][0] <= _GAP_TOLERANCE:
+            runs[-1].append(delta)
+        else:
+            runs.append([delta])
+    return runs
+
+
+def _mark_labels(classified: list[tuple[int, _RawLine]], body_size: float) -> None:
+    """Flag every line that is a figure's own label rather than prose.
+
+    Labels are not prose. Their gaps are the figure's own spacing, so a run of
+    them reads as one paragraph that owns a scatter of rectangles — and the
+    rebuilt PDF then prints one translation across the whole scatter (see
+    :func:`bind_page_geometry`). Kept as a flag rather than a kind, a label is
+    still translated and printed as the body line it is; only the block boundary
+    changes, and :func:`_is_new_block` reads the flag.
+
+    The page's text block is the widest line on it, so what counts as *narrow*
+    is this page's own measure rather than a number of points. And a line that
+    reads on from the one above it is a *continuation*, never a label: this is
+    what keeps a note set in the same small type whole — its last line is short
+    and narrow like a label, and only the fact that its sentence started on the
+    line above tells the two apart. A note whose wrapped line stops at a URL or
+    a proper name ends mid-sentence without ending a *sentence*, so the line
+    that follows it is a continuation just as plainly, whichever letter it
+    happens to open with.
+    """
+    for _page_no, group in itertools.groupby(classified, key=lambda item: item[0]):
+        lines = [ln for _, ln in group]
+        column = max((ln.x1 - ln.x0 for ln in lines if ln.kind != "table"), default=0.0)
+        page_body = body_size or _dominant_size(lines)
+        if column <= 0 or page_body <= 0:
+            continue
+        previous = ""
+        wrapped = False  # the line above is a wide small line left mid-sentence
+        for ln in lines:
+            small = ln.kind in {"body", "bullet", "numbered"} and (
+                page_body - ln.size >= _LABEL_SIZE_STEP
+            )
+            narrow = ln.x1 - ln.x0 <= column * _LABEL_WIDTH_SHARE
+            ln.label = small and narrow and not (wrapped or _reads_on(previous, ln.text))
+            previous = ln.text.rstrip()
+            wrapped = bool(previous) and small and not narrow and previous[-1] not in _SENTENCE_END
+
+
+def _dominant_size(lines: list[_RawLine]) -> float:
+    """The size most of *lines* are set in: the page's own body text."""
+    sizes = Counter(round(ln.size, 1) for ln in lines if ln.kind != "table")
+    return sizes.most_common(1)[0][0] if sizes else 0.0
 
 
 def _is_new_block(prev: _RawLine | None, cur: _RawLine, spacing: float) -> bool:
     """True when *cur* starts a fresh paragraph/block rather than continuing."""
     if prev is None:
+        return True
+    if cur.label or prev.label:
+        # A figure's label is a block of its own, at both ends: it must not be
+        # swept into the paragraph above it, and prose must not be swept into it.
         return True
     if prev.kind != cur.kind and {prev.kind, cur.kind} & {"heading", "code"}:
         return True
@@ -954,9 +1128,66 @@ def _is_new_block(prev: _RawLine | None, cur: _RawLine, spacing: float) -> bool:
         return True
     if prev.kind == "toc" or cur.kind == "toc":
         return True  # a table of contents is one entry per line
+    if _label_chain_break(prev, cur):
+        # A run of lines that each open with a bold, colon-terminated label
+        # ("Project Title: ...", "Student ID: ...") is one field per line, not
+        # a wrapped paragraph: a title page sets its fields at the same even
+        # leading as prose wraps, so the spacing cannot tell them apart, and
+        # the trailing "short line" signal cannot either (the last line of a
+        # wrapped paragraph is short just as often). A leading bold label is
+        # what a wrapped continuation never carries.
+        return True
+    if prev.page != cur.page:
+        return not _reads_on(prev.text, cur.text)
     if spacing <= 0:
         return False
     return (cur.top - prev.top) > _PARAGRAPH_GAP * spacing
+
+
+def _leading_label(line: _RawLine) -> str:
+    """The line's leading bold label (its text without the colon), or ``''``.
+
+    A label is a bold run that *ends* on a colon -- "Project Title:" before
+    regular-weight text. A title bold from first character to last carries no
+    such mark, so a heading-like line never reads as a field, and a line whose
+    first run is regular reports nothing either.
+    """
+    for text, bold, _italic in line.spans:
+        stripped = text.strip()
+        if not stripped:
+            continue
+        if not bold:
+            return ""
+        if stripped == stripped.rstrip(":："):
+            return ""  # bold but uncolonned: a title or term, not a field label
+        return stripped.rstrip(":：")
+    return ""
+
+
+def _label_chain_break(prev: _RawLine, cur: _RawLine) -> bool:
+    """True when *cur* opens a new field line right after another one.
+
+    Both lines must carry a label: a lone labelled line before prose is a
+    definition line whose own text may read on into the paragraph below it,
+    but two labelled lines in a row are two fields -- a wrapped continuation
+    never opens with a bold label of its own.
+    """
+    return bool(_leading_label(prev)) and bool(_leading_label(cur))
+
+
+def _reads_on(prev_text: str, cur_text: str) -> bool:
+    """True when *cur_text* reads as the rest of *prev_text*'s paragraph.
+
+    Asked only where the geometry cannot answer — across a page break — and on
+    the evidence a reader uses: the line before it did not end a sentence, and
+    the new line continues that sentence instead of opening a new one (a
+    capital), a heading or a list item.
+    """
+    body = (prev_text or "").rstrip()
+    if not body or body[-1] in _SENTENCE_END:
+        return False
+    head = (cur_text or "").lstrip()[:1]
+    return bool(head) and head.islower()
 
 
 def _join_wrapped(parts: list[str]) -> str:
@@ -1044,12 +1275,13 @@ def _build_units(pages: list[Any]) -> list[_Unit]:
     their rectangles, so the pages are grouped exactly once — there is no second
     classifier that could disagree about where a translated block belongs.
     """
-    heading_min, h1_min = _font_thresholds(pages)
+    heading_min, h1_min, body_size = _font_thresholds(pages)
     classified = [
         (page_no, ln)
         for page_no, page in enumerate(pages)
         for ln in _page_lines(page, page_no, heading_min=heading_min, h1_min=h1_min)
     ]
+    _mark_labels(classified, body_size)
     spacing_by_page = {
         page_no: _line_spacing([ln for pg, ln in classified if pg == page_no])
         for page_no in {pg for pg, _ in classified}
@@ -1061,7 +1293,12 @@ def _build_units(pages: list[Any]) -> list[_Unit]:
     pending_kind = "body"
     code_run: list[_RawLine] = []
     prev: _RawLine | None = None
-    last_heading: tuple[int, str] | None = None
+    #: (level, page) of the heading emitted last, for the two-line title merge
+    #: below. The page is part of it: a part title at the top of one page and a
+    #: chapter title at the top of the next are two headings, not one title
+    #: wrapped over two lines — and with the page's folio no longer sitting
+    #: between them, nothing else tells them apart.
+    last_heading: tuple[int, int] | None = None
 
     def flush() -> None:
         nonlocal pending, pending_kind
@@ -1102,7 +1339,7 @@ def _build_units(pages: list[Any]) -> list[_Unit]:
         return unit
 
     for page_no, ln in classified:
-        if ln.kind == "header":
+        if ln.kind in {"header", "footer"}:
             continue
         spacing = spacing_by_page.get(page_no, 0.0) or 15.0
 
@@ -1120,6 +1357,7 @@ def _build_units(pages: list[Any]) -> list[_Unit]:
             if (
                 last_heading
                 and last_heading[0] == ln.level
+                and last_heading[1] == page_no
                 and units
                 and units[-1].kind == "heading"
             ):
@@ -1128,7 +1366,7 @@ def _build_units(pages: list[Any]) -> list[_Unit]:
                 units[-1].take([ln])
             else:
                 emit("heading", "#" * ln.level + " " + ln.text, level=ln.level).take([ln])
-            last_heading = (ln.level, ln.text)
+            last_heading = (ln.level, page_no)
             prev = ln
             continue
 
@@ -1191,60 +1429,119 @@ def pages_to_markdown(pages: list[Any]) -> str:
 #: A shielded code block survives the Markdown parse as this placeholder.
 _CODE_PLACEHOLDER_RE = re.compile(r"^⟦CODE_\d+⟧$")
 
+#: The key every code block compares equal to. Code is never translated, and a
+#: placeholder's number is local to one parse, so two code blocks are told apart
+#: by their order, never by their text.
+_CODE_KEY = "\x00code"
 
-def _units_for_block(units: list[_Unit], index: int, block: Any) -> int | None:
-    """How many units at *index* make up *block*, or ``None`` when unsure.
+#: How far ahead of the cursor a block's own units may lie. A unit the Markdown
+#: parser folds into a neighbouring block (a numbered line cannot open a list in
+#: the middle of a paragraph, so it becomes that paragraph's next line) is
+#: skipped, and the block after it still owns the units that follow.
+_BIND_WINDOW = 24
 
-    The blocks come from parsing the Markdown rendered from these very units, so
-    they line up in order: a list block owns one unit per item, a heading owns
-    one heading unit, and so on. Answering ``None`` instead of guessing keeps one
-    surprise from shifting every later block's geometry onto the wrong lines.
+#: Most units one block can own. A list block owns one unit per item — the one
+#: place where a block is much longer than a unit.
+_BIND_MAX_SPAN = 64
+
+#: Whitespace and table pipes carry no identity: the Markdown parse re-wraps
+#: lines and rebuilds the matrix, so both sides are compared without them.
+_KEY_SPACE_RE = re.compile(r"\s+")
+
+
+def _plain_key(text: str) -> str:
+    """The comparable form of *text*: no whitespace, no pipes, no case."""
+    return _KEY_SPACE_RE.sub("", (text or "").replace("|", "")).lower()
+
+
+def _parsed_key(block: Any) -> str:
+    """The key of a *parsed* block, on either side of the comparison.
+
+    Both the units and the document's blocks go through the same Markdown
+    parse, so equal keys mean the same source text — not the same raw bytes.
     """
-    if index >= len(units):
-        return None
-    first = units[index]
+    if block.kind == "code" or _CODE_PLACEHOLDER_RE.match(block.text.strip()):
+        return _CODE_KEY
     if block.kind == "list":
-        span = max(1, len(block.meta.get("items") or []))
-        window = units[index : index + span]
-        if len(window) == span and all(unit.kind == "list" for unit in window):
-            return span
-        return 1 if first.kind == "list" else None
-    if block.kind == "heading":
-        return 1 if first.kind == "heading" else None
-    if _CODE_PLACEHOLDER_RE.match(block.text.strip()):
-        return 1 if first.kind == "code" else None
-    if block.meta.get("table"):
-        return 1 if first.kind == "table" else None
-    return 1 if first.kind in {"body", "toc"} else None
+        return _plain_key(" ".join(block.meta.get("items") or [block.text]))
+    return _plain_key(block.text)
+
+
+@lru_cache(maxsize=4096)
+def _unit_key(text: str, kind: str) -> str:
+    """What one unit contributes to the block it is part of.
+
+    The unit's own text is put through the parse the whole document went
+    through, so an emphasised run, an escaped character or a line markdown-it
+    reads as HTML cannot make the two sides look different: the comparison is
+    between two parse results rather than between a parse result and raw text.
+    """
+    if kind == "code":
+        return _CODE_KEY
+    parsed = parse_markdown(normalize_toc_lines(text), source_format="pdf")
+    return "".join(_parsed_key(block) for block in parsed.blocks)
+
+
+def _units_for_block(
+    units: list[_Unit], keys: list[str], cursor: int, block: Any
+) -> tuple[int, int] | None:
+    """``(start, span)`` of the units that produced *block*, or ``None``.
+
+    The match is *verified*: the units' own keys must concatenate to the
+    block's key exactly, so a block is never bound to geometry that belongs to a
+    different one. Finding nothing answers ``None`` — the block then keeps its
+    source text — and, because the cursor only ever moves over units that were
+    verified, that answer cannot drag the blocks after it onto other lines.
+    """
+    target = _parsed_key(block)
+    if not target:
+        return None
+    limit = len(target) + 1
+    for start in range(cursor, min(cursor + _BIND_WINDOW, len(units))):
+        accum = ""
+        for span in range(1, _BIND_MAX_SPAN + 1):
+            end = start + span
+            if end > len(units):
+                break
+            accum += keys[end - 1]
+            if accum == target:
+                return start, span
+            if len(accum) > limit:
+                break
+    return None
 
 
 def bind_page_geometry(doc: Document, units: list[_Unit]) -> int:
     """Attach each block's source rectangles as ``block.meta["pdf"]``.
 
-    Returns how many blocks were bound. A block left unbound is simply not
-    rebuilt (its source text stays), which is the honest outcome: a mis-bound
-    rectangle would print the translation over the wrong lines.
+    Every block is matched to the units it was *parsed from*, by text (see
+    :func:`_units_for_block`), instead of walking both lists in step. The units
+    come from the layout extractor and the blocks from the Markdown parser, so
+    one disagreement about where a unit ends and the next begins used to shift
+    every later block's geometry — and a block of prose bound to one line of a
+    page six pages on is a page of tiny type printed over the wrong text.
+
+    A block that cannot be verified is not rebuilt at all (its source text
+    stays), which is the honest outcome: a mis-bound rectangle would print the
+    translation over the wrong lines. Returns how many blocks were bound.
     """
-    index = 0
+    keys = [_unit_key(unit.text, unit.kind) for unit in units]
+    cursor = 0
     bound = 0
     for block in doc.blocks:
-        span = _units_for_block(units, index, block)
-        if span is None:
-            # A unit the Markdown parser folded into a neighbouring block is
-            # skipped, not mis-assigned, so the blocks after it stay aligned.
-            for ahead in range(1, 4):
-                span = _units_for_block(units, index + ahead, block)
-                if span is not None:
-                    logger.debug(
-                        "PDF geometry: skipped {} unmatched unit(s) before {!r}",
-                        ahead,
-                        block.text[:40],
-                    )
-                    index += ahead
-                    break
-        if span is None:
+        found = _units_for_block(units, keys, cursor, block)
+        if found is None:
             logger.debug("PDF geometry: no unit for block {!r}", block.text[:40])
             continue
+        index, span = found
+        if index > cursor:
+            # A unit the Markdown parser folded into a neighbouring block is
+            # skipped, not mis-assigned, so the blocks after it stay aligned.
+            logger.debug(
+                "PDF geometry: skipped {} unmatched unit(s) before {!r}",
+                index - cursor,
+                block.text[:40],
+            )
         owned = units[index : index + span]
         markers = [mark for unit in owned for mark in unit.markers if mark]
         geometry: dict[str, Any] = {
@@ -1265,7 +1562,7 @@ def bind_page_geometry(doc: Document, units: list[_Unit]) -> int:
         if owned[0].kind == "table" and owned[0].cells:
             geometry["cells"] = owned[0].cells
         block.meta["pdf"] = geometry
-        index += span
+        cursor = index + span
         bound += 1
     if bound != len(doc.blocks):
         logger.warning(

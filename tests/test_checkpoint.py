@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from pathlib import Path
+
 import pytest
 
 from polyglot_lc.llm.client import TokenUsage, clear_mock_replies
@@ -90,6 +92,26 @@ def test_doc_key_changes_when_the_job_changes(tmp_path):
     assert base != _key(path)  # edited document
 
 
+def test_doc_key_ignores_a_rewrite_that_changes_no_bytes(tmp_path):
+    """Re-uploading a document must not orphan chunks that are still valid.
+
+    The web UI writes a file the reader picked up again — same name, same
+    bytes — and that write lands a fresh ``mtime`` on it. Keyed on
+    ``size:mtime``, that alone minted a new key, so "Tiếp tục" matched nothing
+    and translated the whole document again from its first chunk.
+    """
+    import os
+
+    path = _write(tmp_path)
+    base = _key(path)
+
+    os.utime(path, (9_000_000_000, 9_000_000_000))  # same bytes, other mtime
+    assert _key(path) == base
+
+    path.write_bytes(path.read_bytes() + b"\n")  # a real edit still counts
+    assert _key(path) != base
+
+
 # -------------------------------- end to end --------------------------------
 def _run(path, **kw):
     from polyglot_lc.pipeline import TranslationPipeline
@@ -123,6 +145,96 @@ def test_resume_without_checkpoints_re_translates(mock_env, tmp_path):
     assert TokenUsage.snapshot()["calls"] > 0
 
 
+def test_the_resume_record_makes_a_replay_visible_early(mock_env, tmp_path):
+    """A resumed run's replayed chunks leave no per-chunk events in its own
+    log, so the web UI needs one early record carrying how many chunks are
+    being replayed and whether the store had anything to match — without it the
+    resumed run's progress bar reads 0/N and a checkpoint miss looks like a
+    silent start-over."""
+    import os
+
+    from polyglot_lc.pipeline import TranslationPipeline
+
+    os.environ["LOG_JSONL"] = "1"
+    clear_mock_replies()
+    path = _write(tmp_path)
+
+    os.environ["LOGS_DIR"] = str(tmp_path / "first")
+    first = TranslationPipeline(quiet=True).run(
+        path, src="en", tgt="vi", out=str(tmp_path / "a.md")
+    )
+    assert first.resumed_chunks == 0
+    log = _first_line_types(Path(first.log_path))
+    assert log and log["resume_requested"] is False
+
+    os.environ["LOGS_DIR"] = str(tmp_path / "second")
+    second = TranslationPipeline(quiet=True).run(
+        path, src="en", tgt="vi", out=str(tmp_path / "b.md"), resume=True
+    )
+    assert second.resumed_chunks == second.chunks
+    log = _first_line_types(Path(second.log_path))
+    assert log["resume_requested"] is True and log["resumed_chunks"] == second.chunks
+
+
+def _records_of(path, kind: str) -> list[dict]:
+    """Every record of one type, in the run's own log."""
+    import json
+
+    out = []
+    for line in path.read_text(encoding="utf-8").splitlines():
+        record = json.loads(line)
+        if record.get("type") == kind:
+            out.append(record)
+    return out
+
+
+def _first_line_types(path) -> dict:
+    """The run's own early `resume` record, read from its log."""
+    import json
+
+    for line in path.read_text(encoding="utf-8").splitlines():
+        record = json.loads(line)
+        if record.get("type") == "resume":
+            return record
+    raise AssertionError("no resume record in the run's log")
+
+
+def test_the_run_names_the_directory_its_chunks_are_written_to(mock_env, tmp_path, monkeypatch):
+    """The page shows the translation as it lands, out of the chunks' own files
+    on disk — and it cannot derive where those live, because the checkpoint
+    directory is the pipeline's configuration and the web UI is not allowed to
+    read that. So the run names its own directory, once, before the first chunk
+    is written; a run that keeps no checkpoints says nothing at all, which reads
+    as "there is nothing to watch".
+    """
+    monkeypatch.setenv("LOG_JSONL", "1")
+    monkeypatch.setenv("LOGS_DIR", str(tmp_path / "logs"))
+    monkeypatch.setenv("CHECKPOINT_DIR", str(tmp_path / "cp"))
+    clear_mock_replies()
+    path = _write(tmp_path)
+    out = tmp_path / "a.md"
+
+    result = _run(path, out=str(out))
+
+    named = _records_of(Path(result.log_path), "checkpoint")
+    assert len(named) == 1, "one attempt names its directory once"
+    directory = Path(named[0]["path"])
+    assert directory.is_dir() and named[0]["doc_key"] == directory.name
+    written = {item.stem for item in directory.glob("*.json") if item.name != "meta.json"}
+    assert written == {f"chunk-{index:03d}" for index in range(result.chunks)}
+
+
+def test_a_run_without_checkpoints_names_no_directory(mock_env, tmp_path, monkeypatch):
+    monkeypatch.setenv("CHECKPOINT_DIR", "off")
+    monkeypatch.setenv("LOG_JSONL", "1")
+    monkeypatch.setenv("LOGS_DIR", str(tmp_path / "logs"))
+    clear_mock_replies()
+
+    result = _run(_write(tmp_path), out=str(tmp_path / "a.md"))
+
+    assert _records_of(Path(result.log_path), "checkpoint") == []
+
+
 def test_editing_the_document_invalidates_checkpoints(mock_env, tmp_path):
     clear_mock_replies()
     path = _write(tmp_path)
@@ -133,6 +245,32 @@ def test_editing_the_document_invalidates_checkpoints(mock_env, tmp_path):
     again = _run(path, out=str(tmp_path / "b.md"), resume=True)
     assert again.resumed_chunks == 0
     assert TokenUsage.snapshot()["calls"] > 0
+
+
+def test_re_uploading_the_same_document_still_resumes_from_checkpoint(mock_env, tmp_path):
+    """The reader uploads a file they already uploaded, then presses "Tiếp tục".
+
+    Nothing about the document changed, so every finished chunk is still valid
+    and the resume must replay them instead of paying for the whole document
+    again. Only the file's ``mtime`` moved, and that is not the document.
+    """
+    import os
+
+    clear_mock_replies()
+    path = _write(tmp_path)
+    first = _run(path, out=str(tmp_path / "a.md"))
+    assert first.chunks >= 1 and first.resumed_chunks == 0
+
+    os.utime(path, (9_000_000_000, 9_000_000_000))  # the re-upload's only trace
+
+    TokenUsage.reset()
+    second = _run(path, out=str(tmp_path / "b.md"), resume=True)
+
+    assert second.resumed_chunks == second.chunks
+    assert TokenUsage.snapshot()["calls"] == 0  # nothing re-translated
+    assert (tmp_path / "a.md").read_text(encoding="utf-8") == (tmp_path / "b.md").read_text(
+        encoding="utf-8"
+    )
 
 
 def _chunks_of(path, max_tokens=15):
@@ -202,44 +340,152 @@ def test_a_crashed_run_resumes_the_chunks_it_finished(mock_env, tmp_path, monkey
     )
 
 
-def test_an_exhausted_rate_limit_costs_one_chunk_not_the_run(mock_env, tmp_path, monkeypatch):
-    """A 429 that survives every retry must not abort the whole run.
+def test_a_rate_limited_chunk_is_waited_out_not_left_behind(mock_env, tmp_path, monkeypatch):
+    """A 429 that survives every retry must not cost the chunk, or the run.
 
-    Provider failures are contained per chunk: the run finishes, the chunk's
-    place is marked in the output, and the failure is reported. A lost section
-    must not become a lost document.
+    The resilience layer has already spent its retries on the request by the
+    time a chunk fails, so the chunk waits for the provider to come back and is
+    run again — as often as it takes. The file a finished run writes holds the
+    chunk's translation and no placeholder, and the run reports done: what it
+    waited out is a problem in its log, not a lost section.
     """
+    import json
+
     from polyglot_lc.agents.context import extract_source
     from polyglot_lc.agents.translator import TranslatorAgent
     from polyglot_lc.llm.resilience import RateLimitError
 
     monkeypatch.setenv("MAX_CONCURRENCY", "1")  # deterministic chunk order
     monkeypatch.setenv("CHUNK_OVERLAP_TOKENS", "0")
+    monkeypatch.setenv("CHUNK_RETRY_BASE_DELAY", "0.01")  # the wait is not what is under test
+    monkeypatch.setenv("CHUNK_RETRY_MAX_DELAY", "0.02")
+    monkeypatch.setenv("LOG_JSONL", "1")
     clear_mock_replies()
     path = _write(tmp_path, DOC + "\nA third paragraph to translate as well.\n")
     chunks = _chunks_of(path)
     assert len(chunks) >= 3
     doomed = chunks[1].id
+    attempts = {"n": 0}
 
     def flaky_translate(self, prompt, chunk_id=""):
         if chunk_id == doomed:
-            raise RateLimitError(
-                "Error code: 429 - concurrency_limit_exceeded: Too many "
-                "concurrent requests (limit: 1)",
-                status=429,
-            )
+            attempts["n"] += 1
+            if attempts["n"] <= 5:  # more attempts than any request-level budget
+                raise RateLimitError(
+                    "Error code: 429 - concurrency_limit_exceeded: Too many "
+                    "concurrent requests (limit: 1)",
+                    status=429,
+                )
         return "T::" + extract_source(prompt)
 
     monkeypatch.setattr(TranslatorAgent, "translate", flaky_translate)
-    out = tmp_path / "one-chunk-lost.md"
+    out = tmp_path / "one-chunk-saved.md"
     result = _run(path, out=str(out), max_tokens=15)  # must not raise
 
     text = out.read_text(encoding="utf-8")
-    assert f"<!-- {doomed}: untranslated" in text
+    assert "untranslated" not in text
     for chunk in chunks:
-        if chunk.id != doomed:
-            assert "T::" + chunk.text in text
+        assert "T::" + chunk.text in text
+    # The chunk really was run again five times over: no ceiling at three.
+    assert attempts["n"] == 6
+    assert result.chunks_failed == 0
     assert any(doomed in error for error in result.errors), result.errors
+
+    records = [
+        json.loads(line) for line in Path(result.log_path).read_text(encoding="utf-8").splitlines()
+    ]
+    waits = [record for record in records if record.get("type") == "retry_wait"]
+    assert len(waits) == 5
+    assert {wait["chunk_id"] for wait in waits} == {doomed}
+    # The wait says where the chunk died and why it is waiting.
+    assert waits[0]["step"] == "translate"
+    assert "429" in waits[0]["error"]
+    # And the run's own verdict is about the file it wrote, not about the road.
+    end = [record for record in records if record.get("type") == "run_end"][-1]
+    assert (end["status"], end["exit_code"]) == ("done", 0)
+    assert end["chunks_failed"] == 0
+    assert end["chunk_retries"] == 5
+
+
+def test_an_interrupted_run_is_not_recorded_as_a_finished_one(mock_env, tmp_path, monkeypatch):
+    """Ctrl-C leaves no deliverable, so the run's own record says `failed`.
+
+    The verdict is about the file, and an interrupted run has none — the one
+    path that reaches the final record without any chunk having failed.
+    """
+    import json
+
+    from polyglot_lc.pipeline import TranslationPipeline
+
+    monkeypatch.setenv("LOG_JSONL", "1")
+    logs = tmp_path / "logs"
+    monkeypatch.setenv("LOGS_DIR", str(logs))
+
+    def interrupted(*args, **kwargs):
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(TranslationPipeline, "_run_inner", interrupted)
+    with pytest.raises(KeyboardInterrupt):
+        TranslationPipeline(quiet=True).run(_write(tmp_path), src="en", tgt="vi")
+
+    log = max(logs.glob("run_*.jsonl"))
+    records = [json.loads(line) for line in log.read_text(encoding="utf-8").splitlines()]
+    end = [record for record in records if record.get("type") == "run_end"][-1]
+    assert (end["status"], end["exit_code"]) == ("failed", 1)
+
+
+def test_a_chunk_whose_critic_failed_keeps_the_draft_it_paid_for(mock_env, tmp_path, monkeypatch):
+    """The words already bought are kept: a provider failure *after* the
+    translator must not send the chunk back to the translator.
+
+    The draft is the newest thing the run has, so a second attempt resumes from
+    it and re-runs only the step that failed. Translating the same chunk again
+    would bill one sentence twice — which is exactly what a resumed run of the
+    same document used to do.
+    """
+    from polyglot_lc.agents.context import extract_source
+    from polyglot_lc.agents.critic import CriticAgent
+    from polyglot_lc.agents.translator import TranslatorAgent
+    from polyglot_lc.llm.resilience import RateLimitError
+
+    monkeypatch.setenv("MAX_CONCURRENCY", "1")
+    monkeypatch.setenv("CHUNK_OVERLAP_TOKENS", "0")
+    monkeypatch.setenv("FAST_PATH_MAX_COMPLEXITY", "0")  # every chunk sees the Critic
+    monkeypatch.setenv("CHUNK_RETRY_BASE_DELAY", "0.01")
+    monkeypatch.setenv("CHUNK_RETRY_MAX_DELAY", "0.02")
+    clear_mock_replies()
+    path = _write(tmp_path, DOC + "\nA third paragraph to translate as well.\n")
+    chunks = _chunks_of(path)
+    assert len(chunks) >= 3
+
+    translations: list[str] = []
+
+    def counting_translate(self, prompt, chunk_id=""):
+        translations.append(chunk_id)
+        return "T::" + extract_source(prompt)
+
+    original_review = CriticAgent.review
+    calls = {"n": 0}
+
+    def flaky_review(self, *args, **kwargs):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise RateLimitError("429", status=429)
+        return original_review(self, *args, **kwargs)
+
+    monkeypatch.setattr(TranslatorAgent, "translate", counting_translate)
+    monkeypatch.setattr(CriticAgent, "review", flaky_review)
+
+    out = tmp_path / "kept-draft.md"
+    result = _run(path, out=str(out), max_tokens=15)
+
+    text = out.read_text(encoding="utf-8")
+    assert "untranslated" not in text
+    # Every chunk was translated exactly once, the one whose Critic failed
+    # included: that chunk resumed from the draft it already had.
+    assert sorted(translations) == sorted(chunk.id for chunk in chunks)
+    assert calls["n"] > len(chunks)  # the Critic ran again; the Translator did not
+    assert result.chunks_failed == 0
 
 
 def test_partial_output_is_written_while_chunks_are_pending(mock_env, tmp_path, monkeypatch):

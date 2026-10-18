@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import pathlib
 
 import pytest
 from rich.console import Console
@@ -70,6 +71,31 @@ def test_simpleui_quiet_suppresses_step_lines(tmp_path):
     assert console.file.getvalue().strip() == ""
     # events are still logged regardless of quiet mode
     assert next(iter(sink.tail(1))).step == "translate"
+
+
+def test_a_waiting_chunk_is_visible_on_both_surfaces(tmp_path):
+    """A run that waits minutes for a provider must not look like a hang.
+
+    The wait prints on the console and is written as a ``retry`` event: that
+    status is what keeps the chunk out of the web UI's "failed" state and
+    captions the progress bar.
+    """
+    import io
+
+    sink = EventSink(tmp_path, enabled=False)
+    console = Console(file=io.StringIO(), width=100, force_terminal=False)
+    ui = SimpleUI(sink, console=console, quiet=False)
+    ui.retry("verify", "chunk-014", "TransientError: timeout - waiting 40s, then attempt 3")
+
+    rendered = console.file.getvalue()
+    assert "Waiting: verify (chunk-014)" in rendered
+    assert "waiting 40s" in rendered
+    event = next(iter(sink.tail(1)))
+    assert (event.status, event.step, event.chunk_id) == ("retry", "verify", "chunk-014")
+    assert event.type == "retry_wait"
+    # A wait counts as a problem, so the run's own count reconciles with the
+    # ``retry`` lines a reader finds in its file.
+    assert sink.problem_count == 1
 
 
 def test_simpleui_set_stats_and_errors(tmp_path):
@@ -172,6 +198,34 @@ def test_a_run_id_minted_here_matches_the_web_ui_shape(tmp_path):
     assert re.fullmatch(r"\d{8}_\d{6}_[0-9a-f]{6}", sink.run_id)
 
 
+def test_a_resume_record_in_the_log_does_not_break_the_trace_reader(tmp_path):
+    """The pipeline's early `resume` record is an unknown kind to the trace
+    reader, which must treat it as a bare step and move on — not crash or
+    swallow the surrounding records."""
+    from polyglot_lc.ui.trace import read_trace
+
+    log = tmp_path / "run_20261012_015104_abc123.jsonl"
+    log.write_text(
+        json.dumps({"type": "run_start", "file": "doc.pdf", "chunks": 4})
+        + "\n"
+        + json.dumps(
+            {
+                "type": "resume",
+                "resume_requested": True,
+                "resumed_chunks": 3,
+                "checkpoint_usable": True,
+            }
+        )
+        + "\n"
+        + json.dumps({"type": "run_end", "status": "done", "exit_code": 0}),
+        encoding="utf-8",
+    )
+    trace = read_trace(log)
+    assert trace.run_id == "20261012_015104_abc123"
+    assert trace.malformed == 0
+    assert trace.ended is not None
+
+
 def test_simpleui_run_with_cached_metrics_does_not_break(tmp_path):
     TokenUsage.reset()
     TokenUsage.add(
@@ -180,3 +234,60 @@ def test_simpleui_run_with_cached_metrics_does_not_break(tmp_path):
     snap = TokenUsage.snapshot()
     assert snap["cached"] == 60
     TokenUsage.reset()
+
+
+def test_events_carry_api_call_concurrency_metrics(tmp_path):
+    """Web UI reads active API call concurrency from events, so step/retry events must carry it."""
+    from polyglot_lc.llm.client import _ActiveCalls
+
+    _ActiveCalls.reset()
+    TokenUsage.reset()
+    sink = EventSink(tmp_path, enabled=True)
+    ui = SimpleUI(sink, quiet=True)
+    _ActiveCalls.enter()
+    _ActiveCalls.enter()
+    _ActiveCalls.exit()
+    with ui.step("translate", "chunk-001"):
+        ui.retry("translate", "chunk-002", "waiting")
+    _ActiveCalls.exit()
+    _ActiveCalls.reset()
+
+    lines = [json.loads(l) for l in sink.path.read_text(encoding="utf-8").splitlines()]
+    starts = [line for line in lines if line.get("type") == "step_start"]
+    retries = [line for line in lines if line.get("type") == "retry_wait"]
+    assert starts and retries
+    for line in starts + retries:
+        assert "active_api_calls" in line and "max_active_api_calls" in line
+    assert starts[0]["active_api_calls"] == 1
+    assert starts[0]["max_active_api_calls"] == 2
+    assert retries[0]["active_api_calls"] == 1
+    assert retries[0]["max_active_api_calls"] == 2
+
+
+def test_webui_report_shows_api_call_concurrency():
+    app_js = pathlib.Path("webui/static/app.js").read_text(encoding="utf-8")
+    assert "Api calls" in app_js
+    assert "active_api_calls" in app_js and "max_active_api_calls" in app_js
+    assert "chưa đo được" in app_js
+    assert 'callWords.push(`${formatCount(peak)} luồng`)' in app_js or "cao nhất" in app_js
+
+
+def test_webui_log_lines_expand_and_collapse():
+    """Each history line folds to two lines and opens onto its event's fields."""
+    app_js = pathlib.Path("webui/static/app.js").read_text(encoding="utf-8")
+    app_css = pathlib.Path("webui/static/app.css").read_text(encoding="utf-8")
+    # A chevron per line, wired to aria-expanded, and the event kept on the entry.
+    assert "log-toggle" in app_js
+    assert 'toggle.setAttribute("aria-expanded"' in app_js
+    assert "event: event" in app_js
+    # The detail panel lists the event's own fields under Vietnamese labels.
+    assert "log-detail" in app_js and "logDetailRows" in app_js
+    assert "LOG_DETAIL_WORDS" in app_js
+    # Collapsed, the message is clamped to two lines; open, the chevron turns.
+    assert '-webkit-line-clamp: 2' in app_css
+    assert '.log-line[data-expanded="true"] .log-toggle { transform: rotate(90deg)' in app_css
+    # The narrow layout keeps the fold on the same row as the clock.
+    assert (
+        ".log-line { grid-template-columns: max-content max-content minmax(0, 1fr) max-content; }"
+        in app_css
+    )

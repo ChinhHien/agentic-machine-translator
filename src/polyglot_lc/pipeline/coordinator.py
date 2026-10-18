@@ -29,6 +29,7 @@ stage-by-stage contract and the request/latency measurements behind it.
 from __future__ import annotations
 
 import hashlib
+import threading
 import time
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -51,13 +52,14 @@ from polyglot_lc.agents import (
 from polyglot_lc.analysis import DocumentPlan, score_chunk
 from polyglot_lc.config import (
     ConfigError,
+    RetryConfig,
     get_agent_config,
     get_app_config,
     get_embed_config,
 )
 from polyglot_lc.ingest import load_document
-from polyglot_lc.llm.client import TokenUsage
-from polyglot_lc.llm.resilience import LLMError, RetryStats
+from polyglot_lc.llm.client import TokenUsage, active_api_calls
+from polyglot_lc.llm.resilience import LLMError, RetryStats, jittered_delay
 from polyglot_lc.orchestrator.graph import (
     GraphContext,
     make_chunk_graph,
@@ -91,6 +93,15 @@ from polyglot_lc.ui.events import EventSink
 from polyglot_lc.ui.simple import SimpleUI
 from polyglot_lc.ui.trace import plan_hash
 
+#: How often a chunk that is waiting to be run again checks whether the run was
+#: stopped, so an unbounded wait is still interruptible.
+_RETRY_TICK = 0.5
+
+#: Jitter on the chunk-level wait. Chunks that failed together during an outage
+#: must not come back in the same instant and collide again — the same reason the
+#: per-request backoff has jitter (see :mod:`polyglot_lc.llm.resilience`).
+_CHUNK_RETRY_JITTER = 0.2
+
 
 @dataclass
 class PipelineResult:
@@ -120,6 +131,9 @@ class PipelineResult:
     partial_output: bool = False
     elapsed_s: float = 0.0
     chunks_failed: int = 0
+    #: The error that ended the run, when it ended without finishing. Empty for
+    #: a run that finished, however many provider failures it had to wait out.
+    fatal_error: str = ""
     #: PDF rebuild detail, carried out of the run so the final record can report it.
     pdf_kept: int = 0
     pdf_failures: list[str] = field(default_factory=list)
@@ -180,6 +194,9 @@ class TranslationPipeline:
         # end up naming the same run.
         self.sink = EventSink(self.app.logs_dir, enabled=self.app.log_jsonl, run_id=run_id)
         self.run_id = self.sink.run_id
+        #: Set when the run is interrupted; a chunk that is waiting for its next
+        #: attempt checks it and gives up the wait instead of holding the run.
+        self._stop = threading.Event()
 
     # ------------------------------------------------------------------
     def run(
@@ -218,11 +235,20 @@ class TranslationPipeline:
             except ConfigError as exc:
                 ui.add_error(str(exc))
                 result.errors = list(ui.errors)
+                result.fatal_error = str(exc)
                 logger.error("Config error: {}", exc)
                 raise
             except Exception as exc:
                 ui.add_error(f"{type(exc).__name__}: {exc}")
                 result.errors = list(ui.errors)
+                result.fatal_error = f"{type(exc).__name__}: {exc}"
+                raise
+            except BaseException as exc:
+                # Ctrl-C, or a run cut short by its launcher: no deliverable was
+                # finished, and the record has to say so. It is the one path that
+                # reaches the final record without a chunk having failed.
+                result.errors = result.errors or list(ui.errors)
+                result.fatal_error = f"{type(exc).__name__}: {exc}"
                 raise
             finally:
                 # Retries come from the resilience layer's own counters, which
@@ -233,10 +259,10 @@ class TranslationPipeline:
                 # Written from the `finally` so a run that raised still leaves a
                 # record of how it ended — that is the run most worth reading.
                 self._record_run_end(result, stats, round((time.monotonic() - started) * 1000))
-                # A chunk abandoned after provider errors (an exhausted rate
-                # limit) does not raise: the run continues and its place in the
-                # output is marked. The report still has to carry it, or a lost
-                # section looks like a clean run.
+                # Every provider failure this run had to wait out is in the
+                # report, including the ones a later attempt resolved: the file
+                # is finished, and what it cost to finish it is the reader's to
+                # see.
                 result.errors = result.errors or list(ui.errors)
 
     def _record_run_end(
@@ -249,6 +275,11 @@ class TranslationPipeline:
         this class has been accumulating alongside them.
         """
         usage = TokenUsage.snapshot()
+        # "Failed" is a verdict on the deliverable, not on the road to it: a run
+        # that waited out a provider outage and translated every chunk is done.
+        # It reads as failed only when a chunk has no translation or the run
+        # stopped on an error. Its problems are still counted below.
+        failed = bool(result.chunks_failed or result.fatal_error)
         artifacts: list[dict[str, Any]] = []
         for kind, path in (("md", result.output_path), ("pdf", result.pdf_path)):
             if not path:
@@ -261,10 +292,13 @@ class TranslationPipeline:
                     "bytes": target.stat().st_size if target.is_file() else 0,
                 }
             )
+        calls = active_api_calls()
         self.sink.record(
             type="run_end",
-            status="failed" if result.errors else "done",
-            exit_code=1 if result.errors else 0,
+            status="failed" if failed else "done",
+            active_api_calls=calls.get("active"),
+            max_active_api_calls=calls.get("peak"),
+            exit_code=1 if failed else 0,
             duration_ms=duration_ms,
             tokens={
                 "sent": usage["sent"],
@@ -275,6 +309,7 @@ class TranslationPipeline:
             cache_hits=usage.get("cache_hits", 0),
             cache_misses=usage.get("cache_misses", 0),
             retries=result.retries,
+            chunk_retries=stats.get("chunk_retries", 0),
             fallbacks=stats.get("fallbacks", 0),
             chunks_done=max(0, result.chunks - result.chunks_failed),
             chunks_failed=result.chunks_failed,
@@ -394,6 +429,7 @@ class TranslationPipeline:
         base_state: dict[str, Any],
         ui: SimpleUI,
         *,
+        ctx: GraphContext | None = None,
         per_chunk_state: dict[str, dict[str, Any]] | None = None,
         store: CheckpointStore | None = None,
         doc_key: str = "",
@@ -404,50 +440,79 @@ class TranslationPipeline:
         Each chunk keeps its internal Translate->[Critic->Refiner]->Verify order;
         only *different* chunks run concurrently (``MAX_CONCURRENCY``). Results
         are returned in the original chunk order regardless of completion order.
-        A provider failure on one chunk is recorded and skipped instead of
-        discarding a whole book run: the chunk is left uncheckpointed (so
-        ``--resume`` retries it) and the output marks it as untranslated.
+
+        **A chunk is never skipped.** Provider failures are waited out and the
+        chunk is run again until it has a translation, so the file a finished
+        run writes holds no placeholder for it. A chunk whose draft survived the
+        failure resumes from that draft — the translator is not asked for the
+        same words twice (:meth:`GraphContext.remember_draft`). The wait is
+        unbounded by design: the run ends when every chunk is translated, or
+        when the reader stops it.
         """
         per_chunk_state = per_chunk_state or {}
+        self._stop.clear()
+        # By the time a failure reaches this loop, the resilience layer has
+        # already spent its own retries on the request, so the wait here starts
+        # longer and is capped higher than the per-request one.
+        retry_cfg = RetryConfig(
+            base_delay=self.app.chunk_retry_base_delay,
+            max_delay=self.app.chunk_retry_max_delay,
+            jitter=_CHUNK_RETRY_JITTER,
+        )
 
         def translate_chunk(chunk: Any) -> dict[str, Any]:
             state = {**base_state, **per_chunk_state.get(chunk.id, {}), "chunk": chunk}
-            out = chunk_graph.invoke(state, config={"recursion_limit": 100})
-            # ---- Retry empty translations (up to 2 extra attempts) ----
-            max_empty_retries = 2
-            for retry in range(max_empty_retries):
-                translated = out.get("translated", "") or out.get("draft", "")
-                if translated and translated.strip():
-                    break
-                logger.warning(
-                    "Chunk {} produced empty translation (attempt {}/{}); retrying",
-                    chunk.id,
-                    retry + 1,
-                    max_empty_retries,
-                )
-                out = chunk_graph.invoke(state, config={"recursion_limit": 100})
-            return out
+            kept = ctx.drafts.get(chunk.id, "") if ctx is not None else ""
+            if kept.strip():
+                state["kept_draft"] = kept
+            return chunk_graph.invoke(state, config={"recursion_limit": 100})
+
+        def wait_and_retry(chunk: Any, attempt: int, reason: str) -> None:
+            """Report the wait, then wait in slices so a stop can cut it short."""
+            delay = jittered_delay(retry_cfg, attempt - 1)
+            where = ctx.last_step(chunk.id) if ctx is not None else ""
+            logger.warning(
+                "Chunk {} attempt {} failed ({}); waiting {:.0f}s and running it again",
+                chunk.id,
+                attempt,
+                reason,
+                delay,
+            )
+            ui.retry(
+                where,
+                chunk.id,
+                f"{reason} - waiting {delay:.0f}s, then attempt {attempt + 1}",
+            )
+            RetryStats.add_chunk_retry()
+            waited = 0.0
+            while waited < delay and not self._stop.is_set():
+                slice_s = min(_RETRY_TICK, delay - waited)
+                time.sleep(slice_s)
+                waited += slice_s
 
         def run_one(index: int, chunk: Any) -> dict[str, Any]:
-            try:
-                out = translate_chunk(chunk)
-            except LLMError as exc:
-                ui.add_error(f"{chunk.id}: {type(exc).__name__}: {exc}")
-                logger.warning(
-                    "Chunk {} abandoned after provider errors ({}); continuing with the rest",
-                    chunk.id,
-                    exc,
-                )
-                return {"translated": "", "chunk": chunk, "error": str(exc)}
-            # ---- Only checkpoint non-empty translations ----
-            translated = out.get("translated", "")
-            if store is not None and store.usable and translated and translated.strip():
+            attempt = 0
+            while True:
+                attempt += 1
+                try:
+                    out = translate_chunk(chunk)
+                except LLMError as exc:
+                    ui.add_error(f"{chunk.id}: {type(exc).__name__}: {exc}")
+                    wait_and_retry(chunk, attempt, f"{type(exc).__name__}: {exc}")
+                    if self._stop.is_set():
+                        return {"translated": "", "chunk": chunk, "error": str(exc)}
+                    continue
+                if (out.get("translated", "") or "").strip():
+                    break
+                # An empty translation is not a translation: the chunk is still
+                # owed its words, so it waits and is asked again like any other.
+                wait_and_retry(chunk, attempt, "empty translation")
+                if self._stop.is_set():
+                    return {"translated": "", "chunk": chunk, "error": "empty translation"}
+            # Break above means this chunk has a translation, so it is worth
+            # keeping: a resume never has to translate it again.
+            if store is not None and store.usable:
                 store.put(doc_key, self._to_checkpoint(chunk, out))
-            elif store is not None and store.usable and not (translated and translated.strip()):
-                logger.warning(
-                    "Chunk {} has empty translation after retries; not checkpointing",
-                    chunk.id,
-                )
             if on_chunk_done is not None:
                 on_chunk_done(chunk, out)
             return out
@@ -462,10 +527,17 @@ class TranslationPipeline:
 
         with ThreadPoolExecutor(max_workers=min(workers, len(chunks))) as pool:
             futures = {pool.submit(run_one, i, chunk): i for i, chunk in enumerate(chunks)}
-            for future in as_completed(futures):
-                idx = futures[future]
-                results[idx] = future.result()  # raise the first failure
-                ui.advance()
+            try:
+                for future in as_completed(futures):
+                    idx = futures[future]
+                    results[idx] = future.result()  # raise the first failure
+                    ui.advance()
+            except BaseException:
+                # A chunk is retried without a ceiling, so an interrupted run
+                # has to say so: the workers check this while they wait, and this
+                # block joins them on the way out.
+                self._stop.set()
+                raise
         return results
 
     @staticmethod
@@ -604,6 +676,18 @@ class TranslationPipeline:
             model=translator_cfg.model,
             chunk_hashes=[c.hash() for c in chunks],
         )
+        # The page shows the translation as it arrives, chunk by chunk, out of
+        # the chunks' own files on disk. It cannot work out where those live:
+        # the directory is the pipeline's configuration, which the web UI is
+        # not allowed to read. So the run names its own checkpoint directory,
+        # once, before the first chunk lands — and a run that keeps no
+        # checkpoints says nothing, which reads as "there is nothing to watch".
+        if store.usable:
+            self.sink.record(
+                type="checkpoint",
+                doc_key=doc_key,
+                path=str(store.dir_for(doc_key)),
+            )
         if store.usable and not resume:
             store.clear(doc_key)
         previous_meta = store.load_meta(doc_key) if resume else {}
@@ -625,6 +709,19 @@ class TranslationPipeline:
         pending = [c for i, c in enumerate(chunks) if chunk_states[i] is None]
         resumed_all = not pending
         result.resumed_chunks = len(chunks) - len(pending)
+
+        # One early record the web UI polls on a resumed run: how many chunks
+        # it is about to replay from checkpoint, and whether the store had
+        # anything to replay at all. Without it the resume's progress bar sits
+        # at 0/N (replayed chunks leave no per-chunk events in this run's log)
+        # and a resume whose checkpoints no longer match — model changed, file
+        # touched — looks like it "started over" with nothing to explain it.
+        self.sink.record(
+            type="resume",
+            resume_requested=bool(resume),
+            resumed_chunks=result.resumed_chunks,
+            checkpoint_usable=bool(store.usable),
+        )
 
         if resumed_all:
             # Everything was already translated and consistency-patched; the
@@ -721,6 +818,7 @@ class TranslationPipeline:
                 pending,
                 base_state,
                 ui,
+                ctx=ctx,
                 per_chunk_state=per_chunk_state,
                 store=store,
                 doc_key=doc_key,

@@ -70,6 +70,10 @@ def mock_env(monkeypatch, tmp_path):
         "CONSISTENCY_MAX_PATCHES",
         "OUTPUT_FORMAT",
         "PDF_FONT_PATH",
+        # A chunk is re-run until it is translated, so a tuned wait here would
+        # decide how long the tests take (and whether they look hung).
+        "CHUNK_RETRY_BASE_DELAY",
+        "CHUNK_RETRY_MAX_DELAY",
     ):
         monkeypatch.delenv(var, raising=False)
     # Retry settings: pin deterministic defaults (a tuned local .env may

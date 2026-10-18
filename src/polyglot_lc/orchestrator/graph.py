@@ -95,14 +95,38 @@ class GraphContext:
         self.decision_counts: dict[str, int] = {}
         self.fast_path_rejections = 0
         self.fast_path_reasons: Counter[str] = Counter()
+        # What each chunk has to show for itself if its graph has to be run
+        # again: the newest draft it produced, and the step it was last on.
+        self.drafts: dict[str, str] = {}
+        self.current_steps: dict[str, str] = {}
+        self.resume_lock = threading.Lock()
 
     def step(self, name: str, chunk_id: str = "") -> Any:
         """UI step context manager (no-op-ish when ui is None)."""
+        if chunk_id:
+            self.remember_step(chunk_id, name)
         if self.ui is not None:
             return self.ui.step(name, chunk_id)
         from contextlib import nullcontext
 
         return nullcontext()
+
+    def remember_step(self, chunk_id: str, name: str) -> None:
+        """Note the step *chunk_id* is on, so a retry can say where it died."""
+        with self.resume_lock:
+            self.current_steps[chunk_id] = name
+
+    def last_step(self, chunk_id: str) -> str:
+        """The last step this chunk entered, or "" when it never entered one."""
+        with self.resume_lock:
+            return self.current_steps.get(chunk_id, "")
+
+    def remember_draft(self, chunk_id: str, text: str) -> None:
+        """Keep the draft of *chunk_id* so a failed attempt is not paid for twice."""
+        if not (text or "").strip():
+            return
+        with self.resume_lock:
+            self.drafts[chunk_id] = text
 
     def record_decision(
         self, *, kind: str, chosen: bool, reasons: list[str], **fields: Any
@@ -268,19 +292,27 @@ def make_chunk_graph(ctx: GraphContext):
     def translator_node(state: ChunkState) -> dict[str, Any]:
         chunk = state["chunk"]
         section_note = state.get("section_note", "")
-        with ctx.step("translate", chunk.id):
-            prompt = ctx.translator.build_prompt(
-                chunk_text=chunk.text,
-                src_lang=state["src_lang"],
-                tgt_lang=state["tgt_lang"],
-                strategy=state["strategy"],
-                few_shot=state.get("few_shot"),
-                pitfalls=state.get("pitfalls"),
-                glossary_md=state.get("glossary_md", ""),
-                extra_critique="",
-                section_note=section_note,
-            )
-            draft = ctx.translator.translate(prompt, chunk_id=chunk.id)
+        # A chunk graph that runs a second time — the provider failed at a later
+        # step — must not re-translate: the draft is in hand, and translating
+        # again both pays for work already done and throws those words away.
+        kept = str(state.get("kept_draft") or "")
+        if kept.strip():
+            draft = kept
+        else:
+            with ctx.step("translate", chunk.id):
+                prompt = ctx.translator.build_prompt(
+                    chunk_text=chunk.text,
+                    src_lang=state["src_lang"],
+                    tgt_lang=state["tgt_lang"],
+                    strategy=state["strategy"],
+                    few_shot=state.get("few_shot"),
+                    pitfalls=state.get("pitfalls"),
+                    glossary_md=state.get("glossary_md", ""),
+                    extra_critique="",
+                    section_note=section_note,
+                )
+                draft = ctx.translator.translate(prompt, chunk_id=chunk.id)
+            ctx.remember_draft(chunk.id, draft)
         # Free, local self-assessment: decides the route without a second call.
         signals = draft_signals(chunk.text, draft)
         decision: dict[str, Any] = {
@@ -295,6 +327,11 @@ def make_chunk_graph(ctx: GraphContext):
         decision["fast_path"] = fast
         decision["fast_path_reasons"] = reasons
         decision["skip_llm_verify"] = bool(fast and app_cfg.fast_path_skip_llm_verify)
+        if kept.strip():
+            # The gate already ran on this very draft, and its verdict is what
+            # the first attempt recorded; recording it again would count one
+            # refusal twice in the run's report.
+            return decision
         # The gate already computed why; until now that answer was thrown away
         # one line after it was used.
         ctx.record_decision(
@@ -341,6 +378,8 @@ def make_chunk_graph(ctx: GraphContext):
                 glossary_md=state.get("glossary_md", ""),
                 section_note=state.get("section_note", ""),
             )
+            # The refinement is the newest draft; it is what a retry resumes from.
+            ctx.remember_draft(chunk.id, refined)
             return {"draft": refined, "refine_round": state.get("refine_round", 0) + 1}
 
     def verifier_node(state: ChunkState) -> dict[str, Any]:
@@ -422,6 +461,7 @@ def make_chunk_graph(ctx: GraphContext):
                 section_note=state.get("section_note", ""),
             )
             draft = ctx.translator.translate(prompt, chunk_id=chunk.id)
+            ctx.remember_draft(chunk.id, draft)
             return {
                 "draft": draft,
                 "verify_result": None,

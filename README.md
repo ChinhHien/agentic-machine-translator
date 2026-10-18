@@ -67,7 +67,7 @@ Sơ đồ dạng text cho terminal:
           (skills/<src>-<tgt>/<domain>.json)
 ```
 
-### Hợp đồng của từng giai đoạn
+### Workflow dự án
 
 | # | Giai đoạn | Chủ sở hữu | Gọi model? | Kết quả |
 |---|---|---|---|---|
@@ -148,14 +148,28 @@ lại bản Markdown đã dịch xong.
   Verifier trả phí khi các kiểm tra cứng đã qua. Định tuyến tốn **0 token**.
 - **Checkpoint chống sập**: mỗi chunk xong được ghi vào
   `<CHECKPOINT_DIR>/<job>/<chunk>.json`; `--resume` bỏ qua các chunk đã xong
-  (một lượt resume trọn vẹn tốn 0 request). Checkpoint gắn với đường dẫn/size/
-  mtime của file, cặp ngôn ngữ, domain, model Translator và hash của chunk, nên
-  đổi input hay đổi `--max-tokens` không bao giờ dùng lại kết quả cũ.
+  (một lượt resume trọn vẹn tốn 0 request). Checkpoint gắn với đường dẫn, **nội
+  dung** file (sha256 — không phải `mtime`: upload lại đúng tài liệu đó không
+  được phép xoá công đã dịch), cặp ngôn ngữ, domain, model Translator và hash
+  của chunk, nên đổi input hay đổi `--max-tokens` không bao giờ dùng lại kết quả
+  cũ.
   `PARTIAL_OUTPUT=1` còn ghi lại file đầu ra khi từng chunk hoàn thành.
-- **Một chunk lỗi không làm mất cả lượt chạy**: lỗi nhà cung cấp ở một chunk
-  được ghi lại và bỏ qua, chunk đó để trống trong output dưới dạng marker
-  `<!-- chunk-001: untranslated (source blocks 4-6 lost) -->` kèm số khối nguồn
-  không nơi nào khác chứa, và lỗi vẫn xuất hiện trong báo cáo cuối.
+- **Một chunk lỗi không bao giờ bị bỏ**: cạn các lần thử lại ở tầng request
+  (`LLM_MAX_RETRIES`) thì **chunk** được chờ rồi chạy lại nguyên vẹn — 5s, 10s,
+  20s… tới `CHUNK_RETRY_MAX_DELAY` (mặc định 120s), lặp lại **không giới hạn**
+  cho tới khi chunk có bản dịch. Lối ra duy nhất là Ctrl-C (CLI) hoặc nút Dừng
+  (web UI); trong lúc chờ, lượt chạy in ra, ghi sự kiện `retry_wait` vào log và
+  caption dưới thanh tiến độ nói đang chờ chunk nào, hỏng ở bước nào, chờ bao
+  lâu — một lượt chờ vài phút không được trông như treo.
+  Bản dịch đã sinh ra **được giữ lại**: hỏng ở Critic/Verifier thì lần chạy sau
+  vào thẳng bước đó, không gọi lại Translator cho cùng một câu (đây cũng là chỗ
+  từng đốt ~14 phút mỗi lần bấm Tiếp tục). Vì vậy file kết quả của một lượt đã
+  xong không còn dấu `<!-- chunk-NNN: untranslated (source blocks 4-6 lost) -->`;
+  marker đó chỉ còn là lưới an toàn cho file viết dở (`PARTIAL_OUTPUT=1`) và cho
+  người gọi thẳng `assemble()`. Trạng thái cuối của lượt nói về **file**: mọi
+  chunk đã dịch thì `run_end` là `done` (mã thoát 0), còn những lần phải chờ vẫn
+  nằm trong log và `problems` — `failed` chỉ dành cho lượt không giao được bản
+  dịch trọn vẹn (còn chunk trống, hoặc lượt chết vì lỗi khác `LLMError`).
 - **Nhất quán xuyên chunk**: sau khi dịch, glossary đã lên kế hoạch được áp lên
   toàn tài liệu. Chunk đi lệch được **vá** (giới hạn bởi `CONSISTENCY_MAX_PATCHES`,
   mặc định 5) thay vì dịch lại, và bản vá chỉ được giữ nếu nó thật sự đưa đúng
@@ -174,11 +188,14 @@ lại bản Markdown đã dịch xong.
 - **SkillOpt**: thu thập (prompt, output, điểm) theo từng chunk; Planner đề xuất
   textual gradient; kỹ năng chỉ được promote khi điểm trung bình 20 chunk gần
   nhất **thắng** kỹ năng đang dùng.
-- **Hàng đợi theo từng provider**: tối đa `LLM_PROVIDER_CONCURRENCY` (mặc định
+- **Hàng đợi theo từng provider**: tối đa  `LLM_PROVIDER_CONCURRENCY` (mặc định
   **1**) request đang bay cho mỗi `base_url`, để gói miễn phí chỉ phục vụ một
   request không bị pool chunk giẫm lên. Đây là **hàng đợi**, không phải van: các
   lời gọi xếp hàng chờ lượt thay vì thất bại, thời gian xếp hàng không bị tính
   vào deadline của chính request đó, và slot được trả lại kể cả khi request lỗi.
+  Free tier để 1 (an toàn mặc định); provider trả tiền / self-host nâng lên đúng
+  giới hạn thật của provider. Pool worker (`MAX_CONCURRENCY`) giữ nguyên độc lập
+  với queue, không bị ép theo.
 - **Timeout theo yêu cầu có trần**: mọi lời gọi LLM/embedding bị chặn bởi
   `LLM_TIMEOUT` (mặc định 45s), ghi đè theo từng agent bằng `<NAME>_TIMEOUT`
   (ví dụ `VERIFIER_TIMEOUT`) hoặc `EMBED_TIMEOUT`. SDK `timeout` là *read*
@@ -250,30 +267,17 @@ EMBED_MODEL=text-embedding-3-small
 EMBED_API_KEY=sk-...
 ```
 
-Thiếu key bắt buộc sẽ báo lỗi rõ ràng trên **Errors panel** — không có gì bị
-hard-code, mọi thứ đến từ env.
+Thiếu key bắt buộc sẽ báo lỗi rõ ràng trên **Errors panel**.
 
 ### Nhóm biến
 
-| Nhóm | Biến |
-|---|---|
-| Tác tử | `<NAME>_BASE_URL`, `_MODEL`, `_API_KEY`, `_TEMPERATURE`, `_TIMEOUT` với `NAME` ∈ PLANNER/TRANSLATOR/CRITIC/REFINER/VERIFIER |
-| Nhóm đọc-nguồn | `SOURCE_GROUP_BASE_URL`, `_MODEL`, `_API_KEY`, `_TEMPERATURE` |
-| Endpoint dự phòng | `<NAME>_BACKUP_BASE_URL`, `_BACKUP_MODEL`, `_BACKUP_API_KEY` (cần cả hai biến đầu) |
-| Embedding | `EMBED_BASE_URL`, `EMBED_MODEL`, `EMBED_API_KEY`, `EMBED_TIMEOUT` |
-| Đường dẫn | `REASONING_BANK_PATH`, `SKILLS_DIR`, `LOGS_DIR`, `LOG_JSONL`, `CHECKPOINT_DIR` |
-| Chia đoạn | `CHUNK_MAX_TOKENS`, `CHUNK_OVERLAP_TOKENS`, `MAX_CONCURRENCY` |
-| Chất lượng | `CRITIC_THRESHOLD`, `REFINE_ROUNDS`, `REFINE_MIN_SCORE`, `RB_TOP_K` |
-| Luồng | `UNIFIED_PLANNER`, `SUMMARY_TREE_CHUNK_SUMMARIES`, `ADAPTIVE_QUALITY`, `FAST_PATH_MAX_COMPLEXITY`, `FAST_PATH_MIN_SCORE`, `FAST_PATH_SKIP_LLM_VERIFY` |
-| Bền vững | `RESUME`, `PARTIAL_OUTPUT` |
-| Đầu ra | `OUTPUT_FORMAT` (`md` \| `pdf` \| `both`), `PDF_FONT_PATH` |
-| Nhất quán | `CONSISTENCY_CHECK`, `CONSISTENCY_MAX_PATCHES` |
-| Retry / timeout | `LLM_MAX_RETRIES`, `LLM_TIMEOUT`, `LLM_RETRY_BASE_DELAY`, `LLM_RETRY_MAX_DELAY`, `LLM_RETRY_BUFFER_SECONDS`, `LLM_RETRY_JITTER`, `LLM_PROVIDER_CONCURRENCY`, `LLM_RETRY_CONCURRENCY_WAIT` |
-| Cache | `PROMPT_CACHE` (`auto` \| `explicit` \| `off`) |
-| Debug / demo | `LLM_MOCK`, `LLM_VERBOSE`, `LLM_VERBOSE_RESILIENCE` |
-
-Hai biến chưa có trong `.env.example` (đọc thẳng từ môi trường):
-`LLM_PROVIDER_CONCURRENCY` và `LLM_RETRY_CONCURRENCY_WAIT`.
+Bốn nhóm endpoint ở trên là phần duy nhất bắt buộc. Mọi biến còn lại — đường dẫn,
+chia đoạn, chất lượng, đường tắt thích ứng, nhất quán, retry/timeout, hàng đợi
+theo provider, chạy lại chunk, cache, logging, ghi đè theo từng agent và endpoint
+dự phòng — có bảng đầy đủ kèm mặc định và khi nào nên đổi ở
+[`docs/configuration.md`](docs/configuration.md). Ở đó cũng có công thức cho các
+tình huống hay gặp (chạy thử không cần key, gói miễn phí chỉ cho một request cùng
+lúc, tiết kiệm token, đầu ra PDF) và cách rút gọn một `.env` đang có.
 
 ### Chế độ demo / offline không cần key
 
@@ -365,8 +369,7 @@ python -m webui.server               # rồi mở http://127.0.0.1:8787
 python -m webui.server --port 9000   # đổi cổng, vẫn chỉ bind loopback
 ```
 
-Kéo thả một file PDF vào ô đầu hộp thoại (file được tải lên `input/` — thư mục
-này chỉ để chạy thử và chứa tài liệu mẫu), chọn ngôn ngữ ở hai đầu, rồi bấm
+Kéo thả một file PDF vào ô đầu hộp thoại, chọn ngôn ngữ ở hai đầu, rồi bấm
 **Bắt đầu dịch**. Danh sách ngôn ngữ viết đủ tên chứ không viết tắt (`vi` là
 "Tiếng Việt"); nguồn có thêm **Tự động nhận diện**, đích có **Tiếng Anh** như
 mọi ngôn ngữ khác. Trang hiện thanh tiến độ theo
@@ -496,5 +499,7 @@ webui/                     # ứng dụng UI web (chạy polyglot_lc như tiến
   làm bộ trích xuất báo lỗi rõ ràng chứ không tạo ra tài liệu rỗng.
 - PDF đầu ra cần một font `.ttf` có dấu tiếng Việt. Chương trình tự dò Times/Arial/
   Segoe UI/DejaVu… và báo lỗi rõ khi không thấy; đặt `PDF_FONT_PATH` để chỉ định.
-- Hai biến chưa có trong `.env.example`: `LLM_PROVIDER_CONCURRENCY` và
-  `LLM_RETRY_CONCURRENCY_WAIT` (đã liệt kê ở mục 4).
+- `.env.example` để mọi biến tinh chỉnh ở dạng **comment kèm mặc định**, nên
+  sao chép bản mẫu không đóng băng mặc định của mã. Hai biến trước đây thiếu ở
+  bản mẫu — `LLM_PROVIDER_CONCURRENCY` và `LLM_RETRY_CONCURRENCY_WAIT` — nay đã
+  có mặt ở đó.

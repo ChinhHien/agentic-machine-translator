@@ -66,6 +66,24 @@ class PermanentError(LLMError):
         self.status = status
 
 
+class TruncatedError(LLMError):
+    """The provider cut the reply short (``finish_reason == "length"``).
+
+    The draft is real but incomplete: the model stopped at the output-token
+    limit, so the tail of the chunk was never translated. This is the one
+    failure a *different* endpoint or a bigger budget genuinely can fix — it is
+    not a provider fault — so the chunk layer re-runs it with a raised cap
+    rather than shipping an untranslated tail.
+
+    ``completion_tokens`` is carried for diagnostics (how close the reply was
+    to the limit that cut it).
+    """
+
+    def __init__(self, message: str, completion_tokens: int | None = None) -> None:
+        super().__init__(message)
+        self.completion_tokens = completion_tokens
+
+
 _STATUS_RE = re.compile(r"\b(?:status[: ]|HTTP )?([1-5]\d{2})\b")
 _TRY_AGAIN_RE = re.compile(
     r"try\s+again\s+in\s+([0-9]+(?:\.[0-9]+)?)\s*(ms|s|sec|secs|second|seconds|m|min|mins|minute|minutes)?",
@@ -97,8 +115,11 @@ _CONCURRENCY_HINTS = (
 )
 
 
-def is_concurrency_limit(err: LLMError) -> bool:
-    """True when *err* says another request from this process is still in flight."""
+def is_concurrency_limit(err: LLMError | str) -> bool:
+    """True when *err* says another request from this process is still in flight.
+
+    Accepts the message text too: hooks that only carry the rendered error
+    (``on_retry``) classify with the same hints."""
     text = str(err).lower()
     return any(hint in text for hint in _CONCURRENCY_HINTS)
 
@@ -239,6 +260,7 @@ class RetryStats:
     _rate_limit_retries = 0
     _transient_retries = 0
     _fallbacks = 0
+    _chunk_retries = 0
 
     @classmethod
     def add_rate_limit_retry(cls) -> None:
@@ -256,12 +278,19 @@ class RetryStats:
             cls._fallbacks += 1
 
     @classmethod
+    def add_chunk_retry(cls) -> None:
+        """One chunk run again after provider errors, above this layer's own tries."""
+        with cls._lock:
+            cls._chunk_retries += 1
+
+    @classmethod
     def snapshot(cls) -> dict[str, int]:
         with cls._lock:
             return {
                 "rate_limit_retries": cls._rate_limit_retries,
                 "transient_retries": cls._transient_retries,
                 "fallbacks": cls._fallbacks,
+                "chunk_retries": cls._chunk_retries,
             }
 
     @classmethod
@@ -270,6 +299,7 @@ class RetryStats:
             cls._rate_limit_retries = 0
             cls._transient_retries = 0
             cls._fallbacks = 0
+            cls._chunk_retries = 0
 
 
 def _sleep(seconds: float) -> None:

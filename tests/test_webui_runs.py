@@ -2,11 +2,12 @@
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 import pytest
 
-from webui.runs import RunManager, RunPlanError
+from webui.runs import AUTO_RESUME_DELAYS, RunManager, RunPlanError
 
 
 class FakeProc:
@@ -56,6 +57,19 @@ def _manager(repo, made=None):
     return RunManager(repo, python="PY", popen=popen)
 
 
+def _stopped(mgr, rec):
+    """Make *rec* look like a run whose last attempt is over.
+
+    Its child has exited and the manager has reconciled the record on the next
+    look (what the page's poll does), and the reader pressed "Dừng".
+    """
+    mgr.procs[rec.run_id].returncode = 1
+    stopped = mgr.status(rec.run_id)
+    stopped.status = "stopped"
+    mgr.store.write_record(stopped)
+    return stopped
+
+
 def test_start_builds_the_command_and_the_run_dir(repo, planned):
     made: list = []
     mgr = _manager(repo, made)
@@ -91,14 +105,48 @@ def test_start_builds_the_command_and_the_run_dir(repo, planned):
     assert rec.status == "running" and rec.chunks == 3 and rec.pid == 4242
 
 
-def test_resume_adds_the_flag_and_leaves_the_rest_alone(repo, planned):
-    """Continuing an interrupted document is a real capability of the CLI; the
-    page offers it as "Tiếp tục", so the flag has to reach the child — and a
-    fresh run must not carry it."""
+def test_resume_continues_the_run_in_place_with_its_own_command(repo, planned):
+    """ "Tiếp tục" continues the run the reader is watching, not a new one.
+
+    The chunks left to translate are the ones the stopped attempt wrote
+    checkpoints for, and those checkpoints are keyed by the command that
+    produced them — file, languages, domain, glossary, token budget — plus the
+    Translator model. So the resumed attempt is that exact command with
+    ``--resume``, under the same run id, log directory and output path: the
+    page keeps showing one run, in the place it already was.
+    """
     made: list = []
     mgr = _manager(repo, made)
+    rec = mgr.start(
+        file="doc.pdf",
+        src="vi",
+        tgt="en",
+        domain="tech",
+        glossary="g.csv",
+        max_tokens=555,
+        mock=False,
+    )
+    original = list(rec.command)
+    stopped = _stopped(mgr, rec)
 
-    mgr.start(
+    again = mgr.resume(stopped.run_id)
+
+    argv, kw = made[1]
+    assert argv == original + ["--resume"]  # nothing rebuilt from today's settings
+    assert again.run_id == stopped.run_id
+    assert again.started == stopped.started  # the same session, not a second one
+    assert again.output_path == stopped.output_path
+    assert again.status == "running" and again.exit_code is None and again.note == ""
+    assert len(list((repo / "logs" / "webui").iterdir())) == 1  # no second run dir
+    assert kw["env"]["LOGS_DIR"] == str(repo / "logs" / "webui" / stopped.run_id)
+
+
+def test_resume_refuses_a_run_that_is_still_running(repo, planned):
+    """A run that never stopped keeps its own child: a second one would write
+    the same event log and the same output file at the same time."""
+    made: list = []
+    mgr = _manager(repo, made)
+    rec = mgr.start(
         file="doc.pdf",
         src="vi",
         tgt="en",
@@ -106,9 +154,24 @@ def test_resume_adds_the_flag_and_leaves_the_rest_alone(repo, planned):
         glossary=None,
         max_tokens=None,
         mock=False,
-        resume=True,
     )
-    mgr.start(
+
+    with pytest.raises(RuntimeError):
+        mgr.resume(rec.run_id)
+    assert len(made) == 1  # nothing was spawned
+
+
+def test_resume_of_an_unknown_run_is_a_key_error(repo, planned):
+    with pytest.raises(KeyError):
+        _manager(repo).resume("không-tồn-tại")
+
+
+def test_resume_keeps_the_previous_attempt_s_console_output(repo, planned):
+    """Append, not truncate: a reader asking "why did it stop?" still finds the
+    previous attempt's own words beside the continued attempt's."""
+    made: list = []
+    mgr = _manager(repo, made)
+    rec = mgr.start(
         file="doc.pdf",
         src="vi",
         tgt="en",
@@ -117,9 +180,58 @@ def test_resume_adds_the_flag_and_leaves_the_rest_alone(repo, planned):
         max_tokens=None,
         mock=False,
     )
+    stderr = repo / "logs" / "webui" / rec.run_id / "stderr.log"
+    stderr.write_text("provider 500\n", encoding="utf-8")
+    stopped = _stopped(mgr, rec)
 
-    assert "--resume" in made[0][0]
-    assert "--resume" not in made[1][0]
+    mgr.resume(stopped.run_id)
+
+    assert stderr.read_text(encoding="utf-8") == "provider 500\n"
+
+
+def test_resume_pins_the_model_the_run_itself_reported(repo, planned):
+    """ "Tiếp tục" must keep the checkpoint key of the run it comes from.
+
+    Checkpoints are keyed by the translator model (and the tokenizer it picks),
+    so a resumed attempt that fell back to the server's current config would
+    derive a different key and silently re-translate every chunk instead of
+    reusing the ones the stopped attempt already wrote. The model comes from
+    the run's own `run_start` record — the page sends no settings at all.
+    """
+    made: list = []
+    mgr = _manager(repo, made)
+    rec = mgr.start(
+        file="doc.pdf",
+        src="vi",
+        tgt="en",
+        domain="tech",
+        glossary=None,
+        max_tokens=None,
+        mock=False,
+    )
+    (repo / "logs" / "webui" / rec.run_id / "run_20260101_000000.jsonl").write_text(
+        json.dumps({"type": "run_start", "agents": [{"name": "translator", "model": "gpt-4o"}]})
+        + "\n",
+        encoding="utf-8",
+    )
+    stopped = _stopped(mgr, rec)
+
+    mgr.resume(stopped.run_id)
+
+    assert made[1][1]["env"]["TRANSLATOR_MODEL"] == "gpt-4o"
+
+    # A fresh run never pins: it should track whatever config is in effect now.
+    fresh = mgr.start(
+        file="doc.pdf",
+        src="vi",
+        tgt="en",
+        domain="tech",
+        glossary=None,
+        max_tokens=None,
+        mock=False,
+    )
+    assert fresh.translator_model == ""
+    assert "TRANSLATOR_MODEL" not in made[2][1]["env"]
 
 
 def test_input_path_is_validated_against_the_input_directory(repo, planned):
@@ -431,9 +543,11 @@ def test_stop_marks_stopped_and_kills_the_tree(repo, planned, monkeypatch):
         mgr.stop("không-tồn-tại")
 
 
-def test_delete_removes_the_runs_dirs_and_keeps_the_input(repo, planned, monkeypatch):
-    """Erasing a run's history removes both its log dir and its output dir, but
-    the input PDF a reader may translate again is left alone."""
+def test_delete_removes_the_runs_dirs_and_the_input_it_was_last_at(repo, planned, monkeypatch):
+    """Erasing a run's history removes its log dir, its output dir, and the
+    input PDF it came from — but only when no other run still points at that
+    document: two runs may share one file, and deleting it under the other
+    would break its resume."""
     killed: list = []
     monkeypatch.setattr("webui.runs.kill_tree", lambda pid: killed.append(pid))
     mgr = _manager(repo)
@@ -456,13 +570,47 @@ def test_delete_removes_the_runs_dirs_and_keeps_the_input(repo, planned, monkeyp
 
     assert not (repo / "logs" / "webui" / rec.run_id).exists()
     assert not (repo / "output" / "webui" / rec.run_id).exists()
-    assert (repo / "input" / "doc.pdf").is_file()
+    assert not (repo / "input" / "doc.pdf").exists()
     assert rec.run_id not in mgr.procs
 
     with pytest.raises(KeyError):
         mgr.delete(rec.run_id)  # đã xoá rồi
     with pytest.raises(KeyError):
         mgr.delete("không-tồn-tại")
+
+
+def test_delete_keeps_the_input_while_another_run_still_uses_it(repo, planned, monkeypatch):
+    """Two runs translating the same document: deleting the first must not
+    take the file out from under the second, whose resume still needs it."""
+    killed: list = []
+    monkeypatch.setattr("webui.runs.kill_tree", lambda pid: killed.append(pid))
+    mgr = _manager(repo)
+    first = mgr.start(
+        file="doc.pdf",
+        src="vi",
+        tgt="en",
+        domain="tech",
+        glossary=None,
+        max_tokens=None,
+        mock=False,
+    )
+    second = mgr.start(
+        file="doc.pdf",
+        src="vi",
+        tgt="en",
+        domain="tech",
+        glossary=None,
+        max_tokens=None,
+        mock=False,
+    )
+
+    mgr.delete(first.run_id)
+
+    assert (repo / "input" / "doc.pdf").is_file()
+
+    mgr.delete(second.run_id)
+
+    assert not (repo / "input" / "doc.pdf").exists()
 
 
 def test_pid_alive_recognises_this_process_and_rejects_nonsense():
@@ -495,3 +643,294 @@ def test_probe_command_uses_the_configured_interpreter(repo, monkeypatch):
     assert kw["encoding"] == "utf-8"
     assert kw["env"]["PYTHONIOENCODING"] == "utf-8"
     assert kw["cwd"] == repo
+
+
+# --- Tự động tiếp tục khi nhà cung cấp lỗi tạm thời -------------------------
+
+
+def _run(mgr, **over):
+    """Start one run with the choices every test in this section uses."""
+    fields = {
+        "file": "doc.pdf",
+        "src": "vi",
+        "tgt": "en",
+        "domain": "tech",
+        "glossary": None,
+        "max_tokens": None,
+        "mock": False,
+    }
+    fields.update(over)
+    return mgr.start(**fields)
+
+
+def _died(mgr, rec, tail="Run failed: RateLimitError: 429 rate limit reached\n"):
+    """Make *rec* look like an attempt whose child has just died saying *tail*."""
+    mgr.procs[rec.run_id].returncode = 1
+    (mgr.logs_dir(rec.run_id) / "stderr.log").write_text(tail, encoding="utf-8")
+    return mgr.status(rec.run_id)
+
+
+def test_sweep_schedules_a_wait_instead_of_relaunching_at_once(repo, planned):
+    """A provider that refused everything needs time to clear.
+
+    The pass spends an attempt and writes down when the next one is due; it must
+    not relaunch inside the same outage, or all three attempts burn in one
+    second and the run is dead anyway.
+    """
+    made: list = []
+    mgr = _manager(repo, made)
+    rec = _run(mgr)
+    failed = _died(mgr, rec)
+
+    first = mgr.sweep(now=1000.0)
+
+    assert [r.run_id for r in first] == [failed.run_id]
+    stored = mgr.store.read_record(failed.run_id)
+    assert stored.auto_resumes == 1
+    assert stored.retry_at == 1000.0 + AUTO_RESUME_DELAYS[0]
+    assert "lần 1/3" in stored.note and "30 giây" in stored.note
+    assert len(made) == 1  # chưa relaunch: chờ là chủ ý
+
+    # Chưa tới hạn thì vòng quét để yên.
+    assert mgr.sweep(now=1029.0) == []
+    assert len(made) == 1
+
+
+def test_sweep_continues_the_run_itself_when_the_wait_is_over(repo, planned):
+    """ "Tiếp tục" được bấm hộ: cùng run_id, cùng thư mục log, không sinh lượt mới."""
+    made: list = []
+    mgr = _manager(repo, made)
+    rec = _run(mgr)
+    original = list(rec.command)
+    _died(mgr, rec)
+    mgr.sweep(now=1000.0)
+
+    due = mgr.sweep(now=1000.0 + AUTO_RESUME_DELAYS[0])
+
+    argv, kw = made[1]
+    assert [r.run_id for r in due] == [rec.run_id]
+    assert argv == original + ["--resume"]
+    assert kw["env"]["LOGS_DIR"] == str(repo / "logs" / "webui" / rec.run_id)
+    assert due[0].status == "running" and due[0].exit_code is None
+    assert due[0].retry_at == 0.0
+    assert due[0].note.startswith("đang tự tiếp tục lần 1/3")
+    assert len(list((repo / "logs" / "webui").iterdir())) == 1
+
+
+def test_each_further_attempt_waits_longer(repo, planned):
+    made: list = []
+    mgr = _manager(repo, made)
+    rec = _run(mgr)
+    _died(mgr, rec)
+
+    mgr.sweep(now=0.0)  # hẹn lần 1
+    mgr.sweep(now=AUTO_RESUME_DELAYS[0])  # chạy lần 1
+    mgr.procs[rec.run_id].returncode = 1  # và nó chết lại
+    mgr.status(rec.run_id)
+
+    mgr.sweep(now=100.0)
+
+    stored = mgr.store.read_record(rec.run_id)
+    assert stored.auto_resumes == 2
+    assert stored.retry_at == 100.0 + AUTO_RESUME_DELAYS[1]
+    assert "lần 2/3" in stored.note and "2 phút" in stored.note
+
+
+def test_sweep_gives_up_once_the_budget_is_spent(repo, planned):
+    made: list = []
+    mgr = _manager(repo, made)
+    rec = _run(mgr)
+    failed = _died(mgr, rec)
+    spent = mgr.store.read_record(failed.run_id)
+    spent.auto_resumes = len(AUTO_RESUME_DELAYS)
+    mgr.store.write_record(spent)
+
+    assert mgr.sweep(now=1000.0) == []
+    assert len(made) == 1
+    assert mgr.store.read_record(rec.run_id).retry_at == 0.0
+
+
+def test_sweep_leaves_a_refused_request_alone(repo, planned):
+    """A bad key or a bad request cannot be fixed by waiting; retrying it would
+    spend ten minutes and bury the real reason under three identical failures."""
+    made: list = []
+    mgr = _manager(repo, made)
+    rec = _run(mgr)
+    _died(mgr, rec, "Run failed: PermanentError: Error code: 401 - Incorrect API key\n")
+
+    assert mgr.sweep(now=1000.0) == []
+    assert len(made) == 1
+
+
+def test_sweep_does_not_retry_a_failure_it_cannot_read(repo, planned):
+    """A bug is not an outage: three attempts would only repeat the crash."""
+    made: list = []
+    mgr = _manager(repo, made)
+    rec = _run(mgr)
+    _died(mgr, rec, "Run failed: ZeroDivisionError: division by zero\n")
+
+    assert mgr.sweep(now=1000.0) == []
+    assert len(made) == 1
+
+
+def test_sweep_never_touches_a_run_the_reader_stopped(repo, planned):
+    """ "Dừng" is a decision, and it outranks a retryable error."""
+    made: list = []
+    mgr = _manager(repo, made)
+    rec = _run(mgr)
+    stopped = _stopped(mgr, rec)
+    (mgr.logs_dir(rec.run_id) / "stderr.log").write_text(
+        "Run failed: RateLimitError: 429\n", encoding="utf-8"
+    )
+
+    assert mgr.sweep(now=1_000_000.0) == []
+    assert len(made) == 1
+    assert mgr.store.read_record(stopped.run_id).auto_resumes == 0
+
+
+def test_sweep_continues_a_finished_run_that_lost_a_chunk(repo, planned):
+    """A chunk dropped by an exhausted rate limit does not kill the run.
+
+    The process still exits 0 and the page says "xong", so nothing but the run's
+    own ``run_end`` record says the work is missing — and that is the failure a
+    reader most often has to press "Tiếp tục" for.
+    """
+    made: list = []
+    mgr = _manager(repo, made)
+    rec = _run(mgr)
+    log = mgr.logs_dir(rec.run_id) / "run_20260101_000000.jsonl"
+    log.write_text(
+        json.dumps(
+            {
+                "step": "translate",
+                "status": "fail",
+                "chunk_id": "c3",
+                "error": "c3: RateLimitError: 429 rate limit exceeded",
+            }
+        )
+        + "\n"
+        + json.dumps({"type": "run_end", "status": "failed", "chunks_failed": 1})
+        + "\n",
+        encoding="utf-8",
+    )
+    mgr.procs[rec.run_id].returncode = 0
+    done = mgr.status(rec.run_id)
+    assert done.status == "done"  # mã thoát 0: trang coi như đã xong
+
+    assert [r.run_id for r in mgr.sweep(now=500.0)] == [rec.run_id]
+    assert mgr.store.read_record(rec.run_id).auto_resumes == 1
+
+
+def test_sweep_leaves_a_run_that_finished_cleanly_alone(repo, planned):
+    made: list = []
+    mgr = _manager(repo, made)
+    rec = _run(mgr)
+    (mgr.logs_dir(rec.run_id) / "run_20260101_000000.jsonl").write_text(
+        json.dumps({"type": "run_end", "status": "done", "chunks_failed": 0}) + "\n",
+        encoding="utf-8",
+    )
+    mgr.procs[rec.run_id].returncode = 0
+    mgr.status(rec.run_id)
+
+    assert mgr.sweep(now=500.0) == []
+
+
+def test_sweep_notices_a_child_that_died_with_no_page_open(repo, planned, monkeypatch):
+    """The record still says "running" over a dead pid after a server restart.
+
+    The sweep is often the first thing to look, and it must not need a browser to
+    notice — that would make the feature work only for a reader already watching.
+    """
+    made: list = []
+    mgr = _manager(repo, made)
+    rec = _run(mgr)
+    (mgr.logs_dir(rec.run_id) / "stderr.log").write_text(
+        "Run failed: TransientError: connection reset by peer\n", encoding="utf-8"
+    )
+    mgr.procs.clear()  # như thể server vừa khởi động lại
+    monkeypatch.setattr("webui.runs.pid_alive", lambda pid: False)
+
+    out = mgr.sweep(now=1000.0)
+
+    assert [r.run_id for r in out] == [rec.run_id]
+    assert mgr.store.read_record(rec.run_id).auto_resumes == 1
+
+
+def test_a_manual_resume_cancels_the_scheduled_attempt(repo, planned):
+    """The reader pressing "Tiếp tục" takes over: the pending wait means nothing
+    then, and the attempt it had spent is not handed back."""
+    made: list = []
+    mgr = _manager(repo, made)
+    rec = _run(mgr)
+    _died(mgr, rec)
+    mgr.sweep(now=1000.0)
+
+    again = mgr.resume(rec.run_id)
+
+    assert again.retry_at == 0.0
+    assert again.auto_resumes == 1
+    assert again.note == ""
+    assert mgr.sweep(now=1_000_000.0) == []
+
+
+def test_stop_calls_off_a_waiting_retry(repo, planned):
+    """Between two attempts there is no child, so "Dừng" means "đừng thử lại nữa".
+
+    Without this the reader watches "thử lại sau 8 phút" with no way to say no,
+    which is exactly the feeling a supervisor acting on its own must not create.
+    """
+    made: list = []
+    mgr = _manager(repo, made)
+    rec = _run(mgr)
+    _died(mgr, rec)
+    mgr.sweep(now=1000.0)  # hẹn lần 1
+
+    stopped = mgr.stop(rec.run_id)
+
+    assert stopped.retry_at == 0.0
+    assert stopped.auto_resumes == len(AUTO_RESUME_DELAYS)
+    assert "huỷ tự động tiếp tục" in stopped.note
+    assert stopped.status == "failed"  # vẫn là lượt đã lỗi, không giả vờ là đã dừng
+    assert mgr.sweep(now=1_000_000.0) == []
+    assert len(made) == 1
+
+
+def test_stop_still_refuses_a_run_with_nothing_to_stop(repo, planned):
+    """A finished run with no retry pending has no attempt to call off either."""
+    mgr = _manager(repo)
+    rec = _run(mgr)
+    mgr.procs[rec.run_id].returncode = 0
+    mgr.status(rec.run_id)
+
+    with pytest.raises(RuntimeError):
+        mgr.stop(rec.run_id)
+
+
+def test_the_sweeper_keeps_going_and_survives_a_bad_pass(repo, planned):
+    """A supervisor that dies quietly looks like a run that never comes back."""
+    import threading
+    import time as clock
+
+    from webui.runs import start_sweeper
+
+    calls: list = []
+
+    def sweep(now=None):
+        calls.append(1)
+        if len(calls) == 1:
+            raise RuntimeError("store went away")
+        return []
+
+    mgr = _manager(repo)
+    mgr.sweep = sweep
+    stop = threading.Event()
+    thread = start_sweeper(mgr, interval=0.01, stop=stop)
+
+    deadline = clock.time() + 5
+    while len(calls) < 3 and clock.time() < deadline:
+        clock.sleep(0.01)
+    stop.set()
+    thread.join(timeout=5)
+
+    assert len(calls) >= 3  # một lần hỏng không kết thúc vòng lặp
+    assert not thread.is_alive()

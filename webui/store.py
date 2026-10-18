@@ -103,6 +103,19 @@ class RunRecord:
     pid: int | None
     command: list[str]
     note: str = ""
+    #: The translator model this run actually ran under, read from the child's
+    #: own `run_start` event once it appears. A resume reuses the stopped run's
+    #: checkpoints, which are keyed by the model, so it must pin this value
+    #: rather than re-read it from `.env`; empty until the first event arrives.
+    translator_model: str = ""
+    #: How many times the supervisor has continued this run by itself after a
+    #: temporary provider failure, and when the next such attempt is due (epoch
+    #: seconds; 0 means none is pending). Both live on the record rather than in
+    #: the server's memory: a restart must neither forget the attempts already
+    #: spent nor lose a scheduled one, and the budget has to survive a browser
+    #: that is closed for the whole wait.
+    auto_resumes: int = 0
+    retry_at: float = 0.0
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -132,6 +145,9 @@ class RunRecord:
             pid=None if raw_pid is None else int(raw_pid),
             command=[str(x) for x in (data.get("command") or [])],
             note=str(data.get("note") or ""),
+            translator_model=str(data.get("translator_model") or ""),
+            auto_resumes=int(data.get("auto_resumes") or 0),
+            retry_at=float(data.get("retry_at") or 0.0),
         )
 
 
@@ -167,16 +183,43 @@ class RunsStore:
         records.sort(key=lambda r: r.started, reverse=True)
         return records
 
-    def log_path(self, run_id: str) -> Path | None:
-        """The run's event log, or ``None`` when the run wrote none."""
+    def log_files(self, run_id: str) -> list[Path]:
+        """Every event log this run wrote, oldest first.
+
+        A run writes one ``run_<stamp>.jsonl`` per attempt, because "Tiếp tục"
+        continues the same run in the same directory and the child opens a new
+        file each time. Names sort in the order the attempts ran, so the merged
+        stream is chronological without asking any clock.
+        """
         try:
             directory = self.dir_for(run_id)
         except ValueError:
-            return None
+            return []
         if not directory.is_dir():
-            return None
-        logs = sorted(directory.glob("run_*.jsonl"))
+            return []
+        return sorted(directory.glob("run_*.jsonl"))
+
+    def log_path(self, run_id: str) -> Path | None:
+        """The run's newest event log, or ``None`` when it wrote none."""
+        logs = self.log_files(run_id)
         return logs[-1] if logs else None
+
+    def last_run_end(self, run_id: str) -> dict[str, Any]:
+        """The newest attempt's own ``run_end`` record, or ``{}``.
+
+        The supervisor asks this on a timer to tell a run that finished from one
+        that finished with gaps, and it reads only the newest attempt's file:
+        that attempt's verdict is the current one, and stopping there keeps the
+        question cheap however many times the run has already been continued.
+        """
+        path = self.log_path(run_id)
+        if path is None:
+            return {}
+        events, _malformed = _read_jsonl(path)
+        for event in reversed(events):
+            if str(event.get("type") or "") == "run_end":
+                return event
+        return {}
 
     def read_events(self, run_id: str, after: int) -> tuple[list[dict[str, Any]], int, int]:
         """Events from index *after* on, plus ``(next_index, malformed_count)``.
@@ -184,11 +227,19 @@ class RunsStore:
         Indexing is by position in the usable event list rather than by
         timestamp, so a poll does not depend on any clock and cannot lose an
         event to a timestamp tie.
+
+        Every attempt of the run is read, oldest file first: continuing a run
+        appends a file, and reading only the newest one would erase the run's
+        earlier history from the page — its progress bar among other things.
+        The earlier indices keep their meaning, so a page polling with an
+        ``after=`` cursor keeps following the same run across a resume.
         """
-        path = self.log_path(run_id)
-        if path is None:
-            return [], 0, 0
-        events, malformed = _read_jsonl(path)
+        events: list[dict[str, Any]] = []
+        malformed = 0
+        for path in self.log_files(run_id):
+            written, bad = _read_jsonl(path)
+            events.extend(written)
+            malformed += bad
         start = max(0, int(after))
         return events[start:], len(events), malformed
 

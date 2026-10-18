@@ -45,6 +45,70 @@ def test_run_record_round_trip_and_order(tmp_path):
     assert s.read_record("missing") is None
 
 
+def test_run_record_carries_its_own_automatic_continues(tmp_path):
+    """The supervisor's budget lives on the record, not in the server's memory.
+
+    A restart in the middle of a provider outage must not forget how many
+    automatic continues a run already spent, and the run it is waiting on has to
+    stay findable while the browser is closed for the whole wait.
+    """
+    s = RunsStore(tmp_path)
+    s.write_record(_record("r1", auto_resumes=2, retry_at=1234.5))
+    back = s.read_record("r1")
+    assert back.auto_resumes == 2 and back.retry_at == 1234.5
+
+    # A record written before these fields existed reads as "none yet" rather
+    # than as a malformed record: every run in `logs/webui` predates them.
+    s.write_record(_record("r2"))
+    legacy = s.dir_for("r2") / "run.json"
+    data = json.loads(legacy.read_text(encoding="utf-8"))
+    for field in ("auto_resumes", "retry_at"):
+        del data[field]
+    legacy.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
+    old = s.read_record("r2")
+    assert old is not None and old.auto_resumes == 0 and old.retry_at == 0.0
+
+
+def test_last_run_end_reads_only_the_newest_attempt(tmp_path):
+    """The supervisor asks this on a timer, so it reads one file, not all of them."""
+    s = RunsStore(tmp_path)
+    d = s.dir_for("r1")
+    d.mkdir(parents=True)
+    (d / "run_20260101_000000.jsonl").write_text(
+        '{"type": "run_end", "chunks_failed": 9}\n', encoding="utf-8"
+    )
+    (d / "run_20260101_010000.jsonl").write_text(
+        '{"type": "chunk"}\n{"type": "run_end", "chunks_failed": 1}\n', encoding="utf-8"
+    )
+
+    assert s.last_run_end("r1")["chunks_failed"] == 1
+    assert s.last_run_end("r-missing") == {}
+
+
+def test_read_events_reads_every_attempt_of_a_run(tmp_path):
+    """Continuing a run appends a log file to the same directory.
+
+    Reading only the newest one would wipe the run's earlier history off the
+    page — its progress bar included — the moment the reader pressed "Tiếp tục".
+    """
+    s = RunsStore(tmp_path)
+    d = s.dir_for("r1")
+    d.mkdir(parents=True)
+    (d / "run_20260101_000000.jsonl").write_text('{"type": "chunk", "n": 1}\n', encoding="utf-8")
+    (d / "run_20260101_010000.jsonl").write_text('{"type": "resume"}\n', encoding="utf-8")
+
+    events, nxt, malformed = s.read_events("r1", 0)
+    assert [e["type"] for e in events] == ["chunk", "resume"]
+    assert nxt == 2 and malformed == 0
+    # A page polling with a cursor keeps its place across the second attempt.
+    assert s.read_events("r1", 1) == ([{"type": "resume"}], 2, 0)
+    assert s.log_path("r1").name == "run_20260101_010000.jsonl"
+    assert [p.name for p in s.log_files("r1")] == [
+        "run_20260101_000000.jsonl",
+        "run_20260101_010000.jsonl",
+    ]
+
+
 def test_read_events_counts_malformed_lines(tmp_path):
     s = RunsStore(tmp_path)
     d = s.dir_for("r1")

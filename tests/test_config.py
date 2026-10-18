@@ -176,3 +176,21 @@ def test_an_unknown_output_format_is_rejected(mock_env, monkeypatch):
     monkeypatch.setenv("OUTPUT_FORMAT", "docx")
     with pytest.raises(ConfigError, match="OUTPUT_FORMAT|output_format"):
         get_app_config()
+
+
+# ---------------------------- chunk retry wait -------------------------------
+def test_chunk_retry_wait_has_a_default_and_is_env_overridable(mock_env, monkeypatch):
+    """A chunk that fails waits before its next attempt; how long is tunable."""
+    cfg = get_app_config()
+    assert (cfg.chunk_retry_base_delay, cfg.chunk_retry_max_delay) == (5.0, 120.0)
+
+    monkeypatch.setenv("CHUNK_RETRY_BASE_DELAY", "0.5")
+    monkeypatch.setenv("CHUNK_RETRY_MAX_DELAY", "30")
+    cfg = get_app_config()
+    assert (cfg.chunk_retry_base_delay, cfg.chunk_retry_max_delay) == (0.5, 30.0)
+
+
+def test_a_negative_chunk_retry_wait_is_rejected(mock_env, monkeypatch):
+    monkeypatch.setenv("CHUNK_RETRY_BASE_DELAY", "0")
+    with pytest.raises(ConfigError, match="CHUNK_RETRY_BASE_DELAY|chunk_retry_base_delay"):
+        get_app_config()

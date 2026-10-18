@@ -10,7 +10,13 @@ from polyglot_lc.agents.context import (
     source_context_messages,
     stable_prefix_fingerprint,
 )
+from polyglot_lc.llm.resilience import TruncatedError
 from polyglot_lc.memory.tm import TranslationMemory
+
+#: Output-token cap for the one retry that recovers a truncated reply. High
+#: enough that a 700-token chunk (the default ``chunk_max_tokens``) fits with
+#: room to spare; most providers accept up to 4096 on a free tier.
+_RAISED_OUTPUT_CAP = 4096
 
 
 class TranslatorAgent(Agent):
@@ -99,7 +105,24 @@ class TranslatorAgent(Agent):
             self.config.model,
         )
         # Mark the shared read-source prefix as a cache breakpoint.
-        resp = self.chat(prompt, cache_prefix=True)
+        #
+        # A provider that cuts the reply at its own output-token limit raises
+        # TruncatedError: the model was mid-sentence, so the tail of the chunk
+        # was never translated. Retrying with a raised cap is the only fix that
+        # actually recovers those words — a text heuristic cannot tell a cut
+        # sentence from a legitimately short one, so the provider's own
+        # ``finish_reason`` is the signal we act on.
+        try:
+            resp = self.chat(prompt, cache_prefix=True)
+        except TruncatedError:
+            logger.warning(
+                "chunk={} reply was cut at the provider's output-token limit; "
+                "re-asking with a raised cap",
+                chunk_id or "-",
+            )
+            resp = self.chat(
+                prompt, cache_prefix=True, max_tokens=_RAISED_OUTPUT_CAP
+            )
         out = resp.text.strip()
         # Source text is recovered from the shared context markers.
         source = extract_source(prompt)

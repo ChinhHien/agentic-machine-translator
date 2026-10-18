@@ -162,7 +162,14 @@ def test_summary_tree_skips_per_chunk_requests(mock_env, sample_doc):
 
 
 # ------------------------- verifier scope -----------------------------------
-def test_verifier_truncates_source_to_chunk_context(mock_env):
+def test_verifier_sees_the_whole_chunk(mock_env):
+    """The verifier's scope is one chunk, and it reads all of it.
+
+    It used to see the first 2000 characters of the source and call that the
+    chunk's context, so the tail of a longer chunk was verified by nobody. What
+    bounds the scope now is the chunker — the verifier still never sees the
+    whole document, because the document is what the chunker splits.
+    """
     from polyglot_lc.agents import VerifierAgent
     from polyglot_lc.config import get_agent_config
 
@@ -177,9 +184,7 @@ def test_verifier_truncates_source_to_chunk_context(mock_env):
     long_source = "X" * 5000
     result = verifier.verify(long_source, "short translation", "en", "vi")
     assert result.ok is True
-    # Only up to 2000 chars of the source chunk reach the verifier, never the
-    # whole document.
-    assert captured["text"].count("X") <= 2000
+    assert captured["text"].count("X") == 5000
 
 
 # ------------------------- planner runs once --------------------------------

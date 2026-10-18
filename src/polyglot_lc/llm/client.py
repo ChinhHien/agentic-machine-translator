@@ -32,7 +32,9 @@ from polyglot_lc.config import (
 )
 from polyglot_lc.llm.resilience import (
     LLMError,
+    TruncatedError,
     call_with_resilience,
+    is_concurrency_limit,
     normalize_provider_error,
 )
 
@@ -61,6 +63,41 @@ _GATES: dict[str, threading.BoundedSemaphore] = {}
 _GATES_LOCK = threading.Lock()
 
 
+class _ActiveCalls:
+    """Thread-safe count of provider calls actually in flight now."""
+
+    _lock = threading.Lock()
+    _active: int = 0
+    _peak: int = 0
+
+    @classmethod
+    def enter(cls) -> None:
+        with cls._lock:
+            cls._active += 1
+            cls._peak = max(cls._peak, cls._active)
+
+    @classmethod
+    def exit(cls) -> None:
+        with cls._lock:
+            cls._active = max(0, cls._active - 1)
+
+    @classmethod
+    def snapshot(cls) -> dict[str, int]:
+        with cls._lock:
+            return {"active": cls._active, "peak": cls._peak}
+
+    @classmethod
+    def reset(cls) -> None:
+        with cls._lock:
+            cls._active = 0
+            cls._peak = 0
+
+
+def active_api_calls() -> dict[str, int]:
+    """Real in-flight LLM API calls, for UI reports: `{active, peak}`."""
+    return _ActiveCalls.snapshot()
+
+
 def _provider_gate(base_url: str) -> threading.BoundedSemaphore:
     """The queue for *base_url*, created on first use (see ``_GATES``)."""
     with _GATES_LOCK:
@@ -76,6 +113,7 @@ def reset_provider_gates() -> None:
     """Forget the per-provider queues (tests and config reloads)."""
     with _GATES_LOCK:
         _GATES.clear()
+    _ActiveCalls.reset()
 
 
 class TokenUsage:
@@ -203,6 +241,11 @@ class LLMResponse:
     #: "HIT" / "MISS" only when the provider reported cache metadata; "UNKNOWN"
     #: otherwise (absence of metadata is NOT treated as a miss).
     cache_status: str = "UNKNOWN"
+    #: The provider's own end-of-reply verdict: "stop" (finished), "length"
+    #: (cut off at the token limit), "content_filter", or "" when the endpoint
+    #: reported none. "length" is the ground truth for a truncated draft; text
+    #: heuristics cannot tell a cut-off sentence from a legitimately short one.
+    finish_reason: str = "stop"
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -251,10 +294,47 @@ class LLMClient:
         self.config = config
         self._client: OpenAI | None = None
         self._backup: LLMClient | None = None
+        #: Consecutive 429 "another request still holds the slot" rejections
+        #: seen through :meth:`_note_retry`; reaching the configured count
+        #: swaps this client's connection pool (see ``_note_retry``).
+        self._slot_rejects = 0
 
     # ------------------------------------------------------------------
     # Internals
     # ------------------------------------------------------------------
+    def _note_retry(self, err_text: str) -> None:
+        """Circuit breaker for a provider slot that never comes back.
+
+        A request that stalls and is abandoned mid-flight can leave the free
+        tier still counting it against its one-request limit, so every retry
+        through the same keep-alive connection answers 429
+        ``concurrency_limit_exceeded`` — for as long as their side holds the
+        orphan. After ``RetryConfig.slot_rebuild_after`` such rejections in a
+        row, the SDK client is closed (its httpx pool goes with it) and the
+        next call builds a fresh one. A successful call resets the count;
+        other retry reasons (timeouts, 5xx) leave it alone.
+        """
+        if not is_concurrency_limit(err_text):
+            return
+        self._slot_rejects += 1
+        threshold = get_retry_config().slot_rebuild_after
+        if self._slot_rejects < threshold:
+            return
+        self._slot_rejects = 0
+        old, self._client = self._client, None
+        if old is not None:
+            try:
+                old.close()
+            except Exception:  # noqa: BLE001 - a dead pool must not mask the 429
+                pass
+        logger.warning(
+            "Rebuilding HTTP client after {} consecutive slot-limit rejections "
+            "| model={} base_url={}",
+            threshold,
+            self.config.model,
+            self.config.base_url,
+        )
+
     def _sdk(self) -> OpenAI:
         if self._client is None:
             self._client = OpenAI(
@@ -355,14 +435,18 @@ class LLMClient:
             )
         try:
             with _provider_gate(self.config.base_url):
-                resp = self._with_deadline(
-                    lambda: self._sdk().chat.completions.create(
+                _ActiveCalls.enter()
+                try:
+                    resp = self._with_deadline(
+                        lambda: self._sdk().chat.completions.create(
                         model=self.config.model,
                         messages=messages,  # type: ignore[arg-type]
                         temperature=getattr(self.config, "temperature", 0.3),
                         **kw,
                     )
                 )
+                finally:
+                    _ActiveCalls.exit()
         except Exception as exc:
             elapsed = time.monotonic() - start
             if VERBOSE_LLM:
@@ -376,8 +460,19 @@ class LLMClient:
         latency = int((time.monotonic() - start) * 1000)
         choice = resp.choices[0] if resp.choices else None
         text = (choice.message.content if choice and choice.message else "") or ""
+        finish_reason = str(getattr(choice, "finish_reason", "") or "") if choice else ""
         usage = getattr(resp, "usage", None)
         prompt_tokens, completion_tokens, cached_tokens, cache_reported = _parse_usage(usage)
+        if finish_reason == "length":
+            # The model hit the output-token limit: the draft's tail was never
+            # written. Let the caller re-run this chunk with a bigger budget
+            # rather than ship an untranslated tail silently.
+            raise TruncatedError(
+                f"{self.config.model} stopped at the output-token limit "
+                f"({completion_tokens} completion tokens); the reply is a "
+                "prefix of the chunk, not the whole chunk",
+                completion_tokens=completion_tokens,
+            )
         estimated = False
         # Estimated usage when the endpoint omits it (some Ollama/vLLM builds).
         if prompt_tokens == 0 and completion_tokens == 0:
@@ -404,6 +499,7 @@ class LLMClient:
             provider=self.config.base_url,
             usage_estimated=estimated,
             cache_status=_cache_status(cache_reported, cached_tokens),
+            finish_reason=finish_reason,
         )
 
     # ------------------------------------------------------------------
@@ -478,7 +574,10 @@ class LLMClient:
             model=self.config.model,
             backup_provider=(backup.config.base_url if backup else ""),
             backup_model=(backup.config.model if backup else ""),
+            on_retry=self._note_retry,
         )
+        # The provider served us: whatever it was holding, it let go.
+        self._slot_rejects = 0
         resp.via_backup = used_backup
         if VERBOSE_LLM:
             logger.debug(
@@ -509,12 +608,16 @@ class LLMClient:
         try:
             # Embeddings share the provider's concurrency slot with chat calls.
             with _provider_gate(self.config.base_url):
-                resp = self._with_deadline(
-                    lambda: self._sdk().embeddings.create(
+                _ActiveCalls.enter()
+                try:
+                    resp = self._with_deadline(
+                        lambda: self._sdk().embeddings.create(
                         model=self.config.model,
                         input=inputs,
                     )
                 )
+                finally:
+                    _ActiveCalls.exit()
         except Exception as exc:
             raise normalize_provider_error(exc) from exc
         del start

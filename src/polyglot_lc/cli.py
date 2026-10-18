@@ -228,7 +228,16 @@ def translate(
         raise typer.Exit(code=1) from exc
 
     resilience = RetryStats.snapshot()
-    outcome = "Completed" if not result.errors else "Completed with errors"
+    if result.chunks_failed or result.fatal_error:
+        # The verdict is on the deliverable: a chunk never got its translation,
+        # or the run ended on an error.
+        outcome = "Failed"
+    elif result.errors:
+        # Everything asked for was delivered. The provider failures the run
+        # waited out are listed below, but the file itself is complete.
+        outcome = "Completed with errors"
+    else:
+        outcome = "Completed"
     critic_label = "avg critic (est.)" if result.avg_critic_estimate else "avg critic"
     console.print("", markup=False)
     console.print(f"{outcome}.", markup=False)
@@ -264,11 +273,13 @@ def translate(
         resilience["fallbacks"]
         or resilience["rate_limit_retries"]
         or resilience["transient_retries"]
+        or resilience["chunk_retries"]
     ):
         console.print(
             f"  resilience: {resilience['rate_limit_retries']} rate-limit retry(ies), "
             f"{resilience['transient_retries']} transient retry(ies), "
-            f"{resilience['fallbacks']} fallback(s)",
+            f"{resilience['fallbacks']} fallback(s), "
+            f"{resilience['chunk_retries']} chunk run again after errors",
             markup=False,
         )
     if result.errors:

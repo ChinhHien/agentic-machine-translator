@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import threading
 import time
 
@@ -14,9 +15,12 @@ from polyglot_lc.llm.client import (
     LLMClient,
     LLMError,
     TokenUsage,
+    active_api_calls,
     parse_json_reply,
     reset_provider_gates,
 )
+from polyglot_lc.llm.resilience import TruncatedError
+
 
 BASE = "http://mockapi.test/v1"
 
@@ -134,6 +138,33 @@ def test_concurrent_calls_never_overlap_on_a_single_request_provider(monkeypatch
 
 
 @respx.mock
+def test_a_call_in_flight_is_counted_while_it_is_open(monkeypatch):
+    """The Report tab's number is this counter, so it has to move around a real
+    request: counted from inside the provider while the request is still open,
+    back to zero when that request returns, and a peak that remembers the
+    high-water mark once nothing is in flight any more.
+    """
+    monkeypatch.setenv("LLM_PROVIDER_CONCURRENCY", "2")
+    reset_provider_gates()  # also clears the counter, so the run starts at zero
+    seen: dict[str, dict[str, int]] = {}
+
+    def handler(_request: httpx.Request) -> httpx.Response:
+        seen["inside"] = active_api_calls()
+        return httpx.Response(200, json=chat_payload("ok"))
+
+    route = respx.post(CHAT_URL)
+    route.side_effect = handler
+    client = LLMClient(make_agent_config())
+
+    assert active_api_calls() == {"active": 0, "peak": 0}
+    client.chat([{"role": "user", "content": "hi"}])
+    assert seen["inside"] == {"active": 1, "peak": 1}
+    # Released with the call, while the peak survives it: a finished run still
+    # has its high-water mark to report.
+    assert active_api_calls() == {"active": 0, "peak": 1}
+
+
+@respx.mock
 def test_a_concurrency_429_is_survived(monkeypatch):
     """When the queue is widened past the provider's limit, the 429 is retried."""
     monkeypatch.setenv("LLM_PROVIDER_CONCURRENCY", "4")
@@ -161,6 +192,100 @@ def test_a_concurrency_429_is_survived(monkeypatch):
     # is added above the floor (production default 0.2), never below it.
     assert waits and 6.0 <= waits[0] <= 7.2
     assert route.call_count == 2
+
+
+def _slot_429() -> httpx.Response:
+    return httpx.Response(
+        429,
+        json={
+            "error": {
+                "code": "concurrency_limit_exceeded",
+                "message": "Too many concurrent requests (limit: 1)",
+                "limit": 1,
+                "role": "free",
+            }
+        },
+    )
+
+
+@respx.mock
+def test_slot_streak_rebuilds_the_http_client(monkeypatch):
+    """A connection pool that keeps colliding with a held slot is swapped out.
+
+    A stalled request abandoned mid-flight can leave the provider counting it
+    against its one-request limit, so every retry through the same keep-alive
+    connection answers 429 ``concurrency_limit_exceeded``. After the
+    configured streak, the SDK client is closed (its httpx pool goes with it)
+    and the next attempt runs on a fresh one.
+    """
+    monkeypatch.setenv("LLM_RETRY_SLOT_REBUILD_AFTER", "3")
+    route = respx.post(CHAT_URL)
+    route.side_effect = [
+        _slot_429(),
+        _slot_429(),
+        _slot_429(),
+        httpx.Response(200, json=chat_payload("ok")),
+    ]
+    client = LLMClient(make_agent_config())
+    first_sdk = client._sdk()
+
+    assert client.chat([{"role": "user", "content": "hi"}]).text == "ok"
+    # Three rejections in a row hit the threshold on the third, so the fourth
+    # request ran on a new client — and the success reset the streak.
+    assert client._sdk() is not first_sdk
+    assert client._slot_rejects == 0
+    assert route.call_count == 4
+
+
+@respx.mock
+def test_slot_streak_below_threshold_keeps_the_client(monkeypatch):
+    """One or two collisions are ordinary retries: no pool churn."""
+    monkeypatch.setenv("LLM_RETRY_SLOT_REBUILD_AFTER", "5")
+    route = respx.post(CHAT_URL)
+    route.side_effect = [_slot_429(), httpx.Response(200, json=chat_payload("ok"))]
+    client = LLMClient(make_agent_config())
+    first_sdk = client._sdk()
+
+    assert client.chat([{"role": "user", "content": "hi"}]).text == "ok"
+    assert client._sdk() is first_sdk
+    assert client._slot_rejects == 0
+
+
+@respx.mock
+def test_a_success_resets_the_slot_streak(monkeypatch):
+    """The streak is *consecutive*: serving one call clears it."""
+    monkeypatch.setenv("LLM_RETRY_SLOT_REBUILD_AFTER", "2")
+    route = respx.post(CHAT_URL)
+    route.side_effect = [
+        _slot_429(),
+        httpx.Response(200, json=chat_payload("ok")),
+        httpx.Response(200, json=chat_payload("ok again")),
+    ]
+    client = LLMClient(make_agent_config())
+    first_sdk = client._sdk()
+
+    client.chat([{"role": "user", "content": "hi"}])
+    assert client._slot_rejects == 0
+    client.chat([{"role": "user", "content": "hi again"}])
+    assert client._sdk() is first_sdk
+
+
+@respx.mock
+def test_non_slot_retries_do_not_count_toward_the_rebuild(monkeypatch):
+    """A 500 is not a held slot: the streak only tracks concurrency 429s."""
+    monkeypatch.setenv("LLM_RETRY_SLOT_REBUILD_AFTER", "2")
+    route = respx.post(CHAT_URL)
+    route.side_effect = [
+        httpx.Response(500, json={"error": "boom"}),
+        httpx.Response(500, json={"error": "boom"}),
+        httpx.Response(200, json=chat_payload("ok")),
+    ]
+    client = LLMClient(make_agent_config())
+    first_sdk = client._sdk()
+
+    assert client.chat([{"role": "user", "content": "hi"}]).text == "ok"
+    assert client._slot_rejects == 0
+    assert client._sdk() is first_sdk
 
 
 @respx.mock
@@ -400,3 +525,50 @@ def test_mock_chat_records_agent_tokens(mock_env):
     assert by_agent["TRANSLATOR"]["received"] > 0
     assert TokenUsage.snapshot()["estimated_calls"] == 1
     TokenUsage.reset()
+
+def truncated_payload(text: str) -> dict:
+    """A reply the provider cut at its output-token limit."""
+    payload = chat_payload(text)
+    payload["choices"][0]["finish_reason"] = "length"
+    return payload
+
+
+@respx.mock
+def test_a_length_cut_is_a_truncation_not_a_draft():
+    """finish_reason == "length" must raise, never ship as a draft.
+
+    The reply is a real prefix of the chunk, so it reads like a draft and
+    no text heuristic can prove the tail is missing; the provider's own
+    verdict is the only honest signal."""
+    respx.post(CHAT_URL).respond(json=truncated_payload("cutoff prefix"))
+    client = LLMClient(make_agent_config())
+    with pytest.raises(TruncatedError) as excinfo:
+        client.chat([{"role": "user", "content": "hello"}])
+    assert excinfo.value.completion_tokens == 7  # from the mocked usage
+
+
+@respx.mock
+def test_the_translator_re_asks_a_cut_reply_with_a_raised_cap():
+    """A cut reply is re-requested with a bigger output budget, once.
+
+    The retry passes max_tokens explicitly, which is what lifts the cap
+    the provider cut the first reply on; the recovered draft is returned
+    normally (and lands in the translation memory).
+    """
+    from polyglot_lc.agents.translator import TranslatorAgent
+
+    route = respx.post(CHAT_URL)
+    route.side_effect = [
+        httpx.Response(200, json=truncated_payload("đoạn bị cắt")),
+        httpx.Response(200, json=chat_payload("bản dịch đầy đủ")),
+    ]
+    agent = TranslatorAgent(make_agent_config())
+    prompt = agent.build_prompt("Chunk text.", "en", "vi", "translate")
+    out = agent.translate(prompt, chunk_id="chunk-000")
+
+    assert out == "bản dịch đầy đủ"
+    assert route.call_count == 2
+    first = json.loads(route.calls[0].request.content)
+    assert "max_tokens" not in first, "the first ask must not set a cap"
+    second = json.loads(route.calls[1].request.content)
+    assert second.get("max_tokens") == 4096

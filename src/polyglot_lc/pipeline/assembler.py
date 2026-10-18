@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import difflib
+import math
 import os
 import re
+import statistics
 import threading
 from pathlib import Path
 from typing import Any
@@ -47,6 +49,10 @@ _WS_RE = re.compile(r"\s+")
 #: Similarity at which two consecutive paragraphs count as the same content
 #: translated twice (0..1).
 _NEAR_DUPLICATE_RATIO = 0.85
+
+#: Score of an alignment state that cannot be reached, so every option below is
+#: preferred to it (see :func:`_align_paragraphs`).
+_UNREACHED = float("-inf")
 
 #: A table-of-contents entry: a dot leader (or the collapsed ellipsis form) and
 #: an optional page number. Two *distinct* entries in a row are two entries,
@@ -214,10 +220,195 @@ def assemble(
     return emphasis.to_markdown(_deduplicate_paragraphs(assembled))
 
 
+#: A token a translation is expected to keep as it stands: a number, a
+#: shielded code placeholder, or an identifier / proper noun (it carries a
+#: digit, an underscore, a colon or an internal capital). Translations change
+#: words; these are the things a reader would notice as wrong if they changed.
+_ANCHOR_RE = re.compile(
+    r"⟦CODE_\d+⟧|\d[\d.,:%]*|[A-Za-z][A-Za-z0-9_]*[A-Z_][A-Za-z0-9_]*"
+    r"|[A-Za-z]+:[A-Za-z]+|[A-Za-z]+\d+[A-Za-z\d]*"
+)
+
+#: What makes a source block and a translated paragraph look like each other's:
+#: the evidence they share (see :data:`_ANCHOR_RE`), the shape they were laid out
+#: in (a heading stays a heading, a five-item list stays a five-item list), and
+#: how their lengths compare with the rest of the run. One block per paragraph is
+#: the norm, so a plausible pair starts from a positive score: reading a block
+#: and a paragraph in order must beat rearranging them into a merge and a split,
+#: or a flat run of prose would be free to drift.
+_PAIR_BASE = 1.0
+_ANCHOR_WEIGHT = 1.5
+_SHAPE_WEIGHT = 1.0
+_RATIO_WEIGHT = 1.0
+
+#: What an alignment step costs when it is *not* one source block per paragraph.
+#: A merge — a title the source wrapped over two blocks comes back as one
+#: paragraph — is worth something when the two blocks read as one sentence and
+#: the paragraph accounts for both their lengths, and loses more than that when
+#: they do not. A block the translator left out costs less than that, and it is
+#: kept in its own language: an entry that survived as English is a loss the
+#: reader can see, and a paragraph stretched over it is a loss they cannot.
+_FOLD_BONUS = 0.5
+_FOLD_PENALTY = 1.5
+_DROP_BLOCK_COST = 0.6
+_SPLIT_COST = 0.2
+_STRAY_PARAGRAPH_COST = 2.0
+
+#: A block that ends a sentence ends a paragraph: the next block that does not
+#: start a heading or a list item is a continuation of it ("...Rapidly Changing
+#: Data" / "Model for Dealing with..."). A contents entry is a whole item too,
+#: however its title reads: it ends at its page number, not at a full stop.
+_SENTENCE_END = ".!?:;…"
+_LINE_STARTS = ("#", "-", "*", "|")
+_CONTENTS_TAIL_RE = re.compile(r"(?:…|\.{3,})\s*\d{1,4}\s*$")
+
+
+def _anchor_tokens(text: str) -> set[str]:
+    """The tokens of *text* that a translation is expected to keep."""
+    return set(_ANCHOR_RE.findall(text))
+
+
+def _shape_score(source: str, paragraph: str) -> float:
+    """How much the block's *place in the document* agrees with the paragraph's.
+
+    A heading marker survives translation, and so does the number of items of a
+    list; both are structure the translator was asked to keep, so their absence
+    is evidence about which paragraph this block owns.
+    """
+    score = 0.0
+    stripped = paragraph.lstrip()
+    if source.lstrip().startswith("#"):
+        score += 1.0 if stripped.startswith("#") else -0.5
+    items = sum(1 for line in source.splitlines() if line.lstrip().startswith(("- ", "* ")))
+    if items:
+        got = sum(1 for line in paragraph.splitlines() if line.lstrip().startswith(("- ", "* ")))
+        score += 1.0 if got == items else -0.5
+    return score
+
+
+def _pair_score(source: str, paragraph: str, norm: float) -> float:
+    """How much *paragraph* looks like the translation of *source*."""
+    anchors = _anchor_tokens(source)
+    shared = len(anchors & _anchor_tokens(paragraph)) / len(anchors) if anchors else 0.0
+    ratio = math.exp(-abs(math.log(max(len(paragraph), 1) / max(len(source), 1) / norm)))
+    return (
+        _PAIR_BASE
+        + _ANCHOR_WEIGHT * shared
+        + _SHAPE_WEIGHT * _shape_score(source, paragraph)
+        + _RATIO_WEIGHT * ratio
+    )
+
+
+def _fold_evidence(source: str, following: str, paragraph: str, norm: float) -> float:
+    """What it is worth to read *following* as the rest of *source*'s sentence.
+
+    Two things have to hold at once: the sentence reads on into the next block,
+    and the paragraph accounts for both blocks' words — which is what a source
+    title wrapped over two blocks looks like once it is translated. Evidence of
+    only one of the two is not enough to move a block's translation off it.
+    """
+    combined = max(len(source) + len(following), 1)
+    fit = math.exp(-abs(math.log(max(len(paragraph), 1) / combined / norm)))
+    read_on = _FOLD_BONUS if _continues(source, following) else -_FOLD_PENALTY
+    return 0.5 * fit + read_on
+
+
+def _continues(source: str, following: str) -> bool:
+    """True when *following* reads as the rest of *source*'s sentence."""
+    body = source.rstrip()
+    if not body:
+        return True
+    if body[-1] in _SENTENCE_END or _CONTENTS_TAIL_RE.search(body):
+        return False
+    if body.lstrip().startswith(_LINE_STARTS):
+        return False  # a heading or a list item is a whole block, not a clause
+    head = following.lstrip()[:1]
+    return bool(head) and head not in _LINE_STARTS
+
+
+def _align_paragraphs(
+    sources: list[str], paragraphs: list[str], norm: float
+) -> list[list[int] | None] | None:
+    """Which paragraph(s) each source block owns, in document order.
+
+    A dynamic program over the two lists: the translator may return one
+    paragraph for two short blocks (a wrapped title) or two paragraphs for one
+    long block, and *which* it did is decided by the evidence — the numbers and
+    identifiers the two share, the shape they are laid out in, and how their
+    lengths compare with the run's — never by the paragraph's position in the
+    list.
+
+    One entry per source block: the paragraph indices it owns, ``[]`` when its
+    words are in the paragraph printed for the block above it (the merge), and
+    ``None`` when the translation has no text for it at all — the block then
+    keeps its own language rather than having a neighbour's paragraph stretched
+    over it. ``None`` for the whole alignment means it could not be worked out.
+    """
+    n, m = len(sources), len(paragraphs)
+    if n == 0 or m == 0:
+        return None
+    scores = [[_pair_score(s, p, norm) for p in paragraphs] for s in sources]
+    best: list[list[float]] = [[_UNREACHED] * (m + 1) for _ in range(n + 1)]
+    move: list[list[str]] = [[""] * (m + 1) for _ in range(n + 1)]
+    best[0][0] = 0.0
+
+    def offer(i: int, j: int, value: float, name: str) -> None:
+        if value > best[i][j]:
+            best[i][j], move[i][j] = value, name
+
+    for i in range(n + 1):
+        for j in range(m + 1):
+            here = best[i][j]
+            if here == _UNREACHED:
+                continue
+            if i < n and j < m:
+                offer(i + 1, j + 1, here + scores[i][j], "pair")
+            if i < n and i > 0 and j > 0:
+                # The block above took this block's words with it: the paragraph
+                # already printed for it is this block's translation too, so no
+                # paragraph is consumed here — only this block's own lines are.
+                gain = _fold_evidence(sources[i - 1], sources[i], paragraphs[j - 1], norm)
+                offer(i + 1, j, here + gain, "fold")
+            if i < n:
+                # No paragraph for this block: the translator left it out.
+                offer(i + 1, j, here - _DROP_BLOCK_COST, "drop")
+            if i < n and j + 1 < m:
+                # One block came back as two paragraphs: they are one block's
+                # text, so the move is worth what they average out to.
+                both = (scores[i][j] + scores[i][j + 1]) / 2 - _SPLIT_COST
+                offer(i + 1, j + 2, here + both, "split")
+            if j < m:
+                offer(i, j + 1, here - _STRAY_PARAGRAPH_COST, "stray")
+
+    if best[n][m] == _UNREACHED:
+        return None
+    owners: list[list[int] | None] = [[] for _ in range(n)]
+    i, j = n, m
+    while (i, j) != (0, 0):
+        kind = move[i][j]
+        if kind == "pair":
+            owners[i - 1].append(j - 1)
+            i, j = i - 1, j - 1
+        elif kind == "fold":
+            i -= 1
+        elif kind == "drop":
+            owners[i - 1] = None
+            i -= 1
+        elif kind == "split":
+            owners[i - 1].append(j - 1)
+            owners[i - 1].append(j - 2)
+            i, j = i - 1, j - 2
+        elif kind == "stray":
+            j -= 1
+        else:  # pragma: no cover - every reachable state was entered by a move
+            return None
+    return [sorted(owned) if owned else owned for owned in owners]
+
+
 def block_translations(
     chunks: list[Any],
     translations: dict[str, str],
-) -> dict[int, str]:
+) -> dict[int, str | None]:
     """Per-source-block translated text, with the same overlap rules.
 
     Parallel to :func:`assemble`: the same chunks, the same overlap removal and
@@ -226,10 +417,18 @@ def block_translations(
     the de-duplication rules in a second place is exactly how the Markdown and
     PDF outputs would start to disagree about which translation belongs where.
 
+    The block each paragraph belongs to is decided by :func:`_align_paragraphs`,
+    not by counting: a translator that merges two of the chunk's blocks into one
+    paragraph, or splits one into two, used to move every later paragraph onto
+    the wrong block — printed in the wrong place on the page, at the wrong size.
+
     A block whose translation cannot be pinned down is simply absent: the caller
-    keeps its source text rather than printing the wrong paragraph over it.
+    keeps its source text rather than printing the wrong paragraph over it. A
+    block whose words went into the paragraph above it maps to ``None``: its
+    source lines are part of a sentence that was translated there, so they are
+    cleared and nothing is printed in their place.
     """
-    out: dict[int, str] = {}
+    out: dict[int, str | None] = {}
     for i, chunk in enumerate(chunks):
         text = translations.get(chunk.id)
         refs = _block_refs(chunk)
@@ -245,20 +444,44 @@ def block_translations(
         kept, targets = paragraphs[drop:], refs[drop:]
         if not targets:
             continue
-        if len(kept) == len(targets):
-            out.update(zip(targets, kept))
-        elif len(kept) > len(targets):
+        # The chunk carries its own source text — one piece per block, which is
+        # what the chunker joined it from — so the evidence is available without
+        # a second argument. A caller that cannot supply it keeps the old
+        # position-by-position pairing rather than guessing at an alignment.
+        sources = str(getattr(chunk, "text", "") or "").split(CHUNK_SEPARATOR)[drop:]
+        alignable = len(sources) == len(targets) and all(source.strip() for source in sources)
+        owners = _align_paragraphs(sources, kept, _ratio_norm(kept, sources)) if alignable else None
+        if owners is not None:
+            for ref, owned in zip(targets, owners):
+                if owned is None:
+                    continue  # the translator left it out: its source text stays
+                if not owned:
+                    # Covered by the paragraph printed for the block above it.
+                    out[ref] = None
+                else:
+                    out[ref] = CHUNK_SEPARATOR.join(kept[index] for index in owned)
+            continue
+        for ref, paragraph in zip(targets, kept):
+            out[ref] = paragraph
+        if len(kept) > len(targets):
             # The translator produced more paragraphs than the chunk had blocks
             # (it split one): keep them all on the last block instead of
             # dropping the tail.
-            for ref, paragraph in zip(targets, kept):
-                out[ref] = paragraph
             out[targets[-1]] = CHUNK_SEPARATOR.join(kept[len(targets) - 1 :])
-        else:
-            # Fewer paragraphs than blocks (it merged two): the blocks it ran
-            # out of text for keep their source lines.
-            out.update(zip(targets, kept))
     return out
+
+
+def _ratio_norm(paragraphs: list[str], sources: list[str]) -> float:
+    """The typical out/in length ratio of a run: Vietnamese is not English, and
+    a book's contents entries are not its prose, so each chunk is its own
+    yardstick."""
+    ratios = [
+        len(paragraph) / len(source)
+        for paragraph, source in zip(paragraphs, sources)
+        if source.strip()
+    ]
+    ratios = [r for r in ratios if r > 0]
+    return statistics.median(ratios) if ratios else 1.0
 
 
 def assemble_partial(

@@ -4,10 +4,17 @@ Each finished chunk is written to ``<root>/<doc_key>/<chunk_id>.json`` as it
 completes, so an interrupted run (Ctrl-C, provider outage, crash) can be
 resumed with ``--resume`` instead of paying for every chunk again.
 
-A checkpoint belongs to one *document identity* — file path, size, mtime, the
-language pair, the domain, the Translator model and the chunk hashes. Any of
-those changing invalidates the whole directory, so a resumed run can never
-reuse results produced from different input or a different chunking.
+A checkpoint belongs to one *document identity* — its path, the digest of its
+bytes, the language pair, the domain, the Translator model and the chunk hashes.
+Any of those changing invalidates the whole directory, so a resumed run can
+never reuse results produced from different input or a different chunking.
+
+The document's identity is its **content**, never its ``mtime``. The web UI
+uploads a file it has already uploaded again (same name, same bytes), the write
+lands a fresh ``mtime`` on the same document, and keyed on ``size:mtime`` that
+harmless rewrite orphaned every chunk a paused run had translated — "Tiếp tục"
+then quietly re-translated the whole document from the first chunk. The byte
+digest changes exactly when the document does.
 
 Checkpointing is best-effort by design: a read-only or missing directory logs a
 warning and disables the store instead of failing the translation.
@@ -65,6 +72,20 @@ class ChunkCheckpoint:
         )
 
 
+def _content_digest(path: str | Path) -> str:
+    """SHA-256 of the file's bytes; ``""`` when it cannot be read.
+
+    Unreadable input yields an empty component rather than an exception: the
+    pipeline reports the unreadable document itself, and a key built without
+    this part is still stable for the run that is about to fail on it.
+    """
+    try:
+        with Path(path).open("rb") as handle:
+            return hashlib.file_digest(handle, "sha256").hexdigest()
+    except OSError:  # pragma: no cover - the pipeline reports unreadable input
+        return ""
+
+
 class CheckpointStore:
     """Reads and writes per-chunk checkpoints under one root directory."""
 
@@ -102,11 +123,8 @@ class CheckpointStore:
         for chunk_hash in chunk_hashes:
             digest.update(chunk_hash.encode("utf-8"))
             digest.update(b"\x00")
-        try:
-            stat = Path(file_path).stat()
-            digest.update(f"{stat.st_size}:{int(stat.st_mtime)}".encode())
-        except OSError:
-            pass
+        digest.update(_content_digest(file_path).encode("utf-8"))
+        digest.update(b"\x00")
         return digest.hexdigest()[:16]
 
     # ------------------------------------------------------------------

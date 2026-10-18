@@ -10,9 +10,11 @@ from __future__ import annotations
 
 from polyglot_lc.ingest import load_document
 from polyglot_lc.ingest.md import parse_markdown
-from polyglot_lc.ingest.model import Document
+from polyglot_lc.ingest.model import Block, Document
 from polyglot_lc.ingest.pdf_layout import (
     _build_units,
+    _line_spacing,
+    _page_lines,
     _table_grid,
     bind_page_geometry,
     line_text,
@@ -48,6 +50,16 @@ def _line(
     tokens: list[str], top: float, x0: float = 100.0, size: float = 12.0, font: str = BODY
 ) -> dict:
     return {"chars": _chars(tokens, x0, size, font), "top": top}
+
+
+def _words(text: str) -> list[str]:
+    """One line's tokens, written out as the words a reader would see.
+
+    The extractor never sees spaces — it rebuilds them from the gaps between
+    glyph runs — so a fixture's line is a list of words either way; this just
+    spares every fixture the same twelve-element list.
+    """
+    return text.split()
 
 
 class _StubPage:
@@ -174,6 +186,53 @@ def test_chapter_title_lines_merge_into_one_heading():
     assert md.strip() == "# Chapter 3 ArrayList"
 
 
+def test_cover_fields_that_each_open_with_a_bold_label_are_separate_blocks():
+    """A title page sets its fields at prose leading, one field per line.
+
+    The lines carry no sentence-ending punctuation and their gaps are the
+    page's normal leading, so spacing reads them as one wrapped paragraph and
+    the whole field list arrives glued into a single block: translated as one
+    run-on paragraph, and printed as one shapeless blob on the rebuilt cover.
+    A bold, colon-terminated label opening *every* line is what tells them
+    apart: a wrapped continuation never opens with one.
+    """
+    fields = [
+        ("Project Title:", "Design of a Web System"),
+        ("Project Category:", "Software Engineering"),
+        ("Programming Languages:", "Python, JavaScript"),
+        ("Backend Framework:", "Django"),
+    ]
+    lines = [
+        _styled_line(
+            [(_words(label), BOLD_FACE), (_words(value), BODY)], top=100.0 + 14.5 * i
+        )
+        for i, (label, value) in enumerate(fields)
+    ]
+    md = pages_to_markdown([_page(lines)])
+    assert md.count("\n\n") == len(fields) - 1
+    for label, value in fields:
+        assert f"⟦BOLD⟧{label}⟦/BOLD⟧ {value}" in md
+
+
+def test_a_wrapped_paragraph_of_bold_lead_ins_still_stays_one_block():
+    """One labelled line before regular prose is a definition, not a field run.
+
+    Only two *consecutive* labelled lines break the block: a lone bold label
+    may be a definition line whose text reads on into the paragraph below it,
+    and a prose wrap never opens with a bold label of its own.
+    """
+    lines = [
+        _styled_line(
+            [(["Deployment", "Steps:"], BOLD_FACE), (_words("The application is deployed"), BODY)],
+            top=100.0,
+        ),
+        _line(_words("behind a reverse proxy in production."), top=114.5),
+    ]
+    md = pages_to_markdown([_page(lines)])
+    assert "\\n" not in md.strip()
+    assert "⟦BOLD⟧Deployment Steps:⟦/BOLD⟧ The application is deployed" in md
+
+
 def test_running_head_is_dropped():
     lines = [
         _line(["10", "Chapter", "2", "Analysis"], top=91.0, font=BOLD),
@@ -233,6 +292,76 @@ def test_content_line_carrying_a_year_is_not_a_running_head():
     )
     md = pages_to_markdown([page])
     assert "Windows Server 2016 / 2019 / 2022 is supported." in md
+
+
+# ------------------------------ running feet -------------------------------
+def test_a_running_foot_is_not_glued_to_the_next_page_s_first_line():
+    """Chân trang (số trang) bị dán với dòng đầu trang sau thành một khối.
+
+    Số trang nằm dưới cùng trang; sang trang sau, dòng đầu trang lại ở toạ độ
+    *nhỏ* hơn dòng cuối trang trước, nên phép đo khoảng cách đọc hai dòng đó là
+    cùng một đoạn. Khối sinh ra chỉ sở hữu hình chữ nhật của số trang — một ô
+    rộng vài point — và bản dịch của cả khối bị in vào đó.
+    """
+    pages = [
+        _page(
+            [
+                _line(["Body", "text", "that", "ends"], top=520.0),
+                _line(["7"], top=560.0, x0=375.0),
+            ],
+            height=595.0,
+        ),
+        _page([_line(["Next", "page", "text."], top=60.0)], height=595.0),
+    ]
+    md = pages_to_markdown(pages)
+    assert "Next page text." in md
+    assert "7" not in md, "số trang là trang trí của trang, không phải nội dung"
+    doc = _bound_doc(pages)
+    assert _pages_of(doc) == [[0], [1]], "không khối nào được nằm trên hai trang"
+
+
+def test_a_paragraph_the_page_break_cut_in_half_reads_on():
+    """Ngoại lệ duy nhất của luật trên: câu bị ngắt giữa dòng vẫn nối lại.
+
+    Không có dấu kết câu ở cuối trang trước và dòng đầu trang sau bắt đầu bằng
+    chữ thường — đó là một đoạn văn, không phải hai khối.
+    """
+    pages = [
+        _page([_line(["The", "sentence", "continues"], top=520.0)], height=595.0),
+        _page([_line(["on", "the", "next", "page."], top=60.0)], height=595.0),
+    ]
+    md = pages_to_markdown(pages)
+    assert "The sentence continues on the next page." in md
+
+
+def test_two_headings_on_different_pages_are_not_one_title():
+    """Với số trang đã bỏ, không còn gì xen giữa hai dòng tiêu đề lớn.
+
+    Luật gộp "Chapter 3" / "ArrayList" chỉ đúng khi hai dòng là *một* tiêu đề bị
+    ngắt dòng — cùng một trang. Tiêu đề phần ở đầu trang này và tiêu đề chương ở
+    đầu trang sau là hai tiêu đề, và trước đây chỉ được tách ra nhờ dòng số trang
+    nằm giữa chúng.
+    """
+    pages = [
+        _page([_line(["Part", "I.", "Introduction"], top=100.0, size=24.0)], height=595.0),
+        _page([_line(["1.", "Introduction"], top=100.0, size=24.0)], height=595.0),
+    ]
+    md = pages_to_markdown(pages)
+    assert md.count("# ") == 2, md
+    assert "# Part I. Introduction" in md
+    assert "# 1. Introduction" in md
+
+
+def test_a_page_without_a_height_keeps_every_line():
+    """Trang không cho biết chiều cao thì không dòng nào bị coi là chân trang.
+
+    ``_footer_band`` trả vô cực trong trường hợp đó: thà giữ lại một số trang còn
+    hơn bỏ nhầm một dòng nội dung ở đáy một trang mình không đo được.
+    """
+    page = _page([_line(["Body", "text"], top=520.0), _line(["7"], top=560.0, x0=375.0)])
+    md = pages_to_markdown([page])
+    assert "7" in md
+    assert "Body text" in md
 
 
 def test_heading_threshold_follows_the_document_font_size():
@@ -307,6 +436,95 @@ def _bound_doc(pages: list) -> Document:
     doc = parse_markdown(render_markdown(units), source_format="pdf")
     bind_page_geometry(doc, units)
     return doc
+
+
+def _layout_fixture() -> tuple[Document, list]:
+    """Three pages: a heading and a paragraph each, and a numbered list.
+
+    Each block owns its own line(s) — page 2's list owns three units, one per
+    item — so a block's geometry can be told apart from its neighbour's. Every
+    page opens with a heading because a paragraph *continues* onto the next
+    page until a line of another kind ends it (that is what a real page break
+    looks like to the extractor: the next line is higher up the page).
+    """
+    pages = [
+        _page(
+            [
+                _line(["Chapter", "One"], top=100.0, size=24.0),
+                _line(["Alpha", "paragraph", "text."], top=150.0),
+            ],
+            height=595.0,
+        ),
+        _page(
+            [
+                _line(["Chapter", "Two"], top=100.0, size=24.0),
+                _line(["Beta", "paragraph", "text."], top=150.0),
+                _line(["1.", "First", "item"], top=200.0),
+                _line(["2.", "Second", "item"], top=215.0),
+                _line(["3.", "Third", "item"], top=230.0),
+            ],
+            height=595.0,
+        ),
+        _page(
+            [
+                _line(["Chapter", "Three"], top=100.0, size=24.0),
+                _line(["Gamma", "paragraph", "text."], top=150.0),
+            ],
+            height=595.0,
+        ),
+    ]
+    units = _build_units(pages)
+    return parse_markdown(render_markdown(units), source_format="pdf"), units
+
+
+def _pages_of(doc: Document) -> list[list[int]]:
+    """The source page of every line of every bound block, in order."""
+    return [
+        [int(rect[0]) for rect in block.meta["pdf"]["rects"]]
+        for block in doc.blocks
+        if "pdf" in block.meta
+    ]
+
+
+def test_every_block_is_bound_to_the_units_it_was_parsed_from():
+    """Not to the unit in the same position: to the unit holding its text.
+
+    Ran on the book this was written for, the positional walk drifted: of the
+    572 blocks whose source page could be pinned down, 250 carried geometry
+    from 1 to 7 pages away — a paragraph bound to one line of a page six pages
+    on is a page of 5.5 pt type printed over another page's words.
+    """
+    doc, units = _layout_fixture()
+    assert bind_page_geometry(doc, units) == len(doc.blocks) == 7
+    assert [block.kind for block in doc.blocks] == [
+        "heading",
+        "paragraph",
+        "heading",
+        "paragraph",
+        "list",
+        "heading",
+        "paragraph",
+    ]
+    assert _pages_of(doc) == [[0], [0], [1], [1], [1, 1, 1], [2], [2]]
+    assert [round(rect[2]) for rect in doc.blocks[4].meta["pdf"]["rects"]] == [200, 215, 230]
+    assert doc.blocks[4].meta["pdf"]["markers"] == ["1.", "2.", "3."]
+
+
+def test_a_block_with_no_unit_of_its_own_takes_no_other_block_s_lines():
+    """The one thing the geometry must never do: move onto someone else's text.
+
+    A block the Markdown parser produced without units of its own used to be
+    matched by kind to whatever unit the walk had reached, so it was printed
+    over the *next* block's source lines and every block after it moved on by
+    one. An unmatched block is now left unbound — it keeps its source text —
+    and the blocks after it still own their own lines.
+    """
+    doc, units = _layout_fixture()
+    rogue = Block(kind="paragraph", text="A paragraph no unit produced.")
+    doc.blocks.insert(2, rogue)
+    assert bind_page_geometry(doc, units) == 7
+    assert "pdf" not in rogue.meta
+    assert _pages_of(doc) == [[0], [0], [1], [1], [1, 1, 1], [2], [2]]
 
 
 def test_table_cell_boxes_line_up_with_the_markdown_matrix():
@@ -445,6 +663,89 @@ def test_paragraph_gap_splits_but_line_spacing_does_not():
     assert "First line of the paragraph. Wrapped second line." in md
     assert md.count("\n\n") == 1
     assert md.endswith("A brand new paragraph.")
+
+
+def test_a_diagram_page_measures_its_prose_and_not_its_figure_labels():
+    """The labels of a figure are set smaller and tighter than the prose around
+    them, and on a diagram page they can outnumber the prose lines outright: the
+    book this was written against gives eleven 8.45 pt gaps between 7.2 pt labels
+    and twelve 11.96 pt gaps between 10 pt prose lines on page 11.
+
+    A yardstick taken from every gap on the page then sat at 8.45 pt, *under* the
+    real 11.96 pt leading — and since a break is "more than 1.35 x the yardstick",
+    every line of every real paragraph read as a fresh paragraph: the three-line
+    paragraph below arrived as three blocks, and each list item as one block per
+    line. The rhythm is the gap that repeats between lines of the page's own body
+    size, so the labels' tighter rhythm never answers for the prose.
+    """
+    labels = [
+        _line(["JRuby", "JRuby"], top=100.0, size=9.0),
+        _line(["Wrappers"], top=108.45, size=9.0),
+        _line(["Clojure"], top=116.9, size=9.0),
+        _line(["Sesame", "APIs"], top=125.35, size=9.0),
+        _line(["RDF"], top=133.8, size=9.0),
+    ]
+    prose = [
+        _line(_words("First line of the paragraph, which runs on to the edge."), top=200.0),
+        _line(_words("Wrapped second line of it."), top=215.2),
+        _line(_words("Third line of it."), top=230.4),
+        _line(_words("Fourth line of it."), top=245.6),
+        _line(_words("Fifth line of it."), top=260.8),
+        _line(_words("A brand new paragraph starts here."), top=288.0),
+    ]
+    page = _page(labels + prose)
+    assert abs(_line_spacing(_page_lines(page, 0)) - 15.2) < 0.05
+    blocks = pages_to_markdown([page]).split("\n\n")
+    paragraph = next(b for b in blocks if b.startswith("First line of the paragraph"))
+    assert paragraph == (
+        "First line of the paragraph, which runs on to the edge. Wrapped second line "
+        "of it. Third line of it. Fourth line of it. Fifth line of it."
+    )
+    assert "A brand new paragraph starts here." in blocks
+
+
+def test_a_figure_label_is_its_own_block_and_a_footnote_is_not():
+    """A figure's labels are set smaller *and* narrower than the body text, and a
+    run of them read as one paragraph owns a scatter of rectangles: the rebuilt
+    PDF then prints one translation across the whole scatter. Each label is a
+    block of its own instead.
+
+    Being small is not enough to make a line a label. A note is set smaller too,
+    and its last line is short and narrow — just like a label's. What tells them
+    apart is that the note's sentence started on the line above: a line that
+    reads on from the one above it is never a label, and one whose line above
+    was left mid-sentence is a continuation whichever letter it opens with.
+    """
+    page = _page(
+        [
+            _line(_words("Body line one that spans the text block."), top=100.0),
+            _line(_words("Body line two of the same paragraph here."), top=115.2),
+            _line(_words("Body line three of the same paragraph."), top=130.4),
+            _line(_words("Body line four of the same paragraph."), top=145.6),
+            _line(["RDF"], top=200.0, size=9.0),
+            _line(["Filters"], top=208.45, size=9.0),
+            _line(["Store"], top=216.9, size=9.0),
+            # A note whose last line is short, narrow, and starts lowercase.
+            _line(_words("Footnote one with a full measure of words and"), top=260.0, size=10.5),
+            _line(_words("matching tail"), top=275.2, size=10.5),
+            # ... and one whose last line opens with a capital, the line above it
+            # having been left mid-sentence.
+            _line(_words("Footnote two refers to RDF Examples"), top=300.0, size=10.5),
+            _line(["Apress", "2009"], top=315.2, size=10.5),
+        ]
+    )
+    assert pages_to_markdown([page]).split("\n\n") == [
+        (
+            "Body line one that spans the text block. Body line two of the same "
+            "paragraph here. Body line three of the same paragraph. Body line four of "
+            "the same paragraph."
+        ),
+        "RDF",
+        "Filters",
+        "Store",
+        "Footnote one with a full measure of words and matching tail",
+        "Footnote two refers to RDF Examples Apress 2009",
+    ]
 
 
 def test_hyphenated_line_break_is_rejoined():

@@ -5,10 +5,20 @@
  * quiet chrome around them exists to start a job, watch it honestly, and take
  * the result away. Nothing here reports on the tool's own configuration.
  *
- * Colour is a cool neutral scale with one accent. That accent is the project's
- * own ink — the cyan the pipeline uses for "this term, everywhere" — so the
- * interface and the product still speak one vocabulary, while the surfaces
- * stay calm enough to read a book against.
+ * Dark is the default surface. This page is a workspace for reading one
+ * document against another, and the two panes are where a reader's eyes stay:
+ * so the chrome is dark, shallow and quiet, the one accent is the ink the
+ * pipeline itself uses for "this term, everywhere", and nothing glows. A reader
+ * whose system asks for light gets a light set instead (see the tokens below);
+ * no rule anywhere else in this sheet knows which of the two is in force.
+ *
+ * Four regions, one column of flow: the library (a collapsible column of past
+ * runs), the document header (one line naming the open document), the run's own
+ * strip (a state line, a bar, and the phases of the pass), and the reading
+ * workspace — the two columns a reader holds one against the other, which take
+ * every pixel left over and scroll inside themselves rather than scrolling the
+ * page. On a phone the library becomes a drawer and the page scrolls as a
+ * document again; on a tablet the two columns stack.
  *
  * Three type roles, each doing one job:
  *   --font-doc  the document itself, in both panes: the only text read at length
@@ -20,41 +30,54 @@
  *   .job-row[data-state=running|done|failed|stopped]
  *   .badge[data-state=empty|running|done|failed|stopped]
  *   .bar[data-state=wait|running|ok|fail]
- *   .step[data-state=wait|running|ok|fail]
+ *   .step[data-state=running|ok|fail]
  *   .pane[data-state=empty|loading|done|failed]
  *   .alert[data-kind=warn|error|ok]
  *   .drop[data-state=idle|over|busy|bad]
+ *   .layout[data-rail=expanded|collapsed|open]  the library's own shape
+ *     (expanded is the default; `open` is the drawer's, on a narrow screen)
+ *   .panes[data-zoom=on|off]  the reading workspace, widened or not
+ *   .seg--toggle[aria-pressed=true]  whether the columns travel together
+ *   .chunk[data-state=wait|running|ok|fail]  one chunk in the status tab
+ *   .chunk[data-recovered=true]  a chunk whose failure the run walked past
+ *   .log-line[data-status=start|ok|retry|fail|info|patched|note]  one log line
+ *   .log-line[data-expanded=true|false]  a log line opened to its own detail
  *   .chip[aria-pressed=true]            the filter in force
  *   .view-switch button[aria-pressed=true]   the layout in force
+ *   .tab[aria-selected=true]            the detail tab in force
+ *   .preloader--leaving                  the first paint on its way out
  */
 
 :root {
-  /* Surfaces, from the page back to the raised surface on top of it. */
-  --bg: #F8FAFC;
-  --surface: #FFFFFF;
-  --sunken: #F1F5F9;
-  --border: #E2E8F0;
-  --border-strong: #CBD5E1;
+  /* Surfaces, from the page back to the surface raised over a panel. */
+  --bg: #0E1318;
+  --rail-bg: #141B21;
+  --surface: #192127;
+  --sunken: #10161B;
+  --elevated: #202B33;
+  --border: #26343D;
+  --border-strong: #35454F;
 
   /* Text, strongest first. --muted clears 4.5:1 on --surface. */
-  --text: #0F172A;
-  --soft: #334155;
-  --muted: #64748B;
+  --text: #E6EDF1;
+  --soft: #C3CDD6;
+  --muted: #9AAAB5;
 
-  /* One accent, plus the three outcomes that mean something. */
-  --accent: #0F6E7D;
-  --accent-weak: #E6F1F3;
-  --patch: #B3247A;
-  --warn: #B45309;
-  --danger: #B91C1C;
-  --danger-weak: #FEF2F2;
-  --warn-weak: #FFFBEB;
-  --ok-weak: #ECFDF5;
+  /* One accent, plus the four outcomes that mean something. */
+  --accent: #58C3D0;
+  --accent-weak: #123039;
+  --patch: #E06BAE;
+  --ok: #2DAA78;
+  --ok-weak: #10241C;
+  --warn: #D9A441;
+  --warn-weak: #2A2113;
+  --danger: #E06C75;
+  --danger-weak: #2A1618;
 
   --radius: 10px;
   --radius-sm: 6px;
   --radius-lg: 14px;
-  --shadow: 0 10px 30px rgba(15, 23, 42, 0.14);
+  --shadow: 0 16px 40px rgba(0, 0, 0, 0.45);
 
   /* No webfont and no CDN: the page has to work offline. The serif stack keeps
      the platform's book face in front, because both panes are documents. */
@@ -66,8 +89,8 @@
   --fs-sm: 13px;
   --fs-md: 14px;
   --fs-lg: 16px;
-  --fs-xl: 20px;
-  --fs-2xl: 26px;
+  --fs-xl: 18px;
+  --fs-2xl: 22px;
 
   --sp-1: 4px;
   --sp-2: 8px;
@@ -76,31 +99,52 @@
   --sp-5: 24px;
   --sp-6: 32px;
 
-  --rail: 304px;
-  --measure: 74ch;
-  --topbar: 56px;
+  /* The library column, its folded shape, and the workspace's two columns. */
+  --rail: 240px;
+  --rail-folded: 64px;
+  --pane-split: 50;
+  --split-w: 13px;
+  --measure: 68ch;
+  --topbar: 60px;
+
+  /* Set here so form controls and scrollbars are drawn dark before any rule
+     of this sheet has been applied. */
+  color-scheme: dark;
 }
 
-@media (prefers-color-scheme: dark) {
+/* Light is what a reader's own system preference asks for; dark is what
+   everything else gets, and what this page is designed against. */
+@media (prefers-color-scheme: light) {
   :root {
-    --bg: #0F1418;
-    --surface: #161C20;
-    --sunken: #1D252A;
-    --border: #26323A;
-    --border-strong: #35434C;
-    --text: #E6EDF1;
-    --soft: #C0CDD5;
-    --muted: #93A1AA;
-    --accent: #4FB3C4;
-    --accent-weak: #10333A;
-    --patch: #E06BAE;
-    --warn: #E2A33C;
-    --danger: #F08A8A;
-    --danger-weak: #2A1618;
-    --warn-weak: #2A2113;
-    --ok-weak: #10241F;
-    --shadow: 0 10px 30px rgba(0, 0, 0, 0.5);
+    --bg: #F8FAFC;
+    --rail-bg: #F1F5F9;
+    --surface: #FFFFFF;
+    --sunken: #F1F5F9;
+    --elevated: #FFFFFF;
+    --border: #E2E8F0;
+    --border-strong: #CBD5E1;
+    --text: #0F172A;
+    --soft: #334155;
+    --muted: #64748B;
+    --accent: #0F6E7D;
+    --accent-weak: #E6F1F3;
+    --patch: #B3247A;
+    --ok: #0F7A55;
+    --ok-weak: #ECFDF5;
+    --warn: #B45309;
+    --warn-weak: #FFFBEB;
+    --danger: #B91C1C;
+    --danger-weak: #FEF2F2;
+    --shadow: 0 16px 40px rgba(15, 23, 42, 0.16);
+    color-scheme: light;
   }
+}
+
+/* The OS preference reaches the controls and the scrollbars, not only the
+   tokens: a scrollbar drawn light beside a dark pane is the one place the two
+   can still disagree. */
+@media (prefers-color-scheme: dark) {
+  :root { color-scheme: dark; }
 }
 
 * { box-sizing: border-box; }
@@ -151,25 +195,349 @@ code { font-family: var(--font-data); font-size: 0.92em; }
 .note { font-size: var(--fs-sm); color: var(--muted); overflow-wrap: anywhere; }
 .note:empty, .meta:empty, .count:empty { display: none; }
 
+/* ------------------------------------------------------------- first paint */
+
+/* What the reader sees before the page itself exists: a dark stage, a scan line
+   sweeping it, and the mark settling in over it. It is fixed, and above the
+   rest, because the layout underneath has already been built by the time the
+   stage leaves. Handing the splash over is an opacity fade of the whole stage,
+   set when the first list lands. */
+.preloader {
+  position: fixed;
+  inset: 0;
+  z-index: 10;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  background: #0a1114;
+  transition: opacity 0.8s ease, visibility 0.8s ease;
+  /* A deadline, not an effect: if the script never arrives, the sheet takes the
+     splash away by itself. A splash that stays is a page nobody can use. */
+  animation: preloader-timeout 0.4s ease 8s forwards;
+}
+
+/* Set while it fades out; the element is only made `hidden` (which cannot
+   animate) once the transition has run. */
+.preloader--leaving { opacity: 0; }
+
+/* The stage's own clock: the sweep, then the mark's settle. The faint grid is
+   the overlay plate, the travelling line is the sweep — both belong to the
+   stage, not to extra elements, so the hand-off stays the mark's reveal. */
+.preloader-scan-overlay {
+  position: absolute;
+  inset: 0;
+  background: repeating-linear-gradient(
+    0deg,
+    transparent,
+    transparent 3px,
+    rgba(88, 195, 208, 0.05) 3px,
+    rgba(88, 195, 208, 0.05) 4px
+  );
+  opacity: 0;
+  transition: opacity 0.3s ease;
+  pointer-events: none;
+}
+
+.preloader-scan-overlay.active { opacity: 1; }
+
+/* The sweep line, travelling top to bottom once on the stage's own clock. */
+.preloader-scan-line {
+  position: absolute;
+  left: 0;
+  width: 100%;
+  height: 2px;
+  background: linear-gradient(
+    90deg,
+    transparent 0%,
+    #2E7C87 20%,
+    #58C3D0 50%,
+    #2E7C87 80%,
+    transparent 100%
+  );
+  box-shadow: 0 0 15px 2px rgba(88, 195, 208, 0.55), 0 0 40px 4px rgba(88, 195, 208, 0.22);
+  opacity: 0;
+  z-index: 2;
+  pointer-events: none;
+}
+
+.preloader-scan-line.active {
+  animation: preloader-scan 1.6s cubic-bezier(0.4, 0, 0.2, 1) forwards;
+}
+
+@keyframes preloader-scan {
+  0% { top: -2px; opacity: 0; }
+  10% { opacity: 1; }
+  90% { opacity: 1; }
+  100% { top: 100%; opacity: 0; }
+}
+
+/* The mark settles in over the stage, alone and centred, and goes with the
+   light rather than beside it: while the light is still above it nothing
+   happens to it, it dissolves as the light passes over it, and it is gone by
+   the time the light is under it. The dissolve reads the sweep's own keyframe
+   positions, so the two are in step in a window of any height — a fade spread
+   over the whole sweep had the mark half gone while the light was still over
+   empty stage, which looked like the mark leaving on a timer of its own. */
+.preloader-logo {
+  position: relative;
+  z-index: 3;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  opacity: 0;
+  transform: scale(0.92);
+  transition: opacity 0.7s ease, transform 0.7s cubic-bezier(0.16, 1, 0.3, 1);
+}
+
+.preloader-logo.show { opacity: 1; transform: scale(1); }
+
+/* Started with the sweep, not taken back with it: the dissolve outlives the
+   overlay's class, so the mark does not come back as the sweep is cleared away.
+   Same duration and same easing as the line, which is what keeps the two on one
+   clock: the mark is half gone exactly as the light crosses it, at any window
+   height. */
+.preloader-logo.scanning {
+  animation: preloader-mark-swept 1.6s cubic-bezier(0.4, 0, 0.2, 1) forwards;
+}
+
+/* The sweep's easing puts the light at the middle of the stage — which is where
+   the mark's own middle is — at 35% of the sweep, whatever the window's height:
+   both are centred, so this window holds for short and tall alike. The dissolve
+   is therefore centred on it: the mark is untouched while the light is above it,
+   half gone as the light crosses it, gone as the light passes out of it.
+   Carried by the same easing as the light, it goes at the light's own pace. */
+@keyframes preloader-mark-swept {
+  0%, 20% { opacity: 1; }
+  50%, 100% { opacity: 0; }
+}
+
+.preloader-logo-img {
+  width: min(560px, 72vw);
+  height: auto;
+}
+
+/* Nothing left to draw and nothing left to catch: gone from the picture, and
+   gone from the pointer's way. */
+@keyframes preloader-timeout {
+  to { opacity: 0; visibility: hidden; }
+}
+
 /* ------------------------------------------------------------------ topbar */
 
+/* One line: which document is open, and the one control that folds the library
+   away. It is kept to a single row on purpose — the reading area below it is
+   the part that needs the height — and the document's own name is the only
+   thing here allowed to be long, so it is the only thing that elides. */
 .topbar {
   flex: none;
   height: var(--topbar);
   display: flex;
   align-items: center;
   gap: var(--sp-3);
-  padding: 0 var(--sp-5);
+  padding: 0 var(--sp-3) 0 var(--sp-4);
   border-bottom: 1px solid var(--border);
   background: var(--surface);
 }
 
-.brand { font-size: var(--fs-lg); font-weight: 600; letter-spacing: -0.02em; }
+.icon-btn {
+  flex: none;
+  display: grid;
+  place-items: center;
+  width: 32px;
+  height: 32px;
+  padding: 0;
+  color: var(--soft);
+  background: transparent;
+  border: 1px solid transparent;
+  border-radius: var(--radius-sm);
+  cursor: pointer;
+  transition: background 150ms ease, border-color 150ms ease, color 150ms ease;
+}
 
-.topbar-actions {
-  margin-left: auto;
+.icon-btn:hover { background: var(--sunken); border-color: var(--border); color: var(--text); }
+/* The control in force — the widened workspace, a folded library — wears the
+   accent, and its `aria-pressed` is the same fact for a screen reader. */
+.icon-btn[aria-pressed="true"] {
+  background: var(--accent-weak);
+  border-color: var(--accent);
+  color: var(--accent);
+}
+
+.icon { width: 18px; height: 18px; display: block; fill: none; stroke: currentColor; stroke-width: 1.5; stroke-linecap: round; stroke-linejoin: round; }
+
+/* The path back to the library and the document's own name. The name is the
+   only flexible part: a file name of any length elides rather than pushing the
+   header's other facts off the line. */
+.crumbs {
+  flex: 1;
+  min-width: 0;
   display: flex;
+  align-items: baseline;
   gap: var(--sp-2);
+}
+
+.crumb-root { flex: none; font-size: var(--fs-sm); color: var(--muted); white-space: nowrap; }
+.crumb-sep { color: var(--border-strong); }
+
+.crumb-doc {
+  min-width: 0;
+  font-size: var(--fs-md);
+  font-weight: 500;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.crumb-meta {
+  flex: none;
+  font-family: var(--font-data);
+  font-size: var(--fs-xs);
+  color: var(--muted);
+  white-space: nowrap;
+}
+
+.crumb-meta:empty { display: none; }
+
+/* -------------------------------------------------- start a translation */
+
+/* The action that starts a run wears the frame-drawing effect that was asked
+   for: four edges draw themselves in as the pointer arrives, and the label
+   swaps for the next step of the flow. The demo's own colours (white with a
+   green frame) are replaced by this page's: the accent fill is what a primary
+   action looks like here, and the label takes the page surface's colour so it
+   stays legible on that fill in either scheme. The demo's `start` success state
+   is left out: nothing here sets it, and an unused state is a state nobody
+   tests. */
+.buttons { flex: none; display: flex; margin-top: var(--sp-3); }
+
+.buttons button {
+  position: relative;
+  overflow: hidden;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 100%;
+  height: 44px;
+  padding: 0;
+  border: 0;
+  border-radius: var(--radius-sm);
+  background: var(--accent);
+  color: var(--surface);
+  font: inherit;
+  font-size: var(--fs-sm);
+  font-weight: 500;
+  letter-spacing: 1px;
+  text-transform: uppercase;
+  cursor: pointer;
+  transition: all 0.3s ease;
+}
+
+/* The horizontal edges: two lines that grow out of opposite corners. */
+.buttons button:before,
+.buttons button:after {
+  content: "";
+  position: absolute;
+  width: 0;
+  height: 2px;
+  background-color: var(--surface);
+  transition: all 0.3s cubic-bezier(0.35, 0.1, 0.25, 1);
+}
+
+.buttons button:before {
+  right: 0;
+  top: 0;
+  transition: all 0.5s cubic-bezier(0.35, 0.1, 0.25, 1);
+}
+
+.buttons button:after {
+  left: 0;
+  bottom: 0;
+}
+
+/* The vertical edges ride an overlay that fills the button. */
+.buttons button span {
+  position: absolute;
+  inset: 0;
+  z-index: 1;
+}
+
+.buttons button span:before,
+.buttons button span:after {
+  content: "";
+  position: absolute;
+  width: 2px;
+  height: 0;
+  background-color: var(--surface);
+  transition: all 0.3s cubic-bezier(0.35, 0.1, 0.25, 1);
+}
+
+.buttons button span:before {
+  right: 0;
+  top: 0;
+  transition: all 0.5s cubic-bezier(0.35, 0.1, 0.25, 1);
+}
+
+.buttons button span:after {
+  left: 0;
+  bottom: 0;
+}
+
+/* The label: the resting line sits centred, the next one waits just below the
+   button and slides up to take its place. */
+.buttons button p {
+  position: absolute;
+  inset: 0;
+  margin: 0;
+  padding: 0;
+  transition: all 0.4s cubic-bezier(0.35, 0.1, 0.25, 1);
+}
+
+.buttons button p:before,
+.buttons button p:after {
+  position: absolute;
+  left: 0;
+  width: 100%;
+  z-index: 1;
+  transition: all 0.4s cubic-bezier(0.35, 0.1, 0.25, 1);
+}
+
+.buttons button p:before {
+  content: attr(data-title);
+  top: 50%;
+  transform: translateY(-50%);
+}
+
+.buttons button p:after {
+  content: attr(data-text);
+  top: 150%;
+}
+
+.buttons button:hover:before,
+.buttons button:hover:after {
+  width: 100%;
+}
+
+.buttons button:hover span:before,
+.buttons button:hover span:after {
+  height: 100%;
+}
+
+.buttons button:hover p:before {
+  top: -50%;
+  transform: rotate(5deg);
+}
+
+.buttons button:hover p:after {
+  top: 50%;
+  transform: translateY(-50%);
+}
+
+/* The demo switched the focus ring off; a keyboard reader still needs one. */
+.buttons button:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
 }
 
 /* ------------------------------------------------------------------ buttons */
@@ -253,11 +621,175 @@ code { font-family: var(--font-data); font-size: 0.92em; }
   border-left: 3px solid var(--accent);
   background: var(--surface);
   font-size: var(--fs-sm);
+  cursor: pointer; /* a notice can be waved away, not only waited out */
+  transition: opacity 0.4s ease;
 }
 
 .banner[data-kind="warn"] { border-left-color: var(--warn); }
 .banner[data-kind="error"] { border-left-color: var(--danger); }
 .banner[data-kind="ok"] { border-left-color: var(--accent); }
+
+/* ------------------------------------------------------------- detail tabs */
+
+.tabs {
+  display: flex;
+  gap: var(--sp-1);
+  margin: var(--sp-3) 0 0;
+  border-bottom: 1px solid var(--border);
+}
+
+.tab {
+  appearance: none;
+  background: none;
+  border: 0;
+  border-bottom: 2px solid transparent;
+  padding: var(--sp-2) var(--sp-3);
+  font: inherit;
+  color: var(--muted);
+  cursor: pointer;
+}
+
+.tab[aria-selected="true"] {
+  color: var(--text);
+  border-bottom-color: var(--accent);
+  font-weight: 600;
+}
+
+.tab:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: -2px;
+}
+
+.tab-panel {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+}
+
+/* The reading workspace is the one panel that does not scroll as a whole: its
+   two columns scroll inside themselves, at the same height, so a reader can
+   hold one against the other. The floor under it keeps a short window from
+   squeezing the columns to nothing — past that the page itself scrolls. */
+.tab-panel--workspace {
+  display: flex;
+  flex-direction: column;
+  min-height: 260px;
+  overflow: hidden;
+}
+
+/* The status and history tabs are one shape: a caption and a filter above a
+   single long list. Two scrollbars used to be drawn side by side there — the
+   tab's own, for the few pixels its caption and filters pushed past the window,
+   and the list's, for the run's own length. The list is the part that is long,
+   so the list is the part that scrolls: the tab keeps its counts and its
+   filters where they are and draws no bar of its own. */
+.tab-panel--list {
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+}
+
+/* The list takes its own height while it is short and gives it back when the
+   window is: shrinking below its content is what lets it scroll — with the
+   default `min-height: auto` it would instead push the panel taller and the
+   second scrollbar would come back. The fixed ceiling it used to carry is gone
+   with it, because the panel's height is now the ceiling. */
+.tab-panel--list .chunks,
+.tab-panel--list .log {
+  min-height: 0;
+  max-height: none;
+}
+
+/* --------------------------------------------------------- chunk list */
+
+.chunks-summary { margin: var(--sp-3) 0 var(--sp-2); }
+
+/* One row per chunk, scrolling on its own: a run of a few hundred chunks must
+   not stretch the page, and a reader still scans the list top to bottom. */
+.chunks {
+  list-style: none;
+  margin: 0 0 var(--sp-4);
+  padding: 0;
+  max-height: 55vh;
+  overflow-y: auto;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+}
+
+.chunk {
+  display: grid;
+  /* The id and the state are fixed labels, never wrapped: a chunk number that
+     breaks over two lines stops reading as a column. The work takes what is
+     left and clips if the window is narrow. */
+  grid-template-columns: max-content max-content minmax(0, 1fr);
+  align-items: center;
+  gap: var(--sp-2);
+  padding: var(--sp-1) var(--sp-3);
+  border-bottom: 1px solid var(--border);
+  border-left: 3px solid transparent;
+  font-size: var(--fs-sm);
+}
+
+.chunk:last-child { border-bottom: 0; }
+
+/* A row with a message behind it is a control: the pointer and the ring say so,
+   and the whole message opens under the row it belongs to, taking every column
+   because an error is read, not glanced at. The ring rather than a background
+   keeps the row's own state colour, which a failing row wears. */
+.chunk[role="button"] { cursor: pointer; }
+.chunk[role="button"]:hover { box-shadow: inset 0 0 0 1px var(--border-strong); }
+.chunk[role="button"]:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: -2px;
+}
+
+.chunk-error {
+  grid-column: 1 / -1;
+  font-size: var(--fs-xs);
+  color: var(--danger);
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+.chunk-id {
+  font-family: var(--font-data);
+  font-size: var(--fs-xs);
+  white-space: nowrap;
+  color: var(--muted);
+}
+
+.chunk-state { font-size: var(--fs-xs); white-space: nowrap; }
+
+.chunk-work {
+  overflow: hidden;
+  color: var(--soft);
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.chunk[data-state="wait"] { border-left-color: var(--border); }
+.chunk[data-state="wait"] .chunk-state,
+.chunk[data-state="wait"] .chunk-work { color: var(--muted); }
+.chunk[data-state="running"] { border-left-color: var(--accent); }
+.chunk[data-state="running"] .chunk-state { color: var(--accent); font-weight: 600; }
+.chunk[data-state="ok"] { border-left-color: var(--accent); }
+.chunk[data-state="ok"] .chunk-state { color: var(--accent); }
+.chunk[data-state="fail"] { border-left-color: var(--danger); background: var(--danger-weak); }
+.chunk[data-state="fail"] .chunk-state { color: var(--danger); font-weight: 600; }
+.chunk[data-state="fail"] .chunk-work { color: var(--danger); }
+
+/* A chunk the run walked past after a failure is finished, so it is not red —
+   but it is not indistinguishable from a chunk that went through cleanly
+   either: an amber edge and a ↻ beside its id say it stumbled on the way. */
+.chunk[data-recovered="true"] { border-left-color: var(--warn); }
+.chunk[data-recovered="true"] .chunk-id::after {
+  content: " ↻";
+  color: var(--warn);
+}
+
+/* Set just before the bar is made `hidden`; the stylesheet's reduced-motion
+   rule drops the transition, so it disappears at once there. */
+.banner--leaving { opacity: 0; }
 
 /* ------------------------------------------------------------------ layout */
 
@@ -266,19 +798,80 @@ code { font-family: var(--font-data); font-size: 0.92em; }
   min-height: 0;
   display: grid;
   grid-template-columns: var(--rail) minmax(0, 1fr);
+  /* Folding the library is one track changing width, and both tracks are plain
+     lengths — which is what makes a grid track worth interpolating: the column
+     slides to its folded size instead of snapping to it. The reduced-motion
+     rule at the foot of this sheet drops the transition where it is not
+     wanted. */
+  transition: grid-template-columns 220ms ease;
 }
 
+/* The library's own head: the mark, then the name. Folded away, the name goes
+   and the mark stays — the column still says whose it is. */
+.rail-brand {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-2);
+  flex: none;
+  min-width: 0;
+  margin-bottom: var(--sp-4);
+}
+
+.rail-mark {
+  flex: none;
+  display: grid;
+  place-items: center;
+  width: 30px;
+  height: 30px;
+  border-radius: var(--radius-sm);
+  background: var(--sunken);
+  overflow: hidden;
+}
+
+.rail-mark img { width: 100%; height: 100%; object-fit: cover; display: block; }
+
+.rail-name {
+  min-width: 0;
+  /* Its width is what the fold takes away, so it is a length from the start:
+     a name that is `display: none` in the folded column takes the mark beside
+     it to the middle in the same frame it goes. */
+  flex: 0 1 100%;
+  font-size: var(--fs-md);
+  font-weight: 600;
+  letter-spacing: -0.01em;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  transition: flex-basis 220ms ease, opacity 120ms ease;
+}
+
+/* The history panel is a column with one growing part: the list of runs. The
+   heading, the filters and the action at the foot stay where they are, so a
+   hundred runs scroll inside the panel instead of hiding the newest one or
+   pushing the button off the bottom of the screen. */
 .rail {
   min-height: 0;
-  overflow-y: auto;
-  padding: var(--sp-4);
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+  /* Close to the edges it shares with the rows: the rows are what the reader is
+     pointing at, so the column's own inset is drawn once, by the rows, rather
+     than doubled around them. */
+  padding: var(--sp-4) var(--sp-2);
   border-right: 1px solid var(--border);
-  background: var(--surface);
+  background: var(--rail-bg);
+  /* The fold narrows this inset as well as the track, so both travel together. */
+  transition: padding 220ms ease;
 }
 
+/* The library and the workspace, side by side. Everything the reader scrolls
+   in splits view lives down there rather than here, so only the fallback case
+   — a window too short for the job's own chrome — scrolls the page itself. */
 .view {
   min-width: 0;
   min-height: 0;
+  display: flex;
+  flex-direction: column;
   overflow-y: auto;
   padding: var(--sp-5);
 }
@@ -291,6 +884,20 @@ code { font-family: var(--font-data); font-size: 0.92em; }
   justify-content: space-between;
   gap: var(--sp-2);
   margin-bottom: var(--sp-4);
+  /* Folding the library takes this head and the filters out of the column, and
+     the rows under them must not be left jumping up by their height: a ceiling
+     travels where a display cannot, so both are carried away instead of
+     dropped. The ceiling clears what each holds (one line here, two rows of
+     filters below), so nothing is ever cut while the column is open. */
+  max-height: 32px;
+  overflow: hidden;
+  transition: max-height 220ms ease, margin-bottom 220ms ease, opacity 120ms ease;
+}
+
+.rail .chips {
+  max-height: 64px;
+  overflow: hidden;
+  transition: max-height 220ms ease, margin-bottom 220ms ease, opacity 120ms ease;
 }
 
 .chips { display: flex; flex-wrap: wrap; gap: var(--sp-1); margin-bottom: var(--sp-3); }
@@ -316,13 +923,29 @@ code { font-family: var(--font-data); font-size: 0.92em; }
   font-weight: 500;
 }
 
-.jobs { display: flex; flex-direction: column; gap: var(--sp-1); }
+.jobs {
+  display: flex;
+  flex-direction: column;
+  /* Rows are centred rather than stretched, and carry their own width: that is
+     what lets the fold shrink a row around its own middle instead of moving it
+     to the middle in one frame. */
+  align-items: center;
+  gap: var(--sp-1);
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+  padding-right: var(--sp-1); /* the scrollbar rides beside the rows, not on them */
+}
 
 /* One history entry: the row that opens the run, at its full width. The
    delete action does not live in the row's layout — it overlays the row's
    bottom-right corner and stays hidden until the pointer (or focus) is on the
    entry, so a run with a long title is never narrowed to make room for it. */
-.job-item { position: relative; }
+.job-item {
+  position: relative;
+  width: 100%;
+  transition: width 220ms ease;
+}
 
 .job-delete {
   position: absolute;
@@ -351,7 +974,15 @@ code { font-family: var(--font-data); font-size: 0.92em; }
 .job-delete svg { width: 14px; height: 14px; display: block; }
 
 .job-row {
+  /* The folded shape is drawn from this one, and the fold travels the lengths
+     that can travel: the row's floor (one line of facts), its padding and the
+     state's edge. What cannot travel — where the words sit in the folded row —
+     is pinned to where they already were, so the switch of shape is invisible
+     behind the cross-fade. */
+  position: relative;
+  overflow: hidden; /* the closing box is what clips the words as they fade */
   width: 100%;
+  min-height: 52px;
   display: grid;
   grid-template-columns: minmax(0, 1fr) auto;
   gap: var(--sp-1) var(--sp-3);
@@ -362,9 +993,53 @@ code { font-family: var(--font-data); font-size: 0.92em; }
   background: transparent;
   border: 1px solid transparent;
   border-radius: var(--radius-sm);
-  padding: var(--sp-2) var(--sp-3);
+  padding: var(--sp-1) var(--sp-2);
   cursor: pointer;
+  transition: min-height 220ms ease, padding 220ms ease, box-shadow 220ms ease;
 }
+
+/* The tile the folded column shows, drawn whether the column is folded or not:
+   out of the flow in both shapes, so it never joins the row's own grid, and
+   invisible while the words beside it are saying what it says. Folding is then
+   a cross-fade — the letter comes up as the words go — rather than one shape
+   replaced by another in a single frame. */
+.job-row::before {
+  content: attr(data-mark);
+  position: absolute;
+  top: 50%;
+  left: 50%;
+  display: grid;
+  place-items: center;
+  width: 34px;
+  height: 34px;
+  border-radius: var(--radius-sm);
+  background: var(--sunken);
+  font-size: var(--fs-sm);
+  font-weight: 600;
+  color: var(--soft);
+  opacity: 0;
+  transform: translate(-50%, -50%);
+  transition: opacity 160ms ease;
+}
+
+/* The state as a shape, not only as a colour: the mark sits in the tile's
+   corner, where it cannot be mistaken for part of the letter. Dimmed in the
+   open row, where the row's own word already names the state. */
+.job-row::after {
+  content: attr(data-state-mark);
+  position: absolute;
+  right: 0;
+  bottom: -1px;
+  font-size: 10px;
+  line-height: 1;
+  color: var(--muted);
+  opacity: 0;
+  transition: opacity 160ms ease;
+}
+
+.job-row-name,
+.job-row-sub,
+.job-row-time { transition: opacity 120ms ease; }
 
 .job-row:hover { background: var(--sunken); }
 .job-row[aria-current="true"] { background: var(--sunken); border-color: var(--border-strong); }
@@ -401,10 +1076,112 @@ code { font-family: var(--font-data); font-size: 0.92em; }
   color: var(--muted);
 }
 
+/* ---------------------------------------------- the library, folded away */
+
+/* A folded library is a column of tiles: one square per document, carrying the
+   document's own initial with its state on the tile's ink, and its full name
+   in the tooltip and in the button's own name for a screen reader. Nothing is
+   lost by folding — the names, the times and the filters are one press away —
+   and the column that remains still says what it is. */
+.layout[data-rail="collapsed"] { grid-template-columns: var(--rail-folded) minmax(0, 1fr); }
+.layout[data-rail="collapsed"] .rail { padding: var(--sp-2); }
+.layout[data-rail="collapsed"] .rail-brand { justify-content: center; gap: 0; }
+/* The name gives its width back rather than being dropped: as it narrows, the
+   mark beside it is carried to the middle by the row's own centring, instead of
+   being left there by a word that vanished in one frame. */
+.layout[data-rail="collapsed"] .rail-name { flex-basis: 0; opacity: 0; }
+.layout[data-rail="collapsed"] .rail-head,
+.layout[data-rail="collapsed"] .chips {
+  max-height: 0;
+  margin-bottom: 0;
+  opacity: 0;
+}
+.layout[data-rail="collapsed"] .job-delete { display: none; }
+.layout[data-rail="collapsed"] .jobs { align-items: center; }
+.layout[data-rail="collapsed"] .job-item { width: 36px; }
+.layout[data-rail="collapsed"] .job-row {
+  min-height: 36px;
+  padding: 0;
+  background: transparent;
+  border-color: transparent;
+  box-shadow: none;
+}
+
+/* The words keep the shape they had and are clipped by the box closing on them:
+   out of the flow, they neither reflow into a column this narrow nor hold the
+   row open, so it is the row's own floor that travels and the cut of the last
+   line is a wipe rather than a jump. Their offsets are the row's padding, which
+   is where they already sat. */
+.layout[data-rail="collapsed"] .job-row-name,
+.layout[data-rail="collapsed"] .job-row-time,
+.layout[data-rail="collapsed"] .job-row-sub {
+  position: absolute;
+  opacity: 0;
+}
+.layout[data-rail="collapsed"] .job-row-name {
+  left: var(--sp-2);
+  top: var(--sp-1);
+  width: max-content;
+}
+.layout[data-rail="collapsed"] .job-row-time {
+  right: var(--sp-2);
+  top: 6px;
+}
+.layout[data-rail="collapsed"] .job-row-sub {
+  left: var(--sp-2);
+  top: 28px;
+  width: max-content;
+  /* The width the facts had in the open row, so their lines break where they
+     broke there instead of reflowing as the row closes. */
+  max-width: calc(var(--rail) - 38px);
+}
+
+/* The folded shape is the tile, and both shapes are drawn at once: only the
+   opacity between them changes as the column travels. */
+.layout[data-rail="collapsed"] .job-row::before,
+.layout[data-rail="collapsed"] .job-row::after { opacity: 1; }
+.layout[data-rail="collapsed"] .job-row:hover::before,
+.layout[data-rail="collapsed"] .job-row[aria-current="true"]::before { background: var(--elevated); }
+.layout[data-rail="collapsed"] .job-row[data-state="running"]::before,
+.layout[data-rail="collapsed"] .job-row[data-state="done"]::before { color: var(--accent); }
+.layout[data-rail="collapsed"] .job-row[data-state="failed"]::before { color: var(--danger); }
+.layout[data-rail="collapsed"] .job-row[data-state="stopped"]::before { color: var(--warn); }
+.layout[data-rail="collapsed"] .job-row[data-state="running"]::after,
+.layout[data-rail="collapsed"] .job-row[data-state="done"]::after { color: var(--accent); }
+.layout[data-rail="collapsed"] .job-row[data-state="failed"]::after { color: var(--danger); }
+.layout[data-rail="collapsed"] .job-row[data-state="stopped"]::after { color: var(--warn); }
+
+/* The action keeps the frame it was drawn with and loses its words: a plus is
+   the whole label a column this narrow can hold, and the button's own name
+   still carries the sentence. */
+.layout[data-rail="collapsed"] .buttons button p:before { content: "+"; font-size: var(--fs-lg); }
+.layout[data-rail="collapsed"] .buttons button p:after { content: ""; }
+
+/* Behind the library while it is a drawer over the page, and only then: the
+   drawer is over the document, so one tap on the document puts it back. */
+.rail-scrim {
+  position: fixed;
+  inset: 0;
+  z-index: 30;
+  padding: 0;
+  border: 0;
+  background: rgba(8, 12, 16, 0.55);
+  cursor: pointer;
+}
+
 /* ------------------------------------------------------------- job view */
 
 .job {
-  max-width: 1180px;
+  /* Sized by the window, never by the document inside the columns: a basis or
+     a floor taken from its own content would make the page as tall as the
+     translation and leave the columns nothing to scroll in. A window too short
+     for the chrome plus the workspace's floor still scrolls the view, because
+     what overflows a child of a scroll container is the container's to scroll. */
+  flex: 1 1 0%;
+  min-height: 0;
+  width: 100%;
+  max-width: 1560px;
+  margin-inline: auto;
   display: flex;
   flex-direction: column;
   gap: var(--sp-4);
@@ -439,16 +1216,9 @@ code { font-family: var(--font-data); font-size: 0.92em; }
 
 .job[data-state="empty"] .job-title { color: var(--muted); font-size: var(--fs-xl); }
 
-/* The tag row under a title: what this job was asked to do. */
-#job-meta { display: flex; flex-wrap: wrap; gap: var(--sp-2); margin-top: var(--sp-2); }
-
-.tag {
-  font-size: var(--fs-xs);
-  color: var(--soft);
-  background: var(--sunken);
-  border-radius: 999px;
-  padding: 2px 10px;
-}
+/* Under the title, and only when no run is open: the prompt to pick one. What
+   a run was asked to do is listed in the report tab instead. */
+#job-meta { margin-top: var(--sp-2); }
 
 .badge {
   flex: none;
@@ -464,6 +1234,98 @@ code { font-family: var(--font-data); font-size: 0.92em; }
 .badge[data-state="done"] { color: var(--accent); background: var(--accent-weak); }
 .badge[data-state="failed"] { color: var(--danger); background: var(--danger-weak); }
 .badge[data-state="stopped"] { color: var(--warn); background: var(--warn-weak); }
+
+/* The header's right-hand corner: the badge that names the run's state and, on
+   the same line, the controls that change it. They sit here rather than in the
+   row of download links below, so "Dừng" is found where the reader is already
+   looking to see how the run is doing. */
+.job-head-side {
+  flex: none;
+  display: flex;
+  align-items: center;
+  /* The state and the control that changes it are two things, not one: the
+     gap keeps "Dừng"/"Tiếp tục" off the badge it sits next to. */
+  gap: var(--sp-4);
+}
+
+.job-control { display: flex; gap: var(--sp-2); }
+/* No run to stop or continue: the corner holds the badge alone. */
+.job-control:empty { display: none; }
+
+/* A run's own two controls, and the one place in this sheet where the button
+   itself is the subject: the word steps aside for a mark on hover — the label
+   slides out to the right and fades, the mark slides in from the left. The
+   geometry stays fixed (one line, one mark) so only the two layers move, and
+   the button never changes size while the pointer is on it. */
+.btn--swap {
+  position: relative;
+  overflow: hidden;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  height: 32px;
+  transition: all 0.3s cubic-bezier(0.35, 0.1, 0.25, 1);
+}
+
+.btn-label {
+  display: inline-block;
+  transition: all 0.35s cubic-bezier(0.35, 0.1, 0.25, 1);
+}
+
+/* Out of the way at rest: parked to the left of the label and transparent, so
+   the word is all a reader sees until they reach for the button. */
+.btn-mark {
+  position: absolute;
+  inset: 0;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  opacity: 0;
+  transform: translateX(-14px);
+  transition: all 0.35s cubic-bezier(0.35, 0.1, 0.25, 1);
+}
+
+/* A disabled control never invites the pointer: the swap is for a button that
+   can actually be pressed, the same way the rest of the sheet guards :hover. */
+.btn--swap:hover:not(:disabled) .btn-label,
+.btn--swap:focus-visible .btn-label {
+  transform: translateX(calc(100% + 12px));
+  opacity: 0;
+}
+
+.btn--swap:hover:not(:disabled) .btn-mark,
+.btn--swap:focus-visible .btn-mark {
+  transform: translateX(0);
+  opacity: 1;
+}
+
+/* The mark keeps breathing once it has arrived, which is the whole difference
+   between a still picture of a pause and a control that is live. */
+.btn--swap:hover:not(:disabled) .btn-mark svg,
+.btn--swap:focus-visible .btn-mark svg {
+  animation: mark-breathe 2.4s ease-in-out infinite;
+}
+
+@keyframes mark-breathe {
+  0%, 100% { transform: scale(1); }
+  50% { transform: scale(1.14); }
+}
+
+/* "Dừng" keeps the plain control's surface — stopping is not destructive, the
+   chunks already translated are safe in the checkpoint, and "Tiếp tục" sits
+   right beside it as the way back. "Tiếp tục" takes the warn tone instead. */
+.btn--resume {
+  color: var(--warn);
+  border-color: var(--warn);
+  background: var(--warn-weak);
+  font-weight: 500;
+}
+
+.btn--resume:hover:not(:disabled) {
+  border-color: var(--warn);
+  background: var(--warn-weak);
+  box-shadow: inset 0 0 0 1px var(--warn);
+}
 
 .job-actions { display: flex; flex-wrap: wrap; gap: var(--sp-2); }
 
@@ -516,7 +1378,8 @@ code { font-family: var(--font-data); font-size: 0.92em; }
 
 .bar {
   flex: 1;
-  height: 8px;
+  height: 16px;
+  border: 1px solid var(--border-strong);
   border-radius: 999px;
   background: var(--sunken);
   overflow: hidden;
@@ -533,9 +1396,41 @@ code { font-family: var(--font-data); font-size: 0.92em; }
 }
 
 .bar[data-state="wait"] .bar-fill { width: 0; }
-.bar[data-state="running"] .bar-fill { background: var(--accent); }
+/* A running bar moves: a small wave rolls across the fill, so "still going"
+   is something the eye catches without reading. Only the running state
+   animates — a finished or failed bar is a still picture again. */
+.bar[data-state="running"] .bar-fill {
+  background-color: var(--accent);
+  background-image: radial-gradient(
+    circle at 12px -5px,
+    rgba(255, 255, 255, 0.16) 0 9px,
+    transparent 10px
+  );
+  background-size: 24px 100%;
+  background-repeat: repeat-x;
+  animation: bar-wave 1.1s linear infinite;
+}
 .bar[data-state="ok"] .bar-fill { background: var(--accent); }
 .bar[data-state="fail"] .bar-fill { background: var(--danger); }
+
+@keyframes bar-wave {
+  to { background-position: 24px 0; }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .bar[data-state="running"] .bar-fill { animation: none; }
+}
+
+/* One row under the bar: the state at the left where a reader starts, the
+   throughput number at the right where the eye lands second. */
+.progress-foot {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: var(--sp-3);
+}
+
+.progress-foot .mono { white-space: nowrap; }
 
 .progress-step { font-size: var(--fs-sm); color: var(--soft); }
 
@@ -595,88 +1490,301 @@ code { font-family: var(--font-data); font-size: 0.92em; }
   color: var(--surface);
 }
 
-/* --------------------------------------------------------------- problems */
+/* There is no "done after failing once" marker here. A phase that runs once per
+   chunk reports on itself hundreds of times per run, and a marker that flipped
+   between translated and translated-again was tracking chunks, not phases; the
+   rail ticks a phase once the run has moved past it — the whole input went
+   through it — or once the run is finished. What a phase stumbled on stays in
+   its tooltip, in the log and in the chunk list. */
 
-.problems { border-left: 3px solid var(--danger); }
-.problems .card-title { margin-bottom: var(--sp-2); }
+/* ------------------------------------------------------------- chunk log */
 
-/* A long Vấn đề list must not push the reading panes off the screen: the card
-   keeps to a bounded height and the items scroll inside it.
-   ponytail: fixed height ceiling; revisit if a single message needs more room. */
-.problems-list {
-  display: flex;
-  flex-direction: column;
-  gap: var(--sp-2);
-  max-height: 240px;
+/* The run's own log, oldest line at the top: it grows for as long as the run
+   does, so it keeps to a bounded height and scrolls inside itself.
+   ponytail: fixed height ceiling; revisit if a single line needs more room. */
+.log {
+  list-style: none;
+  margin: var(--sp-3) 0 var(--sp-4);
+  padding: 0;
   overflow-y: auto;
-  padding-right: var(--sp-2);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  font-size: var(--fs-sm);
+  max-height: 55vh;
 }
 
-.problem {
+.log:empty { display: none; }
+
+.log-line {
   display: grid;
-  /* where · cause · what: the cause column collapses to nothing when the
-     pipeline had no cause to record. */
-  grid-template-columns: auto auto minmax(0, 1fr);
-  gap: var(--sp-3);
+  /* A log is read down its columns: the fold, the clock, what was being worked
+     on, how it ended, and the run's own words about it. The subject column is a
+     fixed width so the verdicts line up all the way down the log, and the
+     message takes what is left and wraps there rather than widening the row. */
+  grid-template-columns: max-content max-content 14rem max-content minmax(0, 1fr);
+  gap: var(--sp-2) var(--sp-3);
   align-items: baseline;
+  padding: var(--sp-1) var(--sp-3);
+  border-bottom: 1px solid var(--border);
+}
+
+/* The fold: a bare chevron at the line's left edge, quiet until the row is
+   hovered or it takes focus, and turned down while the line is open. */
+.log-toggle {
+  padding: 0;
+  border: 0;
+  background: none;
+  color: var(--muted);
+  cursor: pointer;
+  opacity: 0.55;
+  transition: transform 120ms ease, opacity 120ms ease;
+  align-self: center;
+}
+
+.log-line:hover .log-toggle,
+.log-toggle:focus-visible { opacity: 1; }
+
+.log-line[data-expanded="true"] .log-toggle { transform: rotate(90deg); opacity: 1; }
+
+/* Collapsed, the message is held to two lines so a long provider error cannot
+   push a hundred lines of log out of view; open, it runs on as long as it is. */
+.log-line[data-expanded="false"] .log-text {
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+}
+
+/* The line's own fields, under the message: each key with its value, only
+   while the line is open. */
+.log-detail {
+  grid-column: 1 / -1;
+  margin: 0;
+  padding-left: calc(var(--sp-3) + 2 * var(--sp-3));
+  font-size: var(--fs-xs);
+  color: var(--muted);
+}
+
+.log-detail[hidden] { display: none; }
+
+.log-detail-line {
+  display: grid;
+  grid-template-columns: 12rem minmax(0, 1fr);
+  gap: var(--sp-3);
+  margin: 2px 0;
+}
+
+.log-detail-key { color: var(--soft); }
+
+.log-detail-value {
+  font-family: var(--font-data);
+  overflow-wrap: anywhere;
+}
+
+.log-line:last-child { border-bottom: 0; }
+
+.log-time {
+  font-family: var(--font-data);
+  font-size: var(--fs-xs);
+  color: var(--muted);
+  white-space: nowrap;
+}
+
+.log-where {
+  overflow: hidden;
+  color: var(--soft);
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.log-word { font-size: var(--fs-xs); white-space: nowrap; }
+
+.log-text {
+  min-width: 0;
+  color: var(--soft);
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+.log-line[data-status="start"] .log-word,
+.log-line[data-status="ok"] .log-word,
+.log-line[data-status="patched"] .log-word { color: var(--accent); }
+.log-line[data-status="retry"] .log-word { color: var(--warn); }
+.log-line[data-status="fail"] { background: var(--danger-weak); }
+.log-line[data-status="fail"] .log-word,
+.log-line[data-status="fail"] .log-where { color: var(--danger); }
+.log-line[data-status="info"] .log-word,
+.log-line[data-status="note"] .log-word { color: var(--muted); }
+
+/* ---------------------------------------------------------------- report */
+
+.report { margin-top: var(--sp-3); }
+
+.report .note { margin: 0 0 var(--sp-3); }
+
+/* The figures first, as label/value pairs: a report is read for its numbers
+   before its tables, and the sunken panel separates them from the tables. */
+.report-facts {
+  display: grid;
+  grid-template-columns: max-content minmax(0, 1fr);
+  gap: var(--sp-1) var(--sp-3);
+  margin-bottom: var(--sp-4);
+  padding: var(--sp-3);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: var(--sunken);
+}
+
+/* The pair is one grid row of the block above, not a box of its own. */
+.fact { display: contents; }
+
+.fact-label { color: var(--muted); font-size: var(--fs-sm); }
+.fact-value { color: var(--text); font-size: var(--fs-sm); }
+
+.report-block { margin-bottom: var(--sp-4); }
+.report-block .card-title { margin-bottom: var(--sp-2); }
+
+.report-table {
+  width: 100%;
+  border-collapse: collapse;
   font-size: var(--fs-sm);
 }
 
-.problem-cause {
-  font-family: var(--font-data);
+.report-table th {
+  padding: var(--sp-1) var(--sp-2);
+  border-bottom: 1px solid var(--border);
   font-size: var(--fs-xs);
-  color: var(--danger);
-  border: 1px solid currentColor;
-  border-radius: 999px;
-  padding: 0 var(--sp-2);
-  white-space: nowrap;
+  font-weight: 500;
+  color: var(--muted);
+  text-align: left;
 }
 
-.problem-where {
-  font-family: var(--font-data);
-  font-size: var(--fs-xs);
-  color: var(--danger);
-  white-space: nowrap;
-}
-
-.problem-text { white-space: pre-wrap; overflow-wrap: anywhere; color: var(--soft); }
-
-/* ----------------------------------------------------------- route mix */
-
-.progress-routes {
-  margin-top: var(--sp-2);
-  font-size: var(--fs-xs);
+.report-table td {
+  padding: var(--sp-1) var(--sp-2);
+  border-bottom: 1px solid var(--border);
   color: var(--soft);
+  vertical-align: top;
+  overflow-wrap: anywhere;
 }
 
-.progress-routes:empty { display: none; }
+.report-table tr:last-child td { border-bottom: 0; }
+
+/* The first column is an identifier, as everywhere else it appears. */
+.report-table td:first-child {
+  font-family: var(--font-data);
+  font-size: var(--fs-xs);
+  color: var(--muted);
+  white-space: nowrap;
+}
+
+/* An error keeps its own line breaks, exactly as the chunk list shows it. */
+.report-table td:last-child { white-space: pre-wrap; }
 
 /* ------------------------------------------------------------------ panes */
 
-.panes-note { display: flex; justify-content: flex-end; }
-
-.panes {
-  display: grid;
-  gap: var(--sp-4);
-  align-items: start;
+/* The row that says which columns are on screen. It is separated from the
+   columns below it (and labelled) so it is read as one control over both,
+   rather than as the right-hand column's own header. */
+.panes-note {
+  flex: none;
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--sp-2) var(--sp-3);
+  margin-bottom: var(--sp-3);
 }
 
-.panes[data-view="split"] { grid-template-columns: repeat(2, minmax(0, 1fr)); }
-.panes[data-view="source"] { grid-template-columns: minmax(0, 1fr); }
+.panes-note-label { font-size: var(--fs-sm); color: var(--muted); }
+
+/* The tools for reading the two columns, in one row beside the label: which
+   layout is in force, whether the columns travel together, and whether the
+   workspace takes the whole window. */
+.panes-tools { flex: none; display: flex; align-items: center; gap: var(--sp-2); }
+
+.seg--toggle { display: inline-flex; align-items: center; gap: var(--sp-2); }
+.seg--toggle .icon { width: 14px; height: 14px; }
+/* The toggle in force is the accent one, the same way the layout button is. */
+.seg--toggle[aria-pressed="true"] {
+  background: var(--accent-weak);
+  border-color: var(--accent);
+  color: var(--accent);
+  font-weight: 500;
+}
+
+/* A single reading column is capped at a readable measure; two columns sharing
+   the window are not, and each is given an equal share that the reader can
+   move by dragging the divider between them (see --pane-split). */
+/* The one row is sized by the workspace, not by the document inside it: the
+   columns are the height the window gives them, and their text scrolls. A row
+   sized by its content would make the page as tall as the document, which is
+   the thing this layout exists to avoid. */
+.panes {
+  flex: 1;
+  min-height: 0;
+  display: grid;
+  grid-template-rows: minmax(0, 1fr);
+  gap: 0;
+}
+
+.panes[data-view="split"] {
+  grid-template-columns:
+    minmax(0, calc((100% - var(--split-w)) * var(--pane-split) / 100))
+    var(--split-w)
+    minmax(0, 1fr);
+}
+
+.panes[data-view="source"],
 .panes[data-view="target"] { grid-template-columns: minmax(0, 1fr); }
 /* One column at a time means the other is genuinely away, not merely narrow. */
 .panes[data-view="source"] #pane-target,
 .panes[data-view="target"] #pane-source { display: none; }
 
+/* The divider: a hairline with a wider grab zone over it, so the pointer does
+   not have to find one pixel. It only exists while there are two columns. */
+.pane-split {
+  display: none;
+  position: relative;
+  cursor: col-resize;
+}
+
+.panes[data-view="split"] .pane-split { display: block; }
+
+.pane-split::before {
+  content: "";
+  position: absolute;
+  inset: 0 calc((var(--split-w) - 1px) / 2);
+  border-radius: 999px;
+  background: var(--border);
+  transition: background 150ms ease;
+}
+
+.pane-split:hover::before,
+.pane-split:focus-visible::before { background: var(--accent); }
+
+/* Wide reading: the browser chrome around the document steps back so the two
+   columns get the whole window, and the text keeps its own measure so a wide
+   screen does not turn a paragraph into one long line. */
+.layout:has(.panes[data-zoom="on"]) .view { padding: var(--sp-3); }
+.layout:has(.panes[data-zoom="on"]) .job { max-width: none; }
+.layout:has(.panes[data-zoom="on"]) .panes[data-view="split"] .pane { padding: var(--sp-3); }
+
+/* The two columns of the workspace: one card each, the same height, each
+   scrolling on its own. */
 .pane {
+  display: flex;
+  flex-direction: column;
   border: 1px solid var(--border);
   border-radius: var(--radius);
   background: var(--surface);
   padding: var(--sp-4);
   min-width: 0;
+  min-height: 0;
 }
 
+
 .pane-head {
+  flex: none;
   display: flex;
   align-items: baseline;
   justify-content: space-between;
@@ -686,7 +1794,11 @@ code { font-family: var(--font-data); font-size: 0.92em; }
 }
 
 .pane-text {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
   margin: var(--sp-3) 0 0;
+  padding-right: var(--sp-2); /* the column's own scrollbar, off the text */
   font-family: var(--font-doc);
   font-size: 16px;
   line-height: 1.7;
@@ -825,26 +1937,91 @@ code { font-family: var(--font-data); font-size: 0.92em; }
 
 /* -------------------------------------------------------------- responsive */
 
-/* Below this width two reading panes are too narrow to compare, and the
-   history rail stops earning its own column. */
-@media (max-width: 1100px) {
-  .panes[data-view="split"] { grid-template-columns: minmax(0, 1fr); }
+/* A laptop with less room to give: the workspace keeps its air, the chrome
+   loses some. */
+@media (max-width: 1439px) {
+  .view { padding: var(--sp-4); }
+  .job { max-width: none; }
 }
 
-@media (max-width: 900px) {
-  body { overflow: auto; }
+/* Two columns stop being readable side by side: they stack, keeping equal
+   heights and their own scrollbars, and the switch above flips between them. */
+@media (max-width: 1100px) {
+  .panes[data-view="split"] {
+    grid-template-columns: minmax(0, 1fr);
+    grid-template-rows: repeat(2, minmax(0, 1fr));
+    grid-auto-rows: minmax(0, 1fr);
+    row-gap: var(--sp-3);
+  }
+  /* Stacked, the pair is read one after the other, so each column keeps a
+     readable height of its own and the workspace scrolls to reach the second
+     one — a column squeezed to half a panel is not a column anyone reads. */
+  .panes[data-view="split"] > .pane { min-height: min(44vh, 420px); }
+  .panes[data-view="split"] .pane-split { display: none; }
+  .tab-panel--workspace { overflow-y: auto; }
+  .seg-label { display: none; }
+  /* A log row keeps its fold, its clock, its subject and its verdict on one
+     line and puts the run's own words underneath: five columns in a column this
+     narrow would squeeze a message down to a few characters per line. */
+  .log-line { grid-template-columns: max-content max-content minmax(0, 1fr) max-content; }
+  .log-text { grid-column: 1 / -1; }
+  .log-detail { padding-left: 0; }
+}
+
+/* Tablet: the library stops being a column and becomes a drawer over the
+   document — opened from the header, closed by the tap behind it. */
+@media (max-width: 1023px) {
   .layout { grid-template-columns: minmax(0, 1fr); }
   .rail {
-    border-right: 0;
-    border-bottom: 1px solid var(--border);
-    max-height: 40vh;
+    position: fixed;
+    top: var(--topbar);
+    bottom: 0;
+    left: 0;
+    z-index: 40;
+    width: min(var(--rail), 84vw);
+    border-top: 1px solid var(--border);
+    background: var(--rail-bg);
+    box-shadow: var(--shadow);
+    transform: translateX(-100%);
+    transition: transform 180ms ease;
   }
-  .view { overflow: visible; padding: var(--sp-4); }
-  .topbar { padding: 0 var(--sp-4); }
+  .layout[data-rail="open"] .rail { transform: translateX(0); }
+  .view { padding: var(--sp-4); }
+}
+
+/* Mobile: the page is a document again — one column, scrolling as a whole —
+   and the panes stack, so which of the two is read is the switch's business.
+   Controls grow back to what a finger can hit. */
+@media (max-width: 767px) {
+  html, body { height: auto; }
+  body { overflow: visible; }
+  .layout { display: block; }
+  .view { display: block; overflow: visible; padding: var(--sp-3); }
+  .job { display: block; }
+  .job > * + * { margin-top: var(--sp-3); }
+  .tab-panel,
+  .tab-panel--workspace { display: block; min-height: 0; overflow: visible; }
+  .panes { display: block; }
+  .pane + .pane { margin-top: var(--sp-3); }
+  .pane-text { max-height: 60vh; }
+  /* The panel is a block here and the page is what scrolls, so the list takes
+     its ceiling back: a chunk list of a hundred rows must not push the run's
+     own strip off the top of a phone. */
+  .chunks, .log, .tab-panel--list .chunks, .tab-panel--list .log { max-height: 60vh; }
+  .topbar { padding: 0 var(--sp-2) 0 var(--sp-3); }
+  .crumb-root, .crumb-sep, .panes-note-label { display: none; }
+  .seg { padding: 8px 12px; }
+  .icon-btn { width: 40px; height: 40px; }
+  /* Nothing hovers on a touch screen: the row's own action is simply there. */
+  .job-delete { opacity: 1; }
   .grid-2 { grid-template-columns: minmax(0, 1fr); }
   .job-title { font-size: var(--fs-xl); }
+  .dialog-form { padding: var(--sp-4); }
 }
 
 @media (prefers-reduced-motion: reduce) {
   * { animation: none !important; transition: none !important; }
+  /* ...except the splash's deadline, which is not motion: drop it and a script
+     that failed to load leaves the mark sitting over a page that never opens. */
+  .preloader { animation: preloader-timeout 0.01s linear 8s forwards !important; }
 }

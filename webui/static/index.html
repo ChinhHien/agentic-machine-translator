@@ -3,31 +3,75 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<meta name="color-scheme" content="light dark">
-<title>polyglot-lc — dịch tài liệu PDF</title>
+<meta name="color-scheme" content="dark light">
+<title>Polyglot-LC — dịch tài liệu PDF</title>
 <link rel="stylesheet" href="/static/app.css">
+<!-- With no script to hand the splash over (see app.js), it would sit on top of
+     the page forever, so it is simply not drawn. -->
+<noscript><style>#preloader { display: none; }</style></noscript>
 </head>
 <body>
 
-<header class="topbar">
-  <p class="brand">polyglot-lc</p>
-  <div class="topbar-actions">
-    <button id="nav-new" class="btn btn--primary" type="button">Dịch tài liệu mới</button>
+<!-- The first paint, before any of the page exists: the mark alone. A scan line
+     sweeps the dark stage, the mark settles in, and the script hands the whole
+     thing over once the first list has arrived — or the stylesheet's deadline
+     takes it away on its own if the script never got that far. -->
+<div id="preloader" class="preloader" role="status" aria-label="Đang mở bảng điều khiển">
+  <div class="preloader-scan-overlay" id="preloader-scan-overlay"></div>
+  <div class="preloader-scan-line" id="preloader-scan-line"></div>
+  <div class="preloader-logo" id="preloader-logo">
+    <img class="preloader-logo-img" src="/static/logo.png" alt="">
   </div>
+</div>
+
+<!-- The document header: which document is open, what it is, and the one
+     control that folds the library away. It is one line tall on purpose — the
+     reading area below it is the part that needs the height. -->
+<header class="topbar">
+  <button id="rail-toggle" class="icon-btn" type="button"
+          aria-label="Thu gọn danh sách tài liệu" aria-expanded="true" aria-controls="rail">
+    <svg class="icon" viewBox="0 0 20 20" aria-hidden="true" focusable="false">
+      <path d="M3 5.5h14M3 10h14M3 14.5h14"/>
+    </svg>
+  </button>
+  <nav class="crumbs" aria-label="Tài liệu đang mở">
+    <span class="crumb-root">Polyglot-LC</span>
+    <span class="crumb-sep" aria-hidden="true">/</span>
+    <span id="crumb-doc" class="crumb-doc">Chưa mở lượt dịch nào</span>
+  </nav>
+  <span id="crumb-meta" class="crumb-meta"></span>
 </header>
 
 <p id="banner" class="banner" role="status" aria-live="polite" hidden></p>
 
-<div class="layout">
+<div id="layout" class="layout" data-rail="expanded">
 
-  <aside class="rail" aria-labelledby="jobs-title">
+  <aside id="rail" class="rail" aria-labelledby="jobs-title">
+    <div class="rail-brand">
+      <span class="rail-mark" aria-hidden="true">
+        <img src="/static/logo.png" alt="" width="40" height="27">
+      </span>
+      <span class="rail-name">Polyglot-LC</span>
+    </div>
+
     <div class="rail-head">
-      <h2 id="jobs-title" class="section-title">Lịch sử</h2>
+      <h2 id="jobs-title" class="section-title">Tài liệu</h2>
       <span id="jobs-count" class="count"></span>
     </div>
     <div id="jobs-filter" class="chips" role="group" aria-label="Lọc theo trạng thái"></div>
     <ul id="jobs" class="jobs" aria-label="Các lượt dịch"></ul>
     <p id="jobs-empty" class="empty" hidden></p>
+
+    <!-- The action that starts a run sits at the foot of the library: the list
+         of documents is what a reader is looking at when they decide to bring
+         another one in. The visible label is drawn by the stylesheet from these
+         attributes, so the button carries its own name for screen readers. -->
+    <div class="buttons">
+      <button id="nav-new" type="button" aria-label="Dịch tài liệu mới">
+        <span></span>
+        <p data-title="Dịch tài liệu mới" data-text="Chọn tệp PDF"></p>
+      </button>
+    </div>
   </aside>
 
   <main class="view">
@@ -38,58 +82,135 @@
           <h2 id="job-title" class="job-title">Chưa mở lượt dịch nào</h2>
           <p id="job-meta" class="meta"></p>
         </div>
-        <span id="job-status" class="badge" data-state="empty"></span>
+        <!-- The run's own controls sit beside the badge that names the state
+             they change: "Dừng" while it runs, "Tiếp tục" once it has stopped. -->
+        <div class="job-head-side">
+          <span id="job-status" class="badge" data-state="empty"></span>
+          <div id="job-control" class="job-control"></div>
+        </div>
       </div>
 
       <div id="job-actions" class="job-actions"></div>
       <p id="job-alert" class="alert" hidden></p>
 
-      <div id="progress" class="card progress" hidden>
+      <!-- One strip, not a panel: a state line, the bar, and the six phases of
+           the pass as a single row of ticks. -->
+      <div id="progress" class="progress" hidden>
         <div class="progress-row">
+          <span id="job-progress-state" class="progress-state"></span>
           <div id="bar" class="bar" data-state="wait" role="progressbar"
                aria-valuemin="0" aria-valuemax="100" aria-valuenow="0"><div id="bar-fill" class="bar-fill"></div></div>
           <span id="progress-count" class="mono" aria-live="polite"></span>
           <span id="progress-elapsed" class="mono"></span>
         </div>
-        <p id="progress-step" class="progress-step"></p>
-        <p id="progress-routes" class="progress-routes mono"></p>
+        <!-- The foot of the strip, one row: the state says what the run is
+             waiting on, at the left where a reader starts; throughput sits at
+             the right, the second thing anyone checks. -->
+        <div class="progress-foot">
+          <p id="progress-step" class="progress-step"></p>
+          <!-- Throughput of the last few seconds, not the run's average: an
+               average survives a stall, a window shows it. Blank until the
+               first token, blank again once the run is over. -->
+          <p id="progress-speed" class="mono"></p>
+        </div>
+        <!-- The phases of one pass, in the order the run reached them: a number
+             is where the run is now, ✓ a phase the whole input has already gone
+             through, ! the phase the run ended on. Named here once, in the
+             list's own label, rather than in a key above it. -->
         <ol id="steps" class="steps" aria-label="Các bước của pipeline"></ol>
       </div>
 
-      <section id="problems" class="card problems" hidden aria-labelledby="problems-title">
-        <h3 id="problems-title" class="card-title">Vấn đề</h3>
-        <ul id="problems-list" class="problems-list"></ul>
-      </section>
-
-      <div class="panes-note">
-        <p class="view-switch" role="group" aria-label="Cách hiển thị">
-          <button id="view-split" class="seg" type="button" aria-pressed="true">Hai cột</button>
-          <button id="view-source" class="seg" type="button" aria-pressed="false">Chỉ bản gốc</button>
-          <button id="view-target" class="seg" type="button" aria-pressed="false">Chỉ bản dịch</button>
-        </p>
+      <div id="job-tabs" class="tabs" role="tablist" aria-label="Nội dung lượt dịch">
+        <button id="tab-result" class="tab" type="button" role="tab" aria-selected="true"
+                aria-controls="tab-panel-result">Bản dịch</button>
+        <button id="tab-status" class="tab" type="button" role="tab" aria-selected="false"
+                aria-controls="tab-panel-status">Trạng thái</button>
+        <button id="tab-history" class="tab" type="button" role="tab" aria-selected="false"
+                aria-controls="tab-panel-history">Lịch sử</button>
+        <button id="tab-report" class="tab" type="button" role="tab" aria-selected="false"
+                aria-controls="tab-panel-report">Báo cáo</button>
       </div>
 
-      <div id="panes" class="panes" data-view="split">
+      <div id="tab-panel-result" class="tab-panel tab-panel--workspace" role="tabpanel"
+           aria-labelledby="tab-result">
+      <!-- The view switch gets a row of its own, with its label beside it:
+           sitting flush above the right column made it read as that column's
+           own header, and its words landed right on top of the column's. The
+           two toggles beside it change how the columns are read, not what they
+           contain, so they live in the same row. -->
+      <div class="panes-note">
+        <span id="view-label" class="panes-note-label">Cách hiển thị</span>
+        <div class="panes-tools">
+          <p class="view-switch" role="group" aria-labelledby="view-label">
+            <button id="view-split" class="seg" type="button" aria-pressed="true">Hai cột</button>
+            <button id="view-source" class="seg" type="button" aria-pressed="false">Chỉ bản gốc</button>
+            <button id="view-target" class="seg" type="button" aria-pressed="false">Chỉ bản dịch</button>
+          </p>
+          <button id="view-sync" class="seg seg--toggle" type="button" aria-pressed="true"
+                  title="Cuộn hai cột cùng lúc">
+            <svg class="icon" viewBox="0 0 20 20" aria-hidden="true" focusable="false">
+              <path d="M7 4v12M7 16l-2.5-2.5M7 16l2.5-2.5M13 16V4M13 4l-2.5 2.5M13 4l2.5 2.5"/>
+            </svg>
+            <span class="seg-label">Cuộn theo</span>
+          </button>
+          <button id="view-zoom" class="icon-btn" type="button" aria-pressed="false"
+                  aria-label="Mở rộng vùng đọc" title="Mở rộng vùng đọc">
+            <svg class="icon" viewBox="0 0 20 20" aria-hidden="true" focusable="false">
+              <path d="M7.5 3H3v4.5M12.5 3H17v4.5M7.5 17H3v-4.5M12.5 17H17v-4.5"/>
+            </svg>
+          </button>
+        </div>
+      </div>
+
+      <div id="panes" class="panes" data-view="split" data-zoom="off" data-sync="on">
         <article id="pane-source" class="pane" data-state="empty" aria-labelledby="source-title">
           <header class="pane-head">
             <h3 id="source-title" class="card-title">Bản gốc</h3>
             <span id="source-meta" class="count"></span>
           </header>
           <p id="source-note" class="note"></p>
-          <pre id="source-text" class="pane-text"></pre>
+          <pre id="source-text" class="pane-text" tabindex="0" aria-labelledby="source-title"></pre>
         </article>
+        <!-- The divider between the two columns: dragged to size the pair, and
+             the arrow keys move it a step at a time. It exists only while both
+             columns do, so it is the stylesheet that takes it away. -->
+        <div id="pane-split" class="pane-split" role="separator" aria-orientation="vertical"
+             aria-label="Điều chỉnh độ rộng hai cột" aria-valuemin="28" aria-valuemax="72"
+             aria-valuenow="50" tabindex="0"></div>
         <article id="pane-target" class="pane" data-state="empty" aria-labelledby="target-title">
           <header class="pane-head">
             <h3 id="target-title" class="card-title">Bản dịch</h3>
             <span id="target-meta" class="count"></span>
           </header>
           <p id="target-note" class="note"></p>
-          <pre id="target-text" class="pane-text"></pre>
+          <pre id="target-text" class="pane-text" tabindex="0" aria-labelledby="target-title"></pre>
         </article>
+      </div>
+      </div>
+
+      <div id="tab-panel-status" class="tab-panel tab-panel--list" role="tabpanel" aria-labelledby="tab-status" hidden>
+        <p id="chunks-summary" class="chunks-summary mono" aria-live="polite"></p>
+        <div id="chunk-filter" class="chips" role="group" aria-label="Lọc chunk">
+          <button id="chunk-filter-all" class="chip" type="button" aria-pressed="true">Tất cả</button>
+          <button id="chunk-filter-fail" class="chip" type="button" aria-pressed="false">Chunk từng lỗi</button>
+        </div>
+        <ol id="chunks" class="chunks" aria-label="Trạng thái các chunk"></ol>
+      </div>
+
+      <div id="tab-panel-history" class="tab-panel tab-panel--list" role="tabpanel" aria-labelledby="tab-history" hidden>
+        <ol id="history" class="log" aria-label="Lịch sử chạy của lượt dịch"></ol>
+      </div>
+
+      <div id="tab-panel-report" class="tab-panel" role="tabpanel" aria-labelledby="tab-report" hidden>
+        <div id="report" class="report" aria-label="Báo cáo lượt dịch"></div>
       </div>
     </section>
 
   </main>
+
+  <!-- Only reachable while the library is a drawer: the tap that puts it back. -->
+  <button id="rail-scrim" class="rail-scrim" type="button" aria-label="Đóng danh sách tài liệu"
+          tabindex="-1" hidden></button>
 </div>
 
 <dialog id="new-job" class="dialog" aria-labelledby="new-job-title">

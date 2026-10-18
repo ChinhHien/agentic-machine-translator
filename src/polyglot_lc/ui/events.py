@@ -43,6 +43,9 @@ class Event(BaseModel):
     #: Token delta for this step, ``{sent, received, cached}``. Approximate when
     #: chunks run concurrently: ``TokenUsage`` is a process-wide counter.
     tokens: dict[str, int] | None = None
+    #: Actual API calls in flight while this event was written: `{active, peak}`.
+    active_api_calls: int | None = None
+    max_active_api_calls: int | None = None
     cause: str = ""
 
     def to_json(self) -> str:
