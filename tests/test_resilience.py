@@ -17,6 +17,7 @@ from polyglot_lc.config import AgentConfig, ConfigError, RetryConfig, get_retry_
 from polyglot_lc.llm.client import LLMClient
 from polyglot_lc.llm.resilience import (
     LLMError,
+    NoBackupError,
     PermanentError,
     RateLimitError,
     RetryStats,
@@ -222,11 +223,13 @@ def test_resilience_ratelimit_hint_plus_buffer(_fast_resilience):
         raise RateLimitError("try again in 47.4s", retry_after=47.4, status=429)
 
     cfg = RetryConfig(max_retries=1, base_delay=2.0, max_delay=60.0, buffer_seconds=2.0)
-    with pytest.raises(RateLimitError):
+    with pytest.raises(NoBackupError) as exc_info:
         call_with_resilience(flaky, None, retry_cfg=cfg)
     # One wait: provider hint 47.4s + 2.0s buffer.
     assert _fast_resilience == [49.4]
     assert RetryStats.snapshot()["rate_limit_retries"] == 1
+    # The provider's own error is still the cause of the stop.
+    assert isinstance(exc_info.value.__cause__, RateLimitError)
 
 
 def test_concurrency_limited_429_waits_for_the_slot(_fast_resilience):
@@ -257,7 +260,7 @@ def test_concurrency_floor_does_not_slow_a_plain_rate_limit(_fast_resilience):
         raise RateLimitError("rate_limit_exceeded: slow down", status=429)
 
     cfg = RetryConfig(max_retries=1, base_delay=2.0, max_delay=60.0, concurrency_wait=30.0)
-    with pytest.raises(RateLimitError):
+    with pytest.raises(NoBackupError):
         call_with_resilience(always, None, retry_cfg=cfg)
     assert _fast_resilience == [2.0]
 
@@ -275,7 +278,7 @@ def test_concurrency_floor_is_a_minimum_even_with_jitter(_fast_resilience):
     cfg = RetryConfig(
         max_retries=1, base_delay=1.0, max_delay=60.0, concurrency_wait=5.0, jitter=0.5
     )
-    with pytest.raises(RateLimitError):
+    with pytest.raises(NoBackupError):
         call_with_resilience(always, None, retry_cfg=cfg)
     assert 5.0 <= _fast_resilience[0] <= 7.5
 
@@ -287,7 +290,7 @@ def test_concurrency_wait_is_capped_by_max_delay(_fast_resilience):
         raise RateLimitError("429 concurrency_limit_exceeded", status=429)
 
     cfg = RetryConfig(max_retries=1, base_delay=2.0, max_delay=5.0, concurrency_wait=30.0)
-    with pytest.raises(RateLimitError):
+    with pytest.raises(NoBackupError):
         call_with_resilience(always, None, retry_cfg=cfg)
     assert _fast_resilience == [5.0]
 
@@ -297,7 +300,7 @@ def test_resilience_ratelimit_hint_capped_at_max_delay(_fast_resilience):
         raise RateLimitError("try again in 900s", retry_after=900.0, status=429)
 
     cfg = RetryConfig(max_retries=2, base_delay=2.0, max_delay=60.0, buffer_seconds=2.0)
-    with pytest.raises(RateLimitError):
+    with pytest.raises(NoBackupError):
         call_with_resilience(always, None, retry_cfg=cfg)
     assert _fast_resilience == [60.0, 60.0]
     assert RetryStats.snapshot()["rate_limit_retries"] == 2
@@ -385,12 +388,21 @@ def test_resilience_timeout_exhausted_falls_back():
     assert RetryStats.snapshot()["fallbacks"] == 1
 
 
-def test_resilience_no_backup_reraises_last_error():
+def test_resilience_no_backup_says_the_attempts_are_spent():
+    """No backup to switch to is the pipeline's own state, and it is said so.
+
+    The provider's error is still the cause, but the caller needs to know that
+    asking again is pointless: there is no other endpoint to ask. The chunk
+    layer reads this as "stop", not as "wait".
+    """
+
     def always():
         raise TransientError("boom", status=503)
 
-    with pytest.raises(TransientError):
+    with pytest.raises(NoBackupError) as exc_info:
         call_with_resilience(always, None, retry_cfg=RetryConfig(max_retries=1))
+    assert "no backup endpoint is configured" in str(exc_info.value)
+    assert isinstance(exc_info.value.__cause__, TransientError)
 
 
 def test_resilience_backup_failure_propagates():
@@ -488,12 +500,12 @@ def test_chat_permanent_401_does_not_retry_or_fallback(monkeypatch):
 
 
 @respx.mock
-def test_chat_without_backup_reraises_after_exhaustion(monkeypatch):
+def test_chat_without_backup_says_the_attempts_are_spent(monkeypatch):
     monkeypatch.setenv("LLM_MAX_RETRIES", "1")
     route = respx.post(CHAT_URL)
     route.side_effect = [ratelimit_response(), ratelimit_response()]
     client = LLMClient(make_agent_config())
-    with pytest.raises(RateLimitError):
+    with pytest.raises(NoBackupError):
         client.chat([{"role": "user", "content": "hi"}])
     assert route.call_count == 2
 

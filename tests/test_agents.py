@@ -41,6 +41,62 @@ def test_verifier_hard_checks_headings(mock_env):
     assert problems  # heading level changed
 
 
+def test_a_verifier_that_cannot_run_is_not_a_pass(mock_env):
+    """No verdict is not the same answer as a verdict.
+
+    A broken QA service must never block a translation, so the result still
+    reads ``ok``; but it used to read *only* ``ok``, and the run reported the
+    chunk as "verifier accepted the draft" when nobody had checked anything.
+    """
+    from polyglot_lc.config import get_agent_config
+
+    verifier = VerifierAgent(get_agent_config("VERIFIER"))
+
+    def unavailable(*args, **kwargs):
+        raise RuntimeError("provider down")
+
+    verifier.chat_json = unavailable
+    result = verifier.verify("NMT is fast.", "Dịch máy neural rất nhanh.", "en", "vi")
+
+    assert result.ok is True  # a translation is never blocked by QA
+    assert result.skipped is True  # …but this is not a pass
+    assert "unavailable" in result.reasons[0]
+    assert "skipped=True" in repr(result)
+
+
+def test_the_consistency_patch_sees_the_whole_translation(mock_env):
+    """The editor must be shown the whole text it is asked to correct.
+
+    The prompt used to slice the translation at 2500 characters, and the
+    model answered with the fragment it was shown — a fragment that still
+    carried the wanted term, so the checker accepted it in place of the
+    complete translation.
+    """
+    from types import SimpleNamespace
+
+    from polyglot_lc.agents.consistency import ConsistencyAgent
+    from polyglot_lc.config import get_agent_config
+
+    seen: dict[str, str] = {}
+
+    def record(messages, **kwargs):
+        seen["prompt"] = "\n".join(m["content"] for m in messages)
+        return SimpleNamespace(text="bản dịch đã chỉnh thuật ngữ")
+
+    agent = ConsistencyAgent(get_agent_config("REFINER"))
+    agent.chat = record  # type: ignore[method-assign]
+    translation = "Một câu đủ dài của bản dịch. " * 200  # well over 2500 characters
+    out = agent.patch(
+        source="A source paragraph.",
+        translation=translation,
+        fixes=[("NMT", "Dịch máy neural")],
+        src_lang="en",
+        tgt_lang="vi",
+    )
+    assert out == "bản dịch đã chỉnh thuật ngữ"
+    assert translation in seen["prompt"]  # the WHOLE text, not a 2500-char prefix
+
+
 def test_verifier_llm_pass(mock_env):
     from polyglot_lc.config import get_agent_config
 
@@ -223,7 +279,6 @@ def test_mock_dispatcher_still_recognises_the_live_prompts(mock_env):
         outline={"Intro": "preview"},
         src_lang="en",
         tgt_lang="vi",
-        domain="tech",
         glossary_candidates="(none)",
         user_glossary_md="(none)",
         trace_lines=[],

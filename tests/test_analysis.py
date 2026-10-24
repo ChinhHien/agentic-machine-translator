@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 from types import SimpleNamespace
 
 import pytest
@@ -13,8 +14,18 @@ from polyglot_lc.analysis import (
     merge_glossary_md,
     score_chunk,
 )
-from polyglot_lc.analysis.unified_planner import GlossaryPair
-from polyglot_lc.segment.glossary import GlossaryTerm
+from polyglot_lc.analysis.unified_planner import (
+    DOC_EXCERPT_CHARS,
+    DOC_EXCERPT_WINDOWS,
+    OUTLINE_MAX_CHARS,
+    SECTION_PREVIEW_CHARS,
+    GlossaryPair,
+    render_outline,
+    sample_body,
+)
+from polyglot_lc.ingest.model import Block, Document
+from polyglot_lc.segment.chunker import chunk_document, count_tokens
+from polyglot_lc.segment.glossary import GlossaryTerm, extract_glossary, glossary_budget
 
 
 def _chunk(cid: str, text: str, tokens: int = 10, section: str = "") -> SimpleNamespace:
@@ -139,7 +150,6 @@ def test_unified_planner_costs_one_request_for_many_sections():
         planner,
         src_lang="en",
         tgt_lang="vi",
-        domain="tech",
         doc_text="Body of section 0.",
         doc_title="Doc",
     )
@@ -161,7 +171,6 @@ def test_section_note_falls_back_to_parent_section():
         planner,
         src_lang="en",
         tgt_lang="vi",
-        domain="general",
     )
     assert plan.note_for("Chapter 1 > Details") == "keep the tone"
 
@@ -174,7 +183,6 @@ def test_unified_planner_survives_model_failure():
         planner,
         src_lang="en",
         tgt_lang="vi",
-        domain="tech",
         doc_text="NMT appears twice. NMT again.",
     )
     assert planner.calls == 1
@@ -196,7 +204,7 @@ def test_unified_planner_clamps_and_tolerates_bad_values():
             "section_notes": ["not a dict"],
         }
     )
-    plan = analyze_document(chunks, planner, src_lang="en", tgt_lang="vi", domain="g")
+    plan = analyze_document(chunks, planner, src_lang="en", tgt_lang="vi")
     assert plan.strategy  # fell back to the default
     assert 0.0 <= plan.complexity <= 1.0
     assert plan.glossary_pairs == []  # pair without a translation dropped
@@ -208,7 +216,7 @@ def test_unified_planner_clamps_and_tolerates_bad_values():
 def test_bare_string_few_shot_is_wrapped_not_iterated():
     chunks = [_chunk("chunk-000", "text")]
     planner = _StubPlanner(reply={"few_shot": "Hello => Xin chào"})
-    plan = analyze_document(chunks, planner, src_lang="en", tgt_lang="vi", domain="g")
+    plan = analyze_document(chunks, planner, src_lang="en", tgt_lang="vi")
     assert plan.few_shot == ["Hello => Xin chào"]
 
 
@@ -245,10 +253,161 @@ def test_planner_prompt_pins_the_complexity_scale():
     """
     chunks = [_chunk("chunk-000", "text", section="Intro")]
     planner = _StubPlanner(reply={})
-    analyze_document(chunks, planner, src_lang="en", tgt_lang="vi", domain="tech")
+    analyze_document(chunks, planner, src_lang="en", tgt_lang="vi")
     prompt = planner.prompts[0]
     assert "[0, 1]" in prompt
     assert "not 0-10" in prompt
     # section_notes must be keyed by names the prompt actually shows.
     assert "section_notes keys" in prompt
     assert "Intro" in prompt
+
+
+# ----------------------- long documents: 1000+ pages ------------------------
+def _tagged_text(segments: int = 200, sentences: int = 40) -> str:
+    """A body whose every 1/200th is labelled, so an excerpt can be traced."""
+    return (
+        "".join(
+            f"[[seg-{i:03d}]] " + "the service returns an error code. " * sentences
+            for i in range(segments)
+        )
+        + "[[end]] the document is over."
+    )
+
+
+def test_the_body_excerpt_is_drawn_from_the_whole_document():
+    """A 1000-page book opens with a cover and a contents list, not a book."""
+    text = _tagged_text()
+    planner = _StubPlanner(reply={})
+    analyze_document(
+        [_chunk("chunk-000", "text", section="Intro")],
+        planner,
+        src_lang="en",
+        tgt_lang="vi",
+        doc_text=text,
+    )
+    prompt = planner.prompts[0]
+    tags = [int(m) for m in re.findall(r"\[\[seg-(\d{3})\]\]", prompt)]
+    assert tags
+    assert min(tags) == 0, "the opening still counts"
+    assert max(tags) >= 100, "the second half of the book is represented"
+    assert "[[end]]" in prompt, "and so is the last page of a 1000-page book"
+
+
+def test_the_body_excerpt_spends_no_more_than_its_budget():
+    excerpt = sample_body(_tagged_text())
+    assert len(excerpt) <= DOC_EXCERPT_CHARS
+    assert excerpt.count("[...]") == DOC_EXCERPT_WINDOWS - 1
+
+
+def test_a_document_that_fits_the_budget_is_sent_whole():
+    text = "Short document sentence. " * 60
+    assert sample_body(text) == text
+
+
+def test_the_outline_never_exceeds_its_budget():
+    outline = {
+        f"Chapter {i}: a heading of realistic length": ("preview sentence " * 10)[
+            :SECTION_PREVIEW_CHARS
+        ]
+        for i in range(150)
+    }
+    rendered = render_outline(outline)
+    assert len(rendered) <= OUTLINE_MAX_CHARS
+    assert all(name in rendered for name in outline), "previews shrink before names are cut"
+    assert rendered.count("…") == len(outline), "every preview was clipped to fit"
+
+
+def test_an_outline_too_large_for_its_names_says_what_it_dropped():
+    outline = {f"Chapter {i}: a heading long enough to matter": "p" * 160 for i in range(5000)}
+    rendered = render_outline(outline)
+    assert len(rendered) <= OUTLINE_MAX_CHARS
+    shown = [line for line in rendered.splitlines() if not line.startswith("- (+")]
+    omitted = int(re.search(r"- \(\+(\d+) more sections not shown\)", rendered).group(1))
+    assert omitted > 0
+    assert omitted == len(outline) - len(shown)
+
+
+def test_a_normal_book_keeps_full_section_previews():
+    outline = {f"Chapter {i}": f"Preview of chapter {i}." for i in range(75)}
+    expected = "\n".join(f"- {name}: {preview}" for name, preview in outline.items())
+    assert render_outline(outline) == expected
+
+
+def test_a_thousand_page_plan_prompt_stays_small():
+    blocks: list[Block] = []
+    for page in range(1000):
+        blocks.append(Block(kind="heading", text=f"Chapter {page + 1}", level=2))
+        blocks.append(Block(kind="paragraph", text="The service returns an error code. " * 40))
+    doc = Document(blocks=blocks)
+    chunks = chunk_document(doc)
+    planner = _StubPlanner(reply={})
+    analyze_document(chunks, planner, src_lang="en", tgt_lang="vi", doc_text=doc.plain_text())
+    assert len(chunks) >= 300
+    assert count_tokens(planner.prompts[0]) < 10_000
+
+
+# ----------------------------- glossary budget ------------------------------
+def test_the_glossary_budget_grows_with_the_document():
+    assert glossary_budget(0) == 40
+    assert glossary_budget(200_000) == 65
+    assert glossary_budget(1_020_000) == 167
+    assert glossary_budget(10_000_000) == 200  # never past the user glossary's cap
+
+
+def test_the_planner_accepts_more_terms_from_a_long_document():
+    pairs = [{"term": f"Term {i}", "translation": f"Thuật ngữ {i}"} for i in range(120)]
+    planner = _StubPlanner(reply={"glossary_terms": pairs, "complexity": 0.2})
+    doc_text = "x" * 1_020_000
+
+    plan = analyze_document(
+        [_chunk("chunk-000", "text", section="Intro")],
+        planner,
+        src_lang="en",
+        tgt_lang="vi",
+        doc_text=doc_text,
+    )
+
+    assert len(plan.glossary_pairs) == 120  # 40 was the old fixed ceiling
+    assert f"up to {glossary_budget(len(doc_text))} terms" in planner.prompts[0]
+
+
+def test_a_short_document_keeps_the_planners_old_ceiling():
+    pairs = [{"term": f"Term {i}", "translation": f"Thuật ngữ {i}"} for i in range(60)]
+    planner = _StubPlanner(reply={"glossary_terms": pairs, "complexity": 0.2})
+
+    plan = analyze_document(
+        [_chunk("chunk-000", "text", section="Intro")],
+        planner,
+        src_lang="en",
+        tgt_lang="vi",
+        doc_text="x" * 2_000,
+    )
+
+    assert len(plan.glossary_pairs) == 40
+
+
+def test_the_user_glossary_is_never_truncated_by_the_budget():
+    """The budget bounds what the machine adds, never what the user supplied."""
+    user = {f"term {i}": f"thuật ngữ người dùng {i}" for i in range(5)}
+
+    md = merge_glossary_md(
+        planner_pairs=[GlossaryPair(f"p{i}", f"dạng máy {i}") for i in range(3)],
+        heuristic_terms=[GlossaryTerm(f"h{i}", 3, "repeated") for i in range(3)],
+        user_glossary=user,
+        limit=2,
+    )
+
+    lines = md.splitlines()
+    assert sum(1 for line in lines if "thuật ngữ người dùng" in line) == 5
+    assert not any("dạng máy" in line for line in lines)  # no room left for machine terms
+
+
+def test_a_long_document_keeps_more_heuristic_terms_than_a_memo():
+    text = " ".join(f"Widget{i} appears twice. Widget{i} again." for i in range(120)) * 60
+    budget = glossary_budget(len(text))
+
+    memo = extract_glossary(text, max_terms=40)
+    book = extract_glossary(text, max_terms=budget)
+
+    assert len(memo) == 40
+    assert len(book) == budget  # the memo's ceiling no longer binds a book-sized text

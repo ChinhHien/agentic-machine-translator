@@ -67,6 +67,48 @@ def test_get_all_configs_validates_everything(mock_env):
     assert set(cfgs) == set(AGENT_NAMES)
 
 
+# ------------------------------- backup endpoint ------------------------------
+def test_one_backup_covers_every_agent_that_has_none_of_its_own(mock_env, monkeypatch):
+    """A pipeline names its second provider once, and every agent has it.
+
+    A pipeline that names a backup for the Translator and forgets the Verifier
+    has nothing to fall back to where it matters: the endpoint that is down is
+    rarely the one that was remembered.
+    """
+    monkeypatch.setenv("LLM_BACKUP_BASE_URL", "http://backup.test/v1")
+    monkeypatch.setenv("LLM_BACKUP_MODEL", "backup-model")
+    for name in AGENT_NAMES:
+        cfg = get_agent_config(name)
+        assert cfg.has_backup, name
+        assert cfg.backup_base_url == "http://backup.test/v1", name
+        assert cfg.backup_model == "backup-model", name
+
+
+def test_without_a_backup_no_agent_has_one(mock_env):
+    for name in AGENT_NAMES:
+        assert get_agent_config(name).has_backup is False, name
+
+
+def test_a_half_set_backup_is_a_config_error(mock_env, monkeypatch):
+    """A base url without a model is a typo, and the check says so."""
+    monkeypatch.setenv("LLM_BACKUP_BASE_URL", "http://backup.test/v1")
+    with pytest.raises(ConfigError, match="BACKUP"):
+        get_agent_config("PLANNER")
+
+
+def test_embedding_has_no_backup_at_all(mock_env, monkeypatch):
+    """The Reasoning Bank is best-effort: a missing backup there costs a trace.
+
+    The embedding endpoint is the one part of the pipeline that does not
+    translate anything, so it is the one part with nothing to fall back to.
+    """
+    monkeypatch.setenv("LLM_BACKUP_BASE_URL", "http://backup.test/v1")
+    monkeypatch.setenv("LLM_BACKUP_MODEL", "backup-model")
+    cfg = get_embed_config()
+    assert not hasattr(cfg, "backup_base_url")
+    assert not hasattr(cfg, "backup_model")
+
+
 def test_embed_config(mock_env):
     cfg = get_embed_config()
     assert cfg.model == "mock-embed"
@@ -104,7 +146,6 @@ def test_app_config_bad_int_raises(monkeypatch, mock_env):
 # ------------------------- workflow v2 defaults -----------------------------
 def test_workflow_defaults(mock_env):
     cfg = get_app_config()
-    assert cfg.unified_planner is True
     assert cfg.adaptive_quality is True
     assert cfg.fast_path_max_complexity == 0.35
     assert cfg.fast_path_min_score == 9.0
@@ -117,7 +158,6 @@ def test_workflow_defaults(mock_env):
 
 
 def test_workflow_overrides(mock_env, monkeypatch):
-    monkeypatch.setenv("UNIFIED_PLANNER", "0")
     monkeypatch.setenv("ADAPTIVE_QUALITY", "0")
     monkeypatch.setenv("FAST_PATH_MIN_SCORE", "8")
     monkeypatch.setenv("FAST_PATH_MAX_COMPLEXITY", "0.5")
@@ -127,7 +167,6 @@ def test_workflow_overrides(mock_env, monkeypatch):
     monkeypatch.setenv("CONSISTENCY_CHECK", "0")
     monkeypatch.setenv("CONSISTENCY_MAX_PATCHES", "2")
     cfg = get_app_config()
-    assert cfg.unified_planner is False
     assert cfg.adaptive_quality is False
     assert cfg.fast_path_min_score == 8.0
     assert cfg.fast_path_max_complexity == 0.5

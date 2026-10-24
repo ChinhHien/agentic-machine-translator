@@ -29,8 +29,12 @@ This extractor reads the PDF's own typography instead of guessing:
   (a fraction of its height) rather than a fixed number of points — 110 pt is a
   seventh of a portrait book page and a fifth of a landscape sheet;
 * **headings and running heads are told apart** by the page number: a line is a
-  running head when it *is* a page number or ends/starts with one, so a section
-  title sitting in the margin band survives as a heading;
+  running head when it *is* a page number or carries *this page's own* folio at
+  an edge — the offset between the printed folio and the PDF's page index is read
+  off the document's own bare folios — so a section title sitting in the margin
+  band, a table row opening with its row number ("1 IBM Armonk …") and a
+  contents entry ending with the page it points at all survive as content. A
+  numeral has to be well formed to count ("iv", not "id");
 * the **bottom band** is the running foot (the folio), and a line there that is
   *nothing but* a page number is dropped like a running head — it is furniture
   repeated on every page, and left in the flow it glues itself to the first line
@@ -125,9 +129,19 @@ _MAX_HEAD_CHARS = 60
 #: serve both.
 _FOOTER_BAND_RATIO = 0.08
 
-#: A standalone page-number token: arabic digits or a roman numeral.
-_PAGE_NUM_RE = re.compile(r"(?<![\w.])(?:\d{1,4}|[IVXLCDM]{1,7})(?![\w.])", re.IGNORECASE)
-_PAGE_NUM_ONLY_RE = re.compile(r"(?:\d{1,4}|[IVXLCDM]{1,7})", re.IGNORECASE)
+#: A standalone page-number token: arabic digits or a roman numeral. The numeral
+#: is validated by :func:`_roman_value` — a bare run of the seven letters is not
+#: one, and it read words too: a table's header row opening with "id" (ID, 501)
+#: or a list item "• C" (C, 100) was taken for a folio and dropped whole.
+_PAGE_NUM_ONLY_RE = re.compile(r"(?:\d{1,4}|[IVXLCDM]+)", re.IGNORECASE)
+#: A well-formed Roman numeral: subtractive notation, in order, nothing left over.
+_ROMAN_NUMERAL_RE = re.compile(
+    r"M{0,4}(?:CM|CD|D?C{0,3})(?:XC|XL|L?X{0,3})(?:IX|IV|V?I{0,3})", re.IGNORECASE
+)
+_ROMAN_VALUES = {"I": 1, "V": 5, "X": 10, "L": 50, "C": 100, "D": 500, "M": 1000}
+#: Fewest bare folios the document must show before its own pagination offset is
+#: trusted. One stray number in a header is not a pagination.
+_MIN_FOLIO_SAMPLE = 3
 
 #: A line that ends here ends a paragraph. Used where the *geometry* of a break
 #: says nothing: the page's last line to the next page's first.
@@ -157,9 +171,6 @@ _BULLET_CHARS = "-*"
 
 #: Leading CMTT advance is 0.525 em; code indentation is restored from x-offset.
 _MONO_ADVANCE = 0.525
-
-#: Ordered-list markers ("1. ", "12. ").
-_NUMBERED_PREFIX = "0123456789"
 
 #: TeX ligature glyphs -> the letters they stand for.
 _LIGATURES = {"ﬀ": "ff", "ﬁ": "fi", "ﬂ": "fl", "ﬃ": "ffi", "ﬄ": "ffl"}
@@ -317,6 +328,40 @@ def looks_like_code(text: str) -> bool:
     return any(ch in stripped for ch in _CODE_CHARS)
 
 
+#: Superscript forms of the characters an exponent is written with. A PDF sets
+#: an exponent as a *small raised glyph*, not as the character ``²``; reading
+#: the glyph as its ordinary digit is how ``n²`` reaches the translator as
+#: ``n2`` and leaves the rebuilt page without its exponent.
+_SUPERSCRIPT = str.maketrans("0123456789+-=()n", "⁰¹²³⁴⁵⁶⁷⁸⁹⁺⁻⁼⁽⁾ⁿ")
+
+
+def _baseline(chars: list[dict[str, Any]]) -> tuple[float, float | None]:
+    """The line's main size and the bottom of its full-size glyphs.
+
+    ``bottom`` is in pdfplumber's top-down coordinates, so a raised glyph has a
+    *smaller* bottom than the text it is raised above.
+    """
+    size = max(float(ch["size"]) for ch in chars)
+    bottoms = [
+        float(ch["bottom"])
+        for ch in chars
+        if "bottom" in ch and abs(float(ch["size"]) - size) < 0.05
+    ]
+    return size, (max(bottoms) if bottoms else None)
+
+
+def _superscript(ch: dict[str, Any], size: float, baseline: float | None) -> str | None:
+    """*ch* as a superscript character, or ``None`` when it is ordinary text."""
+    if baseline is None or "bottom" not in ch:
+        return None
+    if float(ch["size"]) > size * 0.85:
+        return None
+    if float(ch["bottom"]) > baseline - size * 0.08:
+        return None
+    mapped = str(ch["text"]).translate(_SUPERSCRIPT)
+    return mapped if mapped != str(ch["text"]) else None
+
+
 def line_spans(chars: Iterable[dict[str, Any]]) -> list[tuple[str, bool, bool]]:
     """A line's text split into runs of one style, in reading order.
 
@@ -329,16 +374,24 @@ def line_spans(chars: Iterable[dict[str, Any]]) -> list[tuple[str, bool, bool]]:
     :data:`_SPACE_GAP_RATIO` of the size is a word gap — so a uniform line yields
     exactly the same characters as before, in one run.
     """
+    ordered = sorted(chars, key=lambda c: c["x0"])
+    size, baseline = _baseline(ordered)
     runs: list[tuple[str, bool, bool]] = []
     prev: dict[str, Any] | None = None
-    for ch in sorted(chars, key=lambda c: c["x0"]):
+    for ch in ordered:
         style = _font_style(_font_of(ch))
-        gap = ""
-        if prev is not None and float(ch["x0"]) - float(prev["x1"]) > _SPACE_GAP_RATIO * max(
-            float(prev["size"]), 1.0
-        ):
-            gap = " "
-        text = gap + str(ch["text"])
+        raised = _superscript(ch, size, baseline)
+        if raised is not None:
+            # An exponent follows its base with no word gap, whatever the
+            # smaller glyph's advance looks like.
+            text = raised
+        else:
+            gap = ""
+            if prev is not None and float(ch["x0"]) - float(prev["x1"]) > _SPACE_GAP_RATIO * max(
+                float(prev["size"]), 1.0
+            ):
+                gap = " "
+            text = gap + str(ch["text"])
         if runs and runs[-1][1:] == style:
             runs[-1] = (runs[-1][0] + text, *style)
         else:
@@ -441,9 +494,15 @@ def line_text(chars: Iterable[dict[str, Any]]) -> str:
     there. Intra-word gaps are ~0.03 em, inter-word gaps ~0.24 em.
     """
     ordered = sorted(chars, key=lambda c: c["x0"])
+    size, baseline = _baseline(ordered)
     out: list[str] = []
     prev: dict[str, Any] | None = None
     for ch in ordered:
+        raised = _superscript(ch, size, baseline)
+        if raised is not None:
+            out.append(raised)
+            prev = ch
+            continue
         if prev is not None:
             gap = float(ch["x0"]) - float(prev["x1"])
             if gap > _SPACE_GAP_RATIO * max(float(prev["size"]), 1.0):
@@ -616,23 +675,80 @@ def _footer_band(page: Any) -> float:
     return height * (1.0 - _FOOTER_BAND_RATIO)
 
 
-def _looks_like_running_head(text: str) -> bool:
+def _roman_value(token: str) -> int | None:
+    """The value of *token* when it is a well-formed Roman numeral, else ``None``.
+
+    Well-formed matters: ``[IVXLCDM]+`` matches ``id`` and ``mix`` too, and a
+    word that happens to be spelled in numeral letters is not a folio.
+    """
+    upper = token.upper()
+    if not upper or _ROMAN_NUMERAL_RE.fullmatch(upper) is None:
+        return None
+    total = 0
+    for index, letter in enumerate(upper):
+        value = _ROMAN_VALUES[letter]
+        following = _ROMAN_VALUES[upper[index + 1]] if index + 1 < len(upper) else 0
+        total += -value if following > value else value
+    return total
+
+
+def _folio_value(token: str) -> int | None:
+    """The number *token* stands for as a printed folio: ``"42"`` or ``"xiv"``."""
+    stripped = token.strip(".,;:()[]")
+    if _PAGE_NUM_ONLY_RE.fullmatch(stripped) is None:
+        return None
+    if stripped.isdigit():
+        return int(stripped)
+    return _roman_value(stripped)
+
+
+def _page_num_only(text: str) -> int | None:
+    """The folio a line consists of, or ``None`` when it is more than one."""
+    stripped = text.strip()
+    if not stripped or " " in stripped:
+        return None
+    return _folio_value(stripped)
+
+
+def _starts_with_bullet(text: str) -> bool:
+    """Whether a line opens with a bullet glyph, which furniture never does."""
+    stripped = text.lstrip()
+    return any(stripped.startswith(mark) for mark in _BULLETS) or (
+        stripped[:1] in _BULLET_CHARS and stripped[1:2] == " "
+    )
+
+
+def _looks_like_running_head(text: str, *, folio: int | None = None) -> bool:
     """True when a top-of-page line is a running head rather than content.
 
     The evidence is the page number: either the line *is* one (``4``, ``iv``),
     or it carries one at an edge (``10 Chapter 2 Analysis``). A content line that
     happens to contain a year or a version (``Windows Server 2016 / 2019``,
     ``Eocortex 4.6``) has the number inside it, not at an edge, and is kept.
+
+    *folio* is this page's own printed page number, when the document tells us
+    (see :func:`_folio_offset`). It is the difference between furniture and a
+    line that merely starts or ends in a number: a table row opening with its
+    own row number (``1 IBM Armonk New York USA``) or a contents entry ending
+    with the page it points at (``… Authors 38``) is content, and used to be
+    dropped as a running head. Without that evidence the edge number is taken
+    at its word — the old, more forgiving reading.
     """
     stripped = text.strip()
     if not stripped or len(stripped) > _MAX_HEAD_CHARS:
         return False
-    if _PAGE_NUM_ONLY_RE.fullmatch(stripped):
+    if _page_num_only(stripped) is not None:
         return True
-    match = _PAGE_NUM_RE.search(stripped)
-    if match is None:
+    tokens = stripped.split()
+    if not tokens:
         return False
-    return match.start() == 0 or match.end() == len(stripped)
+    for token in (tokens[0], tokens[-1]):
+        value = _folio_value(token)
+        if value is None:
+            continue
+        if folio is None or value == folio:
+            return True
+    return False
 
 
 def _classify(
@@ -643,6 +759,7 @@ def _classify(
     footer_band: float = float("inf"),
     heading_min: float = _HEADING_SIZE,
     h1_min: float = _H1_SIZE,
+    folio: int | None = None,
 ) -> _RawLine | None:
     """Classify one pdfplumber line; ``None`` when it carries no content."""
     chars = line["chars"]
@@ -678,7 +795,11 @@ def _classify(
         level = 1 if size >= h1_min else 2
         return raw("heading", level, text, x0, size, x1, bottom, spans=spans)
 
-    if top < header_band and _looks_like_running_head(text):
+    if (
+        top < header_band
+        and not _starts_with_bullet(text)
+        and _looks_like_running_head(text, folio=folio)
+    ):
         return raw("header", 0, text, 0.0, 0.0)
 
     # The page's own folio, dropped the way a running head is. Leaving it in the
@@ -690,7 +811,7 @@ def _classify(
     # The rule is deliberately narrower than the head's: a foot that carries
     # words as well as its number is something the reader can see, and dropping
     # it would lose those words. A bare number below the text block is furniture.
-    if top >= footer_band and _PAGE_NUM_ONLY_RE.fullmatch(text):
+    if top >= footer_band and _page_num_only(text) is not None:
         return raw("footer", 0, text, 0.0, 0.0)
 
     mono = sum(1 for c in chars if _is_mono(_font_of(c)))
@@ -707,11 +828,13 @@ def _classify(
     stripped = text.lstrip()
     if _TOC_LINE_RE.search(stripped):
         kind = "toc"
-    elif any(stripped.startswith(mark) for mark in _BULLETS) or (
-        stripped[:1] in _BULLET_CHARS and stripped[1:2] == " "
-    ):
+    elif _starts_with_bullet(stripped):
         kind = "bullet"
-    elif len(stripped) > 3 and stripped[0] in _NUMBERED_PREFIX and stripped[1:3] in (". ", ") "):
+    elif _number_marker(stripped):
+        # The same test the marker extraction uses, not a single-digit look at
+        # the second character: an entry numbered "10. " read as body text is
+        # folded as the previous item's continuation, and every entry after it
+        # runs on into that one line.
         kind = "numbered"
     return raw(kind, 0, text, x0, size, x1, bottom, spans=spans)
 
@@ -737,7 +860,10 @@ def _text_lines(page: Any) -> list[dict[str, Any]]:
     return list(page.extract_text_lines(layout=False))
 
 
-def _font_thresholds(pages: list[Any]) -> tuple[float, float, float]:
+def _font_thresholds(
+    pages: list[Any],
+    lines_by_page: list[list[dict[str, Any]]] | None = None,
+) -> tuple[float, float, float]:
     """``(heading_min, h1_min, body)`` from the document's own font sizes.
 
     The body size is the size most lines are set in; a heading is a couple of
@@ -752,8 +878,9 @@ def _font_thresholds(pages: list[Any]) -> tuple[float, float, float]:
     ``0.0``, which tells the caller to measure each page on its own.
     """
     sizes: Counter[float] = Counter()
-    for page in pages:
-        for line in _text_lines(page):
+    for index, page in enumerate(pages):
+        lines = lines_by_page[index] if lines_by_page is not None else _text_lines(page)
+        for line in lines:
             chars = line.get("chars") or []
             if not chars:
                 continue
@@ -941,10 +1068,45 @@ def _page_tables(page: Any, page_no: int) -> list[_Table]:
     return found
 
 
+def _folio_offset(
+    pages: list[Any],
+    lines_by_page: list[list[dict[str, Any]]] | None = None,
+) -> int | None:
+    """How far the printed folio runs behind the PDF's own page index.
+
+    A running head carries *this page's* folio, so telling furniture from content
+    means knowing which number that is. Printed page 78 may be the PDF's 92nd
+    page — front matter is unnumbered — and the offset is fixed for the whole
+    document: it is read off the pages that print a bare folio in their header or
+    foot band, and the value most pages agree on wins.
+
+    ``None`` when too few pages print one (see :data:`_MIN_FOLIO_SAMPLE`): the
+    caller then keeps the old, more forgiving reading of an edge number.
+    """
+    if lines_by_page is None:
+        lines_by_page = [_text_lines(page) for page in pages]
+    offsets: Counter[int] = Counter()
+    for index, (page, lines) in enumerate(zip(pages, lines_by_page, strict=True)):
+        head, foot = _header_band(page), _footer_band(page)
+        for line in lines:
+            value = _page_num_only(normalize_glyphs(line_text(line.get("chars") or [])))
+            if value is None:
+                continue
+            top = float(line["top"])
+            if top < head or top >= foot:
+                offsets[value - (index + 1)] += 1
+    if not offsets:
+        return None
+    offset, seen = offsets.most_common(1)[0]
+    return offset if seen >= _MIN_FOLIO_SAMPLE else None
+
+
 def _page_lines(
     page: Any,
     page_no: int,
     *,
+    raw: list[dict[str, Any]] | None = None,
+    folio: int | None = None,
     heading_min: float = _HEADING_SIZE,
     h1_min: float = _H1_SIZE,
 ) -> list[_RawLine]:
@@ -952,11 +1114,14 @@ def _page_lines(
 
     Lines that fall inside a detected table are replaced by the table itself, so
     a row is emitted once, as a row, instead of being flattened into prose.
+    *raw* is the page's pdfplumber lines when the caller already read them (the
+    thresholds and the folio offset need the same list); *folio* is this page's
+    own printed page number, when the document shows its pagination.
     """
     header_band = _header_band(page)
     footer_band = _footer_band(page)
     lines: list[_RawLine] = []
-    for line in _text_lines(page):
+    for line in _text_lines(page) if raw is None else raw:
         classified = _classify(
             page_no,
             line,
@@ -964,6 +1129,7 @@ def _page_lines(
             footer_band=footer_band,
             heading_min=heading_min,
             h1_min=h1_min,
+            folio=folio,
         )
         if classified is not None:
             lines.append(classified)
@@ -1275,11 +1441,24 @@ def _build_units(pages: list[Any]) -> list[_Unit]:
     their rectangles, so the pages are grouped exactly once — there is no second
     classifier that could disagree about where a translated block belongs.
     """
-    heading_min, h1_min, body_size = _font_thresholds(pages)
+    #: The page's own pdfplumber lines, read once: the size thresholds, the
+    #: document's folio offset and the classification all ask the same list.
+    lines_by_page = [_text_lines(page) for page in pages]
+    heading_min, h1_min, body_size = _font_thresholds(pages, lines_by_page)
+    #: Front matter makes the printed page number differ from the PDF's own page
+    #: index; the running-head test needs the number this page actually prints.
+    offset = _folio_offset(pages, lines_by_page)
     classified = [
         (page_no, ln)
         for page_no, page in enumerate(pages)
-        for ln in _page_lines(page, page_no, heading_min=heading_min, h1_min=h1_min)
+        for ln in _page_lines(
+            page,
+            page_no,
+            raw=lines_by_page[page_no],
+            folio=None if offset is None else offset + page_no + 1,
+            heading_min=heading_min,
+            h1_min=h1_min,
+        )
     ]
     _mark_labels(classified, body_size)
     spacing_by_page = {

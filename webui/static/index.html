@@ -167,6 +167,12 @@
           <header class="pane-head">
             <h3 id="source-title" class="card-title">Bản gốc</h3>
             <span id="source-meta" class="count"></span>
+            <!-- The extraction as a file, in the two shapes it can be useful
+                 in: the pipeline's own text, and the same text with the
+                 emphasis said the Markdown way and the code markers gone.
+                 Filled once the text has arrived, since neither file can exist
+                 before it. -->
+            <p id="source-gets" class="pane-gets" hidden></p>
           </header>
           <p id="source-note" class="note"></p>
           <pre id="source-text" class="pane-text" tabindex="0" aria-labelledby="source-title"></pre>

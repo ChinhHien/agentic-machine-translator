@@ -31,7 +31,6 @@ def test_boundary_score_accepted(bank):
 def test_retrieve_returns_similar_first(bank):
     bank.upsert(
         ReasoningTrace(
-            domain="tech",
             src_lang="en",
             tgt_lang="vi",
             strategy="Keep product names unchanged",
@@ -40,7 +39,6 @@ def test_retrieve_returns_similar_first(bank):
     )
     bank.upsert(
         ReasoningTrace(
-            domain="legal",
             src_lang="en",
             tgt_lang="vi",
             strategy="Use formal register for contracts",
@@ -49,7 +47,8 @@ def test_retrieve_returns_similar_first(bank):
     )
     hits = bank.retrieve("product names in tech manuals", top_k=1)
     assert len(hits) == 1
-    assert hits[0].domain == "tech"
+    # The strategy comes back as the embedded document "en->vi: <strategy>".
+    assert "Keep product names unchanged" in hits[0].strategy
 
 
 def test_retrieve_empty_bank(bank):
@@ -58,7 +57,6 @@ def test_retrieve_empty_bank(bank):
 
 def test_trace_metadata_roundtrip(bank):
     t = ReasoningTrace(
-        domain="tech",
         src_lang="en",
         tgt_lang="vi",
         strategy="strategy text",
@@ -80,7 +78,7 @@ def test_persistence_across_instances(rb_dir, mock_env):
     b2 = ReasoningBank(rb_dir, emb)
     assert b2.count() == 1
     hits = b2.retrieve("persist me", top_k=1)
-    # Strategy is embedded as "[domain] src->tgt: <strategy>" document text.
+    # Strategy is embedded as the document text "src->tgt: <strategy>".
     assert hits and "persist me" in hits[0].strategy
 
 

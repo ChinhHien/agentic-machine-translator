@@ -285,7 +285,6 @@ class Trace:
             )
             lines.append(
                 f"  {started.get('src', '?')} -> {started.get('tgt', '?')}"
-                f"  domain: {started.get('domain', '?')}"
                 f"  max tokens: {started.get('max_tokens', '?')}"
             )
             for agent in started.get("agents") or []:
@@ -328,6 +327,16 @@ class Trace:
                 f"  retries: {totals.get('retries', 0)}"
                 f"  fallbacks: {totals.get('fallbacks', 0)}"
             )
+            # Drift the pass could not fix is part of the totals too: a run that
+            # skipped four chunks and had two patches refused is not a run whose
+            # terminology came out consistent.
+            if totals.get("consistency_inconsistencies"):
+                lines.append(
+                    f"  consistency: {totals.get('consistency_inconsistencies', 0)} drifting term(s)"
+                    f"  patched: {totals.get('consistency_patched', 0)} chunk(s)"
+                    f"  skipped: {totals.get('consistency_skipped', 0)}"
+                    f"  rejected: {totals.get('consistency_rejected', 0)}"
+                )
             for artifact in totals.get("artifacts") or []:
                 lines.append(
                     f"  {artifact.get('kind', '?')}: {artifact.get('path', '?')}"

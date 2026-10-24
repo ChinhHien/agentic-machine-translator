@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
@@ -78,7 +79,6 @@ def test_start_builds_the_command_and_the_run_dir(repo, planned):
         file="doc.pdf",
         src="vi",
         tgt="en",
-        domain="tech",
         glossary="g.csv",
         max_tokens=555,
         mock=True,
@@ -90,7 +90,6 @@ def test_start_builds_the_command_and_the_run_dir(repo, planned):
     for flag, value in (
         ("--src", "vi"),
         ("--tgt", "en"),
-        ("--domain", "tech"),
         ("--glossary", "g.csv"),
         ("--max-tokens", "555"),
     ):
@@ -110,7 +109,7 @@ def test_resume_continues_the_run_in_place_with_its_own_command(repo, planned):
 
     The chunks left to translate are the ones the stopped attempt wrote
     checkpoints for, and those checkpoints are keyed by the command that
-    produced them — file, languages, domain, glossary, token budget — plus the
+    produced them — file, languages, glossary, token budget — plus the
     Translator model. So the resumed attempt is that exact command with
     ``--resume``, under the same run id, log directory and output path: the
     page keeps showing one run, in the place it already was.
@@ -121,7 +120,6 @@ def test_resume_continues_the_run_in_place_with_its_own_command(repo, planned):
         file="doc.pdf",
         src="vi",
         tgt="en",
-        domain="tech",
         glossary="g.csv",
         max_tokens=555,
         mock=False,
@@ -141,6 +139,39 @@ def test_resume_continues_the_run_in_place_with_its_own_command(repo, planned):
     assert kw["env"]["LOGS_DIR"] == str(repo / "logs" / "webui" / stopped.run_id)
 
 
+def test_resume_drops_an_option_the_cli_no_longer_takes(repo, planned):
+    """A stored command is replayed without the options the CLI has dropped.
+
+    A record keeps the command line of the day the run started, and the CLI
+    has changed since: an option it no longer has would stop the child before
+    it started, so the run could never continue. The option goes, and the
+    value it carried goes with it; everything else stays, so the run still
+    lands on the very same checkpoints.
+    """
+    made: list = []
+    mgr = _manager(repo, made)
+    rec = mgr.start(
+        file="doc.pdf",
+        src="vi",
+        tgt="en",
+        glossary="g.csv",
+        max_tokens=555,
+        mock=False,
+    )
+    stopped = _stopped(mgr, rec)
+    stale = list(stopped.command) + ["--legacy-flag", "general"]
+    mgr.store.write_record(replace(stopped, command=stale))
+
+    mgr.resume(stopped.run_id)
+
+    argv, _ = made[1]
+    assert "--legacy-flag" not in argv
+    assert "general" not in argv  # the value went with the option
+    assert "--glossary" in argv and "g.csv" in argv  # the rest is untouched
+    assert "--max-tokens" in argv and "555" in argv
+    assert argv[-1] == "--resume"
+
+
 def test_resume_refuses_a_run_that_is_still_running(repo, planned):
     """A run that never stopped keeps its own child: a second one would write
     the same event log and the same output file at the same time."""
@@ -150,7 +181,6 @@ def test_resume_refuses_a_run_that_is_still_running(repo, planned):
         file="doc.pdf",
         src="vi",
         tgt="en",
-        domain="tech",
         glossary=None,
         max_tokens=None,
         mock=False,
@@ -175,7 +205,6 @@ def test_resume_keeps_the_previous_attempt_s_console_output(repo, planned):
         file="doc.pdf",
         src="vi",
         tgt="en",
-        domain="tech",
         glossary=None,
         max_tokens=None,
         mock=False,
@@ -204,7 +233,6 @@ def test_resume_pins_the_model_the_run_itself_reported(repo, planned):
         file="doc.pdf",
         src="vi",
         tgt="en",
-        domain="tech",
         glossary=None,
         max_tokens=None,
         mock=False,
@@ -225,7 +253,6 @@ def test_resume_pins_the_model_the_run_itself_reported(repo, planned):
         file="doc.pdf",
         src="vi",
         tgt="en",
-        domain="tech",
         glossary=None,
         max_tokens=None,
         mock=False,
@@ -248,7 +275,6 @@ def test_two_runs_keep_separate_log_dirs(repo, planned):
         file="doc.pdf",
         src="vi",
         tgt="en",
-        domain="tech",
         glossary=None,
         max_tokens=None,
         mock=False,
@@ -257,7 +283,6 @@ def test_two_runs_keep_separate_log_dirs(repo, planned):
         file="doc.pdf",
         src="vi",
         tgt="en",
-        domain="tech",
         glossary=None,
         max_tokens=None,
         mock=False,
@@ -282,7 +307,6 @@ def test_probe_failure_raises_and_starts_nothing(repo, monkeypatch):
             file="doc.pdf",
             src="vi",
             tgt="en",
-            domain="tech",
             glossary=None,
             max_tokens=None,
             mock=False,
@@ -301,7 +325,6 @@ def test_input_file_outside_input_dir_is_rejected(repo, planned):
             file="../.env",
             src="vi",
             tgt="en",
-            domain="tech",
             glossary=None,
             max_tokens=None,
             mock=False,
@@ -315,7 +338,6 @@ def test_missing_input_file_is_a_plan_error(repo, planned):
             file="nope.pdf",
             src="vi",
             tgt="en",
-            domain="tech",
             glossary=None,
             max_tokens=None,
             mock=False,
@@ -367,7 +389,6 @@ def test_status_reports_no_events_when_log_is_absent(repo, planned):
         file="doc.pdf",
         src="vi",
         tgt="en",
-        domain="tech",
         glossary=None,
         max_tokens=None,
         mock=False,
@@ -392,7 +413,6 @@ def test_the_no_log_note_is_taken_back_once_the_log_appears(repo, planned):
         file="doc.pdf",
         src="vi",
         tgt="en",
-        domain="tech",
         glossary=None,
         max_tokens=None,
         mock=False,
@@ -423,7 +443,6 @@ def test_a_legacy_no_log_note_is_cleaned_up_too(repo, planned):
         file="doc.pdf",
         src="vi",
         tgt="en",
-        domain="tech",
         glossary=None,
         max_tokens=None,
         mock=False,
@@ -448,7 +467,6 @@ def test_status_reconciles_a_dead_pid_after_a_server_restart(repo, planned, monk
         file="doc.pdf",
         src="vi",
         tgt="en",
-        domain="tech",
         glossary=None,
         max_tokens=None,
         mock=False,
@@ -467,7 +485,6 @@ def test_status_folds_in_the_exit_code(repo, planned):
         file="doc.pdf",
         src="vi",
         tgt="en",
-        domain="tech",
         glossary=None,
         max_tokens=None,
         mock=False,
@@ -476,7 +493,6 @@ def test_status_folds_in_the_exit_code(repo, planned):
         file="doc.pdf",
         src="vi",
         tgt="en",
-        domain="tech",
         glossary=None,
         max_tokens=None,
         mock=False,
@@ -501,7 +517,6 @@ def test_events_are_read_through_the_store(repo, planned):
         file="doc.pdf",
         src="vi",
         tgt="en",
-        domain="tech",
         glossary=None,
         max_tokens=None,
         mock=False,
@@ -524,7 +539,6 @@ def test_stop_marks_stopped_and_kills_the_tree(repo, planned, monkeypatch):
         file="doc.pdf",
         src="vi",
         tgt="en",
-        domain="tech",
         glossary=None,
         max_tokens=None,
         mock=False,
@@ -555,7 +569,6 @@ def test_delete_removes_the_runs_dirs_and_the_input_it_was_last_at(repo, planned
         file="doc.pdf",
         src="vi",
         tgt="en",
-        domain="tech",
         glossary=None,
         max_tokens=None,
         mock=False,
@@ -589,7 +602,6 @@ def test_delete_keeps_the_input_while_another_run_still_uses_it(repo, planned, m
         file="doc.pdf",
         src="vi",
         tgt="en",
-        domain="tech",
         glossary=None,
         max_tokens=None,
         mock=False,
@@ -598,7 +610,6 @@ def test_delete_keeps_the_input_while_another_run_still_uses_it(repo, planned, m
         file="doc.pdf",
         src="vi",
         tgt="en",
-        domain="tech",
         glossary=None,
         max_tokens=None,
         mock=False,
@@ -654,7 +665,6 @@ def _run(mgr, **over):
         "file": "doc.pdf",
         "src": "vi",
         "tgt": "en",
-        "domain": "tech",
         "glossary": None,
         "max_tokens": None,
         "mock": False,

@@ -11,8 +11,8 @@
  * the last one.
  *
  * The page has no view of the server's configuration: a run is the document,
- * its two languages and the output format, and nothing else. The domain, the
- * glossary of terms and the chunk budget are the pipeline's own to work out,
+ * its two languages and the output format, and nothing else. The glossary of
+ * terms and the chunk budget are the pipeline's own to work out,
  * so there is no settings screen and no key status here either.
  *
  * State attributes written here, and styled in app.css:
@@ -131,7 +131,6 @@ const LOG_DETAIL_WORDS = {
   pages: "số trang",
   src: "ngôn ngữ nguồn",
   tgt: "ngôn ngữ đích",
-  domain: "lĩnh vực",
   flags: "cờ",
   agents: "agent",
 };
@@ -187,6 +186,10 @@ const state = {
   chunkFilter: "all",
   chunkOpen: null,
   hadEvents: false,
+  /* The resume notice that has already been raised: the resume record it
+     belongs to, by its time. A notice is shown once for the attempt it
+     describes, not on every poll of a run that goes on for an hour. */
+  resumeSeen: 0,
   panesFor: null, // run_id the pane states below belong to
   source: "idle", // idle | loading | done | failed
   target: "idle",
@@ -532,10 +535,7 @@ function renderJobs() {
     button.append(element("span", "job-row-name", run.file || run.run_id));
     button.append(element("span", "job-row-time", formatTime(run.started)));
     const sub = element("span", "job-row-sub");
-    /* The pair, the size and the state. The domain is not here: a library's runs
-       mostly share one, so it was a column of the same word — and where it did
-       differ it told the reader nothing about the translation they were
-       choosing between. It is still listed as a fact of the open run. */
+    /* The pair, the size and the state. */
     sub.append(element("span", null, `${run.src || "?"} → ${run.tgt || "?"}`));
     if (run.chunks) {
       sub.append(element("span", null, `${formatCount(run.chunks)} chunk`));
@@ -760,7 +760,7 @@ function renderJob(detail) {
     byId("crumb-meta"),
     `${run.src || "?"} → ${run.tgt || "?"} · ${STATUS_WORDS[run.status] || run.status}`,
   );
-  /* What the run was asked to do — the language pair, the domain, the chunk
+  /* What the run was asked to do — the language pair, the chunk
      count, when it started — is not a headline under the title: those are facts
      about the translation, and they are listed with the rest of them in the
      report tab. The heading keeps the document's name and the badge that says
@@ -816,6 +816,10 @@ function renderEmptyJob() {
     "",
     "",
   );
+  /* The downloads belonged to the run that was open: with no run there is no
+     text behind them, and a link to the run that was just deleted would only
+     fail. */
+  renderSourceGets("", "empty");
   paintPane(
     "pane-target",
     "target-text",
@@ -952,6 +956,40 @@ function chunksDone(events) {
 
 /* ------------------------------------------------------------------ chunks */
 
+/* The pipeline counts its chunks from zero — the first chunk of a document is
+   `chunk-000`. A reader counts pages from one, and a list that starts at 000
+   reads as an off-by-one bug rather than as a name. So the web UI renumbers
+   for the reader: `chunk-001` is the first chunk, `chunk-002` the second, and
+   the number is the chunk's place in the document (a 38-chunk run ends at
+   `chunk-038`).
+
+   The ids themselves are untouched: the log file, the checkpoints and the
+   pipeline all still speak `chunk-000`. This is a display rule and nothing
+   else. */
+function displayChunkId(chunkId) {
+  const id = String(chunkId || "");
+  const match = id.match(/^(.*?)(\d+)$/);
+  if (!match) {
+    return id;
+  }
+  const digits = match[2];
+  return `${match[1]}${String(Number(digits) + 1).padStart(digits.length, "0")}`;
+}
+
+/* The same renumbering inside a message: the pipeline writes its own errors
+   with the raw id ("chunk-000: ..."), and a reader who sees `chunk-001` in the
+   list must not find `chunk-000` in the message right next to it. */
+function displayChunkText(text) {
+  const value = String(text || "");
+  if (!value) {
+    return value;
+  }
+  return value.replace(
+    /\bchunk-(\d+)\b/g,
+    (_match, digits) => `chunk-${String(Number(digits) + 1).padStart(digits.length, "0")}`,
+  );
+}
+
 /*: Each chunk state's colour and wording, so the reducer and the tooltip agree
    on the same four outcomes. */
 const CHUNK_STATE_WORDS = {
@@ -1034,9 +1072,12 @@ function chunkStates(events, total) {
   }
   const count = Math.max(Number(total) || 0, highest + 1);
   const cells = [];
-  /* The chunker names its chunks from zero (`chunk-000`), so the list must
-     too: counting from one would hide `chunk-000` and invent a chunk past the
-     end, and the summary would then disagree with the progress bar. */
+  /* The chunker names its chunks from zero (`chunk-000`), so the cells are
+     keyed the same way: they are the pipeline's own ids, the ones the events
+     carry and the ones the log file holds. Only what the reader sees is
+     renumbered (see `displayChunkId`), so counting from one cannot hide
+     `chunk-000` or invent a chunk past the end, and the summary still agrees
+     with the progress bar. */
   for (let i = 0; i < count; i += 1) {
     const id = `chunk-${String(i).padStart(3, "0")}`;
     cells.push(byId.get(id) || { id: id, state: "wait", step: "", error: "" });
@@ -1046,7 +1087,7 @@ function chunkStates(events, total) {
 
 /* What one cell says on hover: which chunk, how far it got, and its problem. */
 function chunkTitle(cell) {
-  const parts = [cell.id];
+  const parts = [displayChunkId(cell.id)];
   if (cell.step) {
     parts.push(STEP_WORDS[cell.step] || cell.step);
   }
@@ -1055,7 +1096,9 @@ function chunkTitle(cell) {
     parts.push(CHUNK_LEFT_WORD);
   }
   if (cell.error) {
-    parts.push(`${cell.recovered ? "lỗi trước đó" : "lỗi"}: ${cell.error}`);
+    parts.push(
+      `${cell.recovered ? "lỗi trước đó" : "lỗi"}: ${displayChunkText(cell.error)}`,
+    );
   }
   return parts.join(" · ");
 }
@@ -1169,7 +1212,7 @@ function renderChunks(detail) {
       row.dataset.recovered = "true";
     }
     row.title = chunkTitle(cell);
-    row.append(element("span", "chunk-id", cell.id));
+    row.append(element("span", "chunk-id", displayChunkId(cell.id)));
     row.append(element("span", "chunk-state", CHUNK_STATE_WORDS[cell.state] || cell.state));
     row.append(element("span", "chunk-work", chunkWork(cell)));
     /* A chunk with something to say can be opened to say all of it: the tooltip
@@ -1189,7 +1232,7 @@ function renderChunks(detail) {
         }
       });
       if (open) {
-        row.append(element("span", "chunk-error", cell.error));
+        row.append(element("span", "chunk-error", displayChunkText(cell.error)));
       }
     }
     list.append(row);
@@ -1238,10 +1281,34 @@ function resumeInfo(events) {
         requested: Boolean(event.resume_requested),
         resumed: Number(event.resumed_chunks) || 0,
         usable: Boolean(event.checkpoint_usable),
+        /* When this attempt was continued. The notice belongs to that moment,
+           so a page can tell a notice it has already raised from one it has
+           not. */
+        ts: Number(event.ts) || 0,
       };
     }
   }
   return null;
+}
+
+/* When the attempt the reader is watching began.
+
+   A run's own start time is the day the run was created, and a run that was
+   continued keeps it: the time it spent failed — waiting for a reader, for a
+   provider, for a free slot — is not time it spent translating. Counting from
+   the run's start made a run that had just been continued report the whole
+   wait as running time, and a healthy run read as one that had been stuck for
+   an hour. The clock measures the attempt, so it starts again with every
+   attempt; when the log has no attempt to point at, the run's start is the
+   best answer there is. */
+function attemptStart(events, run) {
+  for (let i = events.length - 1; i >= 0; i -= 1) {
+    const event = events[i];
+    if (event && event.type === "run_start" && event.ts) {
+      return Number(event.ts);
+    }
+  }
+  return Number(run && run.started) || 0;
 }
 
 /* What to say about a resume that replayed nothing. `checkpoint_usable` only
@@ -1340,9 +1407,10 @@ function renderProgress(detail) {
       : last && last.ts
         ? Number(last.ts)
         : null;
+  const began = attemptStart(state.events, run);
   setText(
     byId("progress-elapsed"),
-    until && run.started ? `đã chạy ${formatClock(until - run.started)}` : "",
+    until && began ? `đã chạy ${formatClock(until - began)}` : "",
   );
 
   setText(byId("progress-speed"), speedLine(run));
@@ -1373,8 +1441,10 @@ function progressWord(run, last, info) {
        run that says nothing while it waits out a provider outage reads as a
        hang, so the wait says what it is and how long it is. */
     if (last && String(last.status || "") === "retry") {
-      const why = String(last.error || last.message || "");
-      const on = last.chunk_id ? `${where || "chunk"} · ${last.chunk_id}` : where || "chunk";
+      const why = displayChunkText(String(last.error || last.message || ""));
+      const on = last.chunk_id
+        ? `${where || "chunk"} · ${displayChunkId(last.chunk_id)}`
+        : where || "chunk";
       /* A slot collision is the provider holding a request we already gave up
          on — a wait for *them*, not our own retry: name it as such. */
       const slot = /concurrency_limit_exceeded|holds the slot|concurrent request/i.test(why);
@@ -1382,7 +1452,9 @@ function progressWord(run, last, info) {
       return `${head}: ${on}${why ? ` — ${why}` : ""}`;
     }
     if (step) {
-      return `Đang chạy: ${last.chunk_id ? `${where} · ${last.chunk_id}` : where}`;
+      return `Đang chạy: ${
+        last.chunk_id ? `${where} · ${displayChunkId(last.chunk_id)}` : where
+      }`;
     }
     /* Before this attempt's first step, a resume whose store had no matching
        chunk to replay says it re-translates rather than leaving the reader to
@@ -1455,8 +1527,10 @@ function logEntry(event) {
     ts: event.ts,
     status: status,
     where: STEP_WORDS[step] || step,
-    chunk: String(event.chunk_id || ""),
-    text: [CAUSE_WORDS[cause] || cause, message].filter(Boolean).join(" · "),
+    chunk: displayChunkId(event.chunk_id),
+    text: displayChunkText(
+      [CAUSE_WORDS[cause] || cause, message].filter(Boolean).join(" · "),
+    ),
     /* The event itself, so a row can be opened onto everything it carries —
        the full message and the fields the one line leaves out. */
     event: event,
@@ -1679,10 +1753,12 @@ function renderLog() {
         ts: 0,
         status: "fail",
         where: STEP_WORDS[problem.step] || problem.step || "Lượt chạy",
-        chunk: String(problem.chunk_id || ""),
-        text: [CAUSE_WORDS[cause] || cause, String(problem.message || "")]
-          .filter(Boolean)
-          .join(" · "),
+        chunk: displayChunkId(problem.chunk_id),
+        text: displayChunkText(
+          [CAUSE_WORDS[cause] || cause, String(problem.message || "")]
+            .filter(Boolean)
+            .join(" · "),
+        ),
       }),
     );
   }
@@ -1755,7 +1831,10 @@ function reportFor(detail) {
   const retried = totals.filter((entry) => entry.retranslated > 0);
   const end = lastOfType(events, "run_end");
   const last = events.length ? Number(events[events.length - 1].ts) || 0 : 0;
-  const started = Number(run.started) || 0;
+  /* The attempt's start, not the run's: a run that was continued keeps the day
+     it was created, and the time it spent failed is not time it spent
+     translating. */
+  const started = attemptStart(events, run);
   /* Actual in-flight API calls at the newest observation, plus the peak seen in
      this run. Older events without the field leave both null: the UI says
      "not measured" instead of inventing a zero. */
@@ -1808,6 +1887,35 @@ function reportFor(detail) {
   };
 }
 
+/* The consistency pass's tally on the report page.
+
+   `run_end` carries four numbers now: terms that drifted between chunks, chunks
+   rewritten to the planned term, chunks the budget left drifting, and rewrites
+   the pass refused because they would have cost the translation. The last two
+   were only ever visible as lines buried in the log, so a run that left most of
+   its drift in the file read like one that found nothing to fix. A run with no
+   drift has nothing to say here, and gets no line. */
+function consistencyText(end) {
+  if (!end) {
+    return "";
+  }
+  const drifts = Number(end.consistency_inconsistencies) || 0;
+  const patched = Number(end.consistency_patched) || 0;
+  const skipped = Number(end.consistency_skipped) || 0;
+  const rejected = Number(end.consistency_rejected) || 0;
+  if (!drifts && !patched && !skipped && !rejected) {
+    return "";
+  }
+  return [
+    drifts ? `${formatCount(drifts)} thuật ngữ lệch` : "",
+    patched ? `${formatCount(patched)} chunk đã vá` : "",
+    skipped ? `${formatCount(skipped)} chunk bỏ sót` : "",
+    rejected ? `${formatCount(rejected)} bản vá bị từ chối` : "",
+  ]
+    .filter(Boolean)
+    .join(" · ");
+}
+
 function reportFacts(report) {
   const { counts, run, end, activeApiCalls, maxActiveApiCalls } = report;
   const total = counts.wait + counts.running + counts.ok + counts.fail;
@@ -1847,6 +1955,10 @@ function reportFacts(report) {
   if (report.resumed) {
     facts.push(["Dùng lại checkpoint", `${formatCount(report.resumed)} chunk`]);
   }
+  const consistency = consistencyText(end);
+  if (consistency) {
+    facts.push(["Nhất quán thuật ngữ", consistency]);
+  }
   if (end && Number(end.retries)) {
     facts.push(["Lượt thử lại của nhà cung cấp", formatCount(end.retries)]);
   }
@@ -1858,13 +1970,10 @@ function reportFacts(report) {
         (tokens.cached ? ` - Cached input ${formatCount(tokens.cached)} tokens` : ""),
     ]);
   }
-  /* What this run was asked to do: the language pair, the domain, how the
+  /* What this run was asked to do: the language pair, how the
      document was split and when it started. These used to sit in a row of tags
      under the title; they belong with the rest of the run's figures. */
   facts.push(["Cặp ngôn ngữ", `${run.src || "?"} → ${run.tgt || "?"}`]);
-  if (run.domain) {
-    facts.push(["Lĩnh vực", run.domain]);
-  }
   if (run.chunks) {
     facts.push(["Số chunk", formatCount(run.chunks)]);
   }
@@ -1932,9 +2041,9 @@ function renderReport(detail) {
       "Chunk lỗi",
       ["Chunk", "Bước", "Lỗi"],
       report.failed.map((cell) => [
-        cell.id,
+        displayChunkId(cell.id),
         STEP_WORDS[cell.step] || cell.step || "—",
-        cell.error || "(không có mô tả)",
+        displayChunkText(cell.error || "(không có mô tả)"),
       ]),
       "Không có chunk nào lỗi.",
     ),
@@ -1944,7 +2053,7 @@ function renderReport(detail) {
       "Chunk chậm nhất",
       ["Chunk", "Thời gian", "Dịch lại"],
       report.slowest.map((entry) => [
-        entry.id,
+        displayChunkId(entry.id),
         formatDuration(entry.ms),
         entry.retranslated ? `${formatCount(entry.retranslated)} lần` : "—",
       ]),
@@ -1957,7 +2066,7 @@ function renderReport(detail) {
       ["Chunk", "Số lần"],
       report.retried
         .sort((a, b) => b.retranslated - a.retranslated)
-        .map((entry) => [entry.id, `${formatCount(entry.retranslated)} lần`]),
+        .map((entry) => [displayChunkId(entry.id), `${formatCount(entry.retranslated)} lần`]),
       "Không chunk nào phải dịch lại.",
     ),
   );
@@ -2003,9 +2112,43 @@ function paintPane(
   setText(byId(metaId), meta);
 }
 
+/* The two files the source column can give: the extraction as the pipeline
+   wrote it — ⟦CODE_n⟧ and the emphasis tokens intact — and the same text with
+   the emphasis written as Markdown and the code markers gone. Built once per
+   run: a poll redraws the panes every second, and rebuilding two links under a
+   reader's focus would take it away for nothing. */
+function renderSourceGets(base, sourceState) {
+  const box = byId("source-gets");
+  show(box, sourceState === "done");
+  if (sourceState !== "done" || box.dataset.base === base) {
+    return;
+  }
+  clear(box);
+  for (const item of [
+    {
+      label: "Tải bản trích xuất",
+      title: "Bản gốc trích xuất, giữ nguyên marker (⟦CODE_n⟧, ⟦BOLD⟧, ⟦ITALIC⟧)",
+      markers: "keep",
+    },
+    {
+      label: "Tải bản gốc",
+      title: "Tải văn bản phía dưới",
+      markers: "strip",
+    },
+  ]) {
+    const link = element("a", "", item.label);
+    link.href = `${base}/source?download=1&markers=${item.markers}`;
+    link.title = item.title;
+    link.setAttribute("download", "");
+    box.append(link);
+  }
+  box.dataset.base = base;
+}
+
 function renderPanes() {
   const detail = state.detail;
   if (!detail) {
+    renderSourceGets("", "empty");
     return;
   }
   const run = detail.run;
@@ -2032,6 +2175,7 @@ function renderPanes() {
     source.body,
     source.meta,
   );
+  renderSourceGets(base, source.state);
 
   const target = { state: "empty", note: "", body: "", meta: "" };
   if (!detail.md) {
@@ -2391,6 +2535,7 @@ async function openJob(runId) {
     state.next = 0;
     state.seenStatus = null;
     state.hadEvents = false;
+    state.resumeSeen = 0;
     state.panesFor = runId;
     state.source = "idle";
     state.target = "idle";
@@ -2464,15 +2609,23 @@ async function pollRun(runId) {
      own fact — not a fault of this run, not a failure of the previous one. A
      light notice, only for the running case, so it leaves the moment the run
      does its work or finishes. Named `resume` rather than `resumeInfo` so it
-     does not shadow the resumeInfo() helper called in this same function. */
+     does not shadow the resumeInfo() helper called in this same function.
+
+     It is raised once for the attempt it describes. The record stays in the
+     log for the whole run, so re-stamping it on every poll made the banner
+     blink in and out for as long as the run went on — a warning about the
+     start of the attempt, chasing a reader through the hour that followed. */
   const resume = resumeInfo(state.events);
   if (
-    payload.status === "running" &&
     resume &&
+    resume.ts &&
+    resume.ts !== state.resumeSeen &&
+    payload.status === "running" &&
     resume.requested &&
     resume.resumed === 0 &&
     !bannerActive()
   ) {
+    state.resumeSeen = resume.ts;
     renderBanner("warn", resumeNotice(resume));
   }
   /* The first poll of a healthy run usually beats the child's own log, so the
@@ -2605,6 +2758,7 @@ async function deleteRun(runId) {
     state.next = 0;
     state.seenStatus = null;
     state.hadEvents = false;
+    state.resumeSeen = 0;
     state.panesFor = null;
     state.source = "idle";
     state.target = "idle";

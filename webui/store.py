@@ -1,4 +1,4 @@
-"""Stores for the web UI: runs, skills and glossaries.
+"""Stores for the web UI: runs and glossaries.
 
 Everything here is a plain file reader meant to be called from the server
 process, so nothing in this module imports :mod:`polyglot_lc` (see the package
@@ -95,7 +95,6 @@ class RunRecord:
     file: str
     src: str
     tgt: str
-    domain: str
     chunks: int
     exit_code: int | None
     output_path: str
@@ -137,7 +136,6 @@ class RunRecord:
             file=str(data.get("file", "")),
             src=str(data.get("src", "")),
             tgt=str(data.get("tgt", "")),
-            domain=str(data.get("domain", "")),
             chunks=int(data.get("chunks") or 0),
             exit_code=None if raw_exit is None else int(raw_exit),
             output_path=str(data.get("output_path", "")),
@@ -267,79 +265,8 @@ class RunsStore:
 
 
 # ---------------------------------------------------------------------------
-# Skills
-# ---------------------------------------------------------------------------
-#: Suffix of the per-pair score history the optimizer appends to.
-HISTORY_SUFFIX = ".history.jsonl"
-
-
-class SkillsStore:
-    """The promoted skills under ``skills/<src>-<tgt>/<domain>.json``.
-
-    The directory also holds files this view has no business reading (a
-    ``session_*.json`` scratch file, a half-written entry), so anything that is
-    not a readable skill object is skipped rather than reported as a failure.
-    """
-
-    def __init__(self, root: Path) -> None:
-        self.root = root
-
-    def _pair_dir(self, pair: str) -> Path:
-        return safe_child(self.root, pair)
-
-    def _skill_path(self, pair: str, domain: str) -> Path:
-        return safe_child(self._pair_dir(pair), f"{domain or 'general'}.json")
-
-    def _history_path(self, pair: str, domain: str) -> Path:
-        return safe_child(self._pair_dir(pair), f"{domain or 'general'}{HISTORY_SUFFIX}")
-
-    def list_skills(self) -> list[dict[str, Any]]:
-        """One summary per readable skill, ordered by pair then domain."""
-        if not self.root.is_dir():
-            return []
-        found: list[dict[str, Any]] = []
-        for path in sorted(self.root.glob("*/*.json")):
-            if path.name.endswith(HISTORY_SUFFIX) or path.name.startswith("session_"):
-                continue
-            if not path.is_file():
-                continue
-            data = _read_json(path)
-            if not isinstance(data, dict):
-                continue
-            found.append(
-                {
-                    "pair": path.parent.name,
-                    "domain": path.stem,
-                    "mean_score": data.get("mean_score"),
-                    "promoted_at": data.get("promoted_at"),
-                    "updated_at": data.get("updated_at"),
-                    "instruction": str(data.get("instruction", "")),
-                    "src_lang": str(data.get("src_lang", "")),
-                    "tgt_lang": str(data.get("tgt_lang", "")),
-                }
-            )
-        found.sort(key=lambda skill: (skill["pair"], skill["domain"]))
-        return found
-
-    def get_skill(self, pair: str, domain: str) -> dict[str, Any] | None:
-        """The full skill object, or ``None`` when absent or unreadable."""
-        try:
-            path = self._skill_path(pair, domain)
-        except ValueError:
-            return None
-        data = _read_json(path)
-        return dict(data) if isinstance(data, dict) else None
-
-    def history(self, pair: str, domain: str) -> list[dict[str, Any]]:
-        """The pair/domain score history, oldest first."""
-        try:
-            path = self._history_path(pair, domain)
-        except ValueError:
-            return []
-        entries, _ = _read_jsonl(path)
-        return entries
-
-
+# skills: no store — skills live as skill.md files under skills/<pair>/ and
+# nothing in the server reads them.
 # ---------------------------------------------------------------------------
 # Glossaries
 # ---------------------------------------------------------------------------

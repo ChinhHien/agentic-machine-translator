@@ -5,9 +5,10 @@ completes, so an interrupted run (Ctrl-C, provider outage, crash) can be
 resumed with ``--resume`` instead of paying for every chunk again.
 
 A checkpoint belongs to one *document identity* — its path, the digest of its
-bytes, the language pair, the domain, the Translator model and the chunk hashes.
-Any of those changing invalidates the whole directory, so a resumed run can
-never reuse results produced from different input or a different chunking.
+bytes, the language pair, the Translator model, the user's glossary and the
+chunk hashes. Any of those changing invalidates the whole directory, so a
+resumed run can never reuse results produced from different input, a different
+chunking, or without the terminology the reader has since asked for.
 
 The document's identity is its **content**, never its ``mtime``. The web UI
 uploads a file it has already uploaded again (same name, same bytes), the write
@@ -43,7 +44,6 @@ class ChunkCheckpoint:
     score: float = 0.0  # 0-10
     path: str = "standard"  # fast | standard | deep
     stored: bool = False  # trace accepted by the reasoning bank
-    patched: bool = False  # rewritten by the consistency pass
     calls: int = 0  # LLM requests spent on this chunk
     ts: float = field(default_factory=time.time)
 
@@ -66,7 +66,6 @@ class ChunkCheckpoint:
             score=float(data.get("score", 0.0) or 0.0),
             path=str(data.get("path", "standard") or "standard"),
             stored=bool(data.get("stored", False)),
-            patched=bool(data.get("patched", False)),
             calls=int(data.get("calls", 0) or 0),
             ts=float(data.get("ts", 0.0) or 0.0),
         )
@@ -107,17 +106,25 @@ class CheckpointStore:
         *,
         src: str,
         tgt: str,
-        domain: str,
         model: str,
         chunk_hashes: list[str],
+        glossary: str = "",
     ) -> str:
-        """Stable 16-char key identifying this exact translation job."""
+        """Stable 16-char key identifying this exact translation job.
+
+        *glossary* is the fingerprint of the terminology the run was given (the
+        user's CSV, as ``term\ttarget`` lines). It is part of the identity: a
+        chunk translated from the same bytes but without a term a later run
+        asks for is not the same deliverable, and replaying it silently left
+        the new term out of the file. Its *content* is hashed rather than its
+        path, so renaming or moving the CSV keeps a resume valid.
+        """
         digest = hashlib.sha1()
         try:
             resolved = str(Path(file_path).resolve())
         except OSError:  # pragma: no cover - exotic paths only
             resolved = str(file_path)
-        for part in (resolved, src, tgt, domain, model):
+        for part in (resolved, src, tgt, model):
             digest.update(str(part).encode("utf-8"))
             digest.update(b"\x00")
         for chunk_hash in chunk_hashes:
@@ -125,6 +132,11 @@ class CheckpointStore:
             digest.update(b"\x00")
         digest.update(_content_digest(file_path).encode("utf-8"))
         digest.update(b"\x00")
+        # Appended last and only when there is one, so the key of a run without
+        # a glossary is exactly what it was before this part existed.
+        if glossary:
+            digest.update(glossary.encode("utf-8"))
+            digest.update(b"\x00")
         return digest.hexdigest()[:16]
 
     # ------------------------------------------------------------------

@@ -249,7 +249,6 @@ def test_as_text_shows_settings_reasons_problems_and_totals(tmp_path):
                 "plan_hash": "3ab1",
                 "src": "en",
                 "tgt": "vi",
-                "domain": "general",
                 "agents": [{"name": "translator", "model": "m", "host": "h", "temperature": 0.2}],
                 "max_tokens": 700,
             },
@@ -283,6 +282,40 @@ def test_as_text_shows_settings_reasons_problems_and_totals(tmp_path):
     assert "complexity 0.62 > 0.35" in text
     assert "[rate_limit]" in text
     assert "Totals" in text
+
+
+def test_as_text_reports_the_drift_the_consistency_pass_left_behind(tmp_path):
+    """Tổng kết phải nói cả phần *chưa* sửa: chunk bỏ sót và bản vá bị từ chối."""
+    path = _write(
+        tmp_path,
+        [
+            {"type": "run_start", "run_id": "r1", "file": "d.pdf"},
+            {
+                "type": "run_end",
+                "run_id": "r1",
+                "status": "done",
+                "consistency_inconsistencies": 4,
+                "consistency_patched": 2,
+                "consistency_skipped": 5,
+                "consistency_rejected": 1,
+            },
+        ],
+    )
+    text = read_trace(path).as_text()
+    assert "consistency: 4 drifting term(s)" in text
+    assert "patched: 2 chunk(s)" in text
+    assert "skipped: 5" in text and "rejected: 1" in text
+
+
+def test_as_text_keeps_quiet_when_the_chunks_agreed(tmp_path):
+    path = _write(
+        tmp_path,
+        [
+            {"type": "run_start", "run_id": "r1", "file": "d.pdf"},
+            {"type": "run_end", "run_id": "r1", "status": "done"},
+        ],
+    )
+    assert "consistency:" not in read_trace(path).as_text()
 
 
 def test_as_dict_is_stable_between_two_reads(tmp_path):

@@ -1,14 +1,12 @@
 """Unified document planner: summary + strategy + glossary + complexity in ONE call.
 
-The previous head of the pipeline was sequential and expensive::
-
-    summary tree (1 request per section + 1 for the document)
-      -> plan_document (1 request)
-
-For a 20-section document that is 21 Planner requests before the first chunk is
-translated. :func:`analyze_document` folds all of it into a single structured
-request, and degrades to a purely local heuristic plan when the model is
-unavailable so the pipeline never depends on it succeeding.
+The previous head of the pipeline was sequential and expensive: a summary tree
+(1 request per section + 1 for the document) followed by a separate planning
+request, which came to 21 Planner requests for a 20-section document before the
+first chunk was translated. That path has been removed. :func:`analyze_document`
+folds all of it into a single structured request, and degrades to a purely local
+heuristic plan when the model is unavailable so the pipeline never depends on it
+succeeding.
 """
 
 from __future__ import annotations
@@ -19,7 +17,12 @@ from typing import TYPE_CHECKING, Any
 from loguru import logger
 
 from polyglot_lc.analysis.complexity import heuristic_document_complexity
-from polyglot_lc.segment.glossary import GlossaryTerm, glossary_to_md, render_user_glossary
+from polyglot_lc.segment.glossary import (
+    GlossaryTerm,
+    glossary_budget,
+    glossary_to_md,
+    render_user_glossary,
+)
 from polyglot_lc.segment.summary_tree import build_sections, preview_text
 
 if TYPE_CHECKING:
@@ -28,9 +31,14 @@ if TYPE_CHECKING:
 
 #: Characters of the document body sent to the Planner (bounded context).
 DOC_EXCERPT_CHARS = 3000
+#: Number of excerpts the body budget is spread across.
+DOC_EXCERPT_WINDOWS = 6
 #: Characters of preview per section in the outline.
 SECTION_PREVIEW_CHARS = 160
-#: Hard cap on glossary pairs accepted from the Planner.
+#: Characters of outline allowed in the Planner prompt, however many sections.
+OUTLINE_MAX_CHARS = 20_000
+#: Floor for the glossary pairs accepted from the Planner; the real cap grows
+#: with the document (see :func:`~polyglot_lc.segment.glossary.glossary_budget`).
 MAX_PLANNER_TERMS = 40
 
 DEFAULT_STRATEGY = "literal, terminology-consistent"
@@ -83,6 +91,88 @@ def build_outline(chunks: list[Chunk]) -> dict[str, str]:
     return outline
 
 
+def _snap_to_line(text: str, offset: int, window: int = 300) -> int:
+    """Move *offset* to the next line (or word) start so an excerpt does not
+    begin in the middle of a word."""
+    if offset <= 0:
+        return 0
+    for marker in ("\n", " "):
+        found = text.find(marker, offset, offset + window)
+        if found != -1:
+            return found + 1
+    return offset
+
+
+def sample_body(
+    text: str,
+    budget: int = DOC_EXCERPT_CHARS,
+    windows: int = DOC_EXCERPT_WINDOWS,
+) -> str:
+    """Excerpt of *text* taken from *windows* places spread across it.
+
+    The opening pages of a long book are a title page and a table of contents,
+    so the first N characters describe the cover rather than the book. The same
+    character budget is spent on evenly spaced windows instead: the first at the
+    start, the last ending at the end, the rest in between, joined by ``[...]``
+    so the model reads missing text rather than one continuous passage.
+
+    A document no longer than the budget is returned whole — for everything
+    that fits, sampling would only add separators.
+    """
+    if len(text) <= budget:
+        return text
+    windows = max(1, windows)
+    separator = "\n\n[...]\n\n"
+    per = max(1, (budget - len(separator) * (windows - 1)) // windows)
+    if windows == 1:
+        return text[:per]
+    span = len(text) - per
+    pieces: list[str] = []
+    for index in range(windows):
+        start = index * span // (windows - 1)
+        # The last window ends at the end of the document, not at a line break.
+        begin = start if index == windows - 1 else _snap_to_line(text, start)
+        pieces.append(text[begin : begin + per].strip())
+    return separator.join(piece for piece in pieces if piece)
+
+
+def render_outline(outline: dict[str, str], budget: int = OUTLINE_MAX_CHARS) -> str:
+    """Render the section outline within *budget* characters.
+
+    Every section of a long document once cost a full preview line, so the
+    prompt grew with the number of headings and a heading-dense 1000-page
+    manual could reach tens of thousands of tokens before the first chunk was
+    translated. Three steps, in order: keep the full preview, shrink previews to
+    whatever fits, then keep only the names — and if even the names overflow,
+    say in the text how many sections were left out.
+    """
+    if not outline:
+        return "(no headings)"
+    labels = {name: f"- {name}" for name in outline}
+    # Every line costs its label, ": ", one newline, and (when clipped) an ellipsis.
+    room = budget - sum(len(label) + 3 for label in labels.values())
+    per = max(0, min(SECTION_PREVIEW_CHARS, room // len(outline) - 1))
+    if per > 0:
+        return "\n".join(
+            f"{labels[name]}: {preview_text(preview, limit=per)}"
+            for name, preview in outline.items()
+        )
+    # Names alone overflow: keep what fits, leaving room to say what was cut.
+    reserve = len(f"- (+{len(outline)} more sections not shown)")
+    kept: list[str] = []
+    used = 0
+    for name in outline:
+        line = labels[name]
+        if kept and used + len(line) + 1 + reserve > budget:
+            break
+        kept.append(line)
+        used += len(line) + 1
+    omitted = len(outline) - len(kept)
+    if omitted:
+        kept.append(f"- (+{omitted} more sections not shown)")
+    return "\n".join(kept)
+
+
 def structural_summary(chunks: list[Chunk], doc_title: str) -> str:
     """Local fallback summary built from headings alone (no LLM call)."""
     sections = [s for s in build_sections(chunks) if s and s != "(root)"]
@@ -99,12 +189,17 @@ def merge_glossary_md(
     heuristic_terms: list[GlossaryTerm],
     user_glossary: dict[str, str] | None = None,
     extra_md: str = "",
+    limit: int | None = None,
 ) -> str:
     """Render the glossary block, most authoritative entry first.
 
     Order is deliberate: pre-rendered text supplied by the caller, then the
     user's CSV, then the Planner's translated terms, then whatever terminology
     heuristics found (which have no target form and are only hints).
+
+    *limit* caps the Planner's and the heuristics' entries only. The user's own
+    CSV is never truncated: their dictionary outranks anything the machine
+    guessed, and keeping that one rule is what makes a growing budget safe.
     """
     covered: set[str] = set()
     blocks: list[str] = []
@@ -122,11 +217,15 @@ def merge_glossary_md(
         for p in planner_pairs
         if p.term.strip() and p.translation.strip() and p.term.casefold() not in covered
     ]
+    if limit is not None:
+        pairs = pairs[: max(0, limit - len(covered))]
     if pairs:
         blocks.append("\n".join(f"- {p.term} => {p.translation}" for p in pairs))
         covered.update(p.term.casefold() for p in pairs)
 
     leftovers = [t for t in heuristic_terms if t.term.casefold() not in covered]
+    if limit is not None:
+        leftovers = leftovers[: max(0, limit - len(covered))]
     if leftovers:
         blocks.append(glossary_to_md(leftovers))
 
@@ -141,16 +240,16 @@ def _planner_prompt(
     outline: dict[str, str],
     src_lang: str,
     tgt_lang: str,
-    domain: str,
     glossary_candidates: str,
     user_glossary_md: str,
     trace_lines: list[str],
+    max_terms: int = MAX_PLANNER_TERMS,
 ) -> str:
-    outline_md = "\n".join(f"- {name}: {preview}" for name, preview in outline.items())
-    excerpt = doc_text[:DOC_EXCERPT_CHARS] if doc_text else doc_summary[:DOC_EXCERPT_CHARS]
+    outline_md = render_outline(outline)
+    excerpt = sample_body(doc_text) if doc_text else doc_summary[:DOC_EXCERPT_CHARS]
     return (
         "You are a senior translation planner and terminologist.\n"
-        f"Language pair: {src_lang} -> {tgt_lang}. Domain: {domain}.\n"
+        f"Language pair: {src_lang} -> {tgt_lang}.\n"
         f"Document: {doc_title}.\n\n"
         f"Section outline:\n{outline_md or '(no headings)'}\n\n"
         "Similar past runs from the reasoning bank:\n"
@@ -159,9 +258,12 @@ def _planner_prompt(
         + (glossary_candidates or "(none)")
         + "\n\nAuthoritative glossary supplied by the user (must be used verbatim):\n"
         + (user_glossary_md or "(none)")
-        + f"\n\nDocument body (first {DOC_EXCERPT_CHARS} chars):\n{excerpt}\n\n"
+        + "\n\nDocument body (sampled across the whole document; "
+        "'[...]' marks text that was skipped):\n" + f"{excerpt}\n\n"
         "Decide ONE translation strategy for this document, extract the domain "
-        "terminology with its target-language form, and score how hard this "
+        f"terminology with its target-language form (up to {max_terms} terms, "
+        "one per distinct concept, the ones a reader would notice if two "
+        "sections disagreed), and score how hard this "
         "document is to translate.\n"
         f"complexity is ONE number in [0, 1], not 0-10 and not a percentage: "
         "0.0 = plain prose in simple sentences, 0.5 = ordinary technical "
@@ -204,7 +306,7 @@ def _fallback_plan(
     )
 
 
-def _parse_pairs(raw: Any) -> list[GlossaryPair]:
+def _parse_pairs(raw: Any, limit: int = MAX_PLANNER_TERMS) -> list[GlossaryPair]:
     pairs: list[GlossaryPair] = []
     seen: set[str] = set()
     if not isinstance(raw, list):
@@ -223,7 +325,7 @@ def _parse_pairs(raw: Any) -> list[GlossaryPair]:
             continue
         seen.add(term.casefold())
         pairs.append(GlossaryPair(term=term, translation=translation, reason=reason))
-        if len(pairs) >= MAX_PLANNER_TERMS:
+        if len(pairs) >= limit:
             break
     return pairs
 
@@ -258,7 +360,6 @@ def analyze_document(
     *,
     src_lang: str,
     tgt_lang: str,
-    domain: str,
     doc_text: str = "",
     doc_summary: str = "",
     doc_title: str = "Document",
@@ -273,6 +374,10 @@ def analyze_document(
     plan is returned instead (``used_llm=False``) so translation still starts.
     """
     heuristic_terms = list(heuristic_terms or [])
+    # One number cannot fit both a memo and a 1000-page book: the budget grows
+    # with the document, floored at the Planner's old 40 and capped at the user
+    # glossary's 200 (see glossary_budget).
+    limit = glossary_budget(len(doc_text)) if doc_text else MAX_PLANNER_TERMS
     outline = build_outline(chunks)
     user_glossary_md = render_user_glossary(user_glossary or {})
     trace_lines = [
@@ -285,10 +390,10 @@ def analyze_document(
         outline=outline,
         src_lang=src_lang,
         tgt_lang=tgt_lang,
-        domain=domain,
         glossary_candidates=glossary_to_md(heuristic_terms),
         user_glossary_md=user_glossary_md,
         trace_lines=trace_lines,
+        max_terms=limit,
     )
     try:
         data = planner.chat_json([{"role": "user", "content": prompt}])
@@ -308,10 +413,11 @@ def analyze_document(
                 heuristic_terms=heuristic_terms,
                 user_glossary=user_glossary,
                 extra_md=extra_glossary_md,
+                limit=limit,
             )
         return plan
 
-    pairs = _parse_pairs(data.get("glossary_terms"))
+    pairs = _parse_pairs(data.get("glossary_terms"), limit)
     try:
         complexity = min(1.0, max(0.0, float(data.get("complexity", 0.0))))
     except (TypeError, ValueError):
@@ -328,6 +434,7 @@ def analyze_document(
             heuristic_terms=heuristic_terms,
             user_glossary=user_glossary,
             extra_md=extra_glossary_md,
+            limit=limit,
         ),
         complexity=complexity,
         section_notes=_parse_section_notes(data.get("section_notes")),

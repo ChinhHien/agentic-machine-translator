@@ -60,7 +60,6 @@ def mock_env(monkeypatch, tmp_path):
         "MAX_CONCURRENCY",
         "REFINE_MIN_SCORE",
         "ADAPTIVE_QUALITY",
-        "UNIFIED_PLANNER",
         "FAST_PATH_MIN_SCORE",
         "FAST_PATH_MAX_COMPLEXITY",
         "FAST_PATH_SKIP_LLM_VERIFY",
@@ -86,6 +85,11 @@ def mock_env(monkeypatch, tmp_path):
     # how many calls a provider serves at once, nor how long a retry waits.
     monkeypatch.delenv("LLM_PROVIDER_CONCURRENCY", raising=False)
     monkeypatch.delenv("LLM_RETRY_CONCURRENCY_WAIT", raising=False)
+    # Backup endpoint: a local .env that names one would give every agent a
+    # backup the suite does not know about, and the tests that say which agent
+    # has which backup would read the machine's .env instead of their own.
+    for var in ("LLM_BACKUP_BASE_URL", "LLM_BACKUP_MODEL", "LLM_BACKUP_API_KEY"):
+        monkeypatch.delenv(var, raising=False)
     return tmp_path
 
 

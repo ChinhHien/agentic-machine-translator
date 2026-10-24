@@ -62,7 +62,6 @@ def record(tmp_path, run_id="r1", **over):
         "file": "doc.pdf",
         "src": "vi",
         "tgt": "en",
-        "domain": "tech",
         "chunks": 2,
         "exit_code": 0,
         "output_path": str(out / "doc.en.md"),
@@ -327,7 +326,7 @@ def test_runs_endpoints_with_a_stubbed_manager(api, monkeypatch):
         api,
         "POST",
         "/api/runs",
-        body=json.dumps({"file": "doc.pdf", "src": "vi", "tgt": "en", "domain": "tech"}).encode(),
+        body=json.dumps({"file": "doc.pdf", "src": "vi", "tgt": "en"}).encode(),
     )
     assert r.status == 201
     started = json.loads(r.body)
@@ -375,7 +374,6 @@ def test_post_run_passes_every_run_preference_to_the_manager(api):
                 "file": "doc.pdf",
                 "src": "en",
                 "tgt": "vi",
-                "domain": "legal",
                 "glossary": None,
                 "max_tokens": 512,
                 "format": "both",
@@ -384,7 +382,7 @@ def test_post_run_passes_every_run_preference_to_the_manager(api):
     )
     assert r.status == 201
     assert seen["output_format"] == "both"
-    assert seen["max_tokens"] == 512 and seen["domain"] == "legal"
+    assert seen["max_tokens"] == 512
 
 
 def test_post_run_with_a_failing_probe_is_422(api):
@@ -398,7 +396,7 @@ def test_post_run_with_a_failing_probe_is_422(api):
         api,
         "POST",
         "/api/runs",
-        body=json.dumps({"file": "doc.pdf", "src": "vi", "tgt": "en", "domain": "tech"}).encode(),
+        body=json.dumps({"file": "doc.pdf", "src": "vi", "tgt": "en"}).encode(),
     )
     assert r.status == 422 and b"probe" in r.body
 
@@ -409,7 +407,7 @@ def test_post_run_with_an_escaping_file_name_is_403(api):
         "POST",
         "/api/runs",
         body=json.dumps(
-            {"file": "../../.env", "src": "vi", "tgt": "en", "domain": "tech"}
+            {"file": "../../.env", "src": "vi", "tgt": "en"}
         ).encode(),
     )
     assert r.status == 403
@@ -510,7 +508,7 @@ def test_run_detail_reports_the_translator_model_the_run_used(api, tmp_path):
 def test_post_run_to_resume_continues_that_run(api):
     """ "Tiếp tục" carries the run being continued and nothing else.
 
-    Its document, languages, domain, glossary, token budget, output format and
+    Its document, languages, glossary, token budget, output format and
     Translator model are all stored on that run's own record, so there is no
     second set of settings to drift out of step with the checkpoints. The answer
     names the same run: the page has nowhere to jump to.
@@ -686,6 +684,50 @@ def test_run_source_comes_from_the_pipeline_and_is_cached(api, tmp_path, monkeyp
     assert second["cached"] is True and len(calls) == 1
 
 
+def test_run_source_downloads_as_markdown_in_both_shapes(api, tmp_path, monkeypatch):
+    """The source column can be kept as a file, not only read as a pane.
+
+    Two shapes, because the extraction carries machinery a reader does not want
+    to see: the text the pipeline wrote (markers and all), and the same text
+    with the emphasis said the Markdown way and the code markers gone. The name
+    of each says which it is, so the two do not land in a folder looking
+    identical.
+    """
+    (tmp_path / "input").mkdir()
+    (tmp_path / "input" / "doc.pdf").write_bytes(PDF_BODY)
+    api.runs.write_record(record(api.root))
+    extracted = (
+        "Đoạn văn ⟦BOLD⟧đậm⟦/BOLD⟧ và ⟦ITALIC⟧nghiêng⟦/ITALIC⟧.\n\n"
+        "⟦CODE_1⟧\n\n"
+        "Đoạn tiếp ⟦BOLD⟧lẻ"
+    )
+    monkeypatch.setattr(
+        api.manager,
+        "probe",
+        lambda args: {"text": extracted, "chars": len(extracted), "blocks": 3, "title": "doc.pdf"},
+    )
+
+    kept = call(api, "GET", "/api/runs/r1/source?download=1&markers=keep")
+    assert kept.status == 200 and kept.content_type.startswith("text/markdown")
+    assert "attachment" in kept.disposition and "doc.goc.md" in kept.disposition
+    assert kept.body.decode("utf-8") == extracted
+
+    plain = call(api, "GET", "/api/runs/r1/source?download=1&markers=strip")
+    assert plain.status == 200 and "doc.goc-sach.md" in plain.disposition
+    # A pair becomes the Markdown it stood for; the code marker and an opener
+    # with no closer leave nothing behind, since neither has text of its own.
+    assert plain.body.decode("utf-8") == (
+        "Đoạn văn **đậm** và *nghiêng*.\n\n\n\nĐoạn tiếp lẻ"
+    )
+
+    # A download that names no shape is the readable one, never the machinery:
+    # the markers are what this surface exists to hide.
+    assert call(api, "GET", "/api/runs/r1/source?download=1").body == plain.body
+    # And the pane still gets its JSON, which is the only consumer of the rest.
+    payload = json.loads(call(api, "GET", "/api/runs/r1/source").body)
+    assert payload["text"] == extracted and payload["cached"] is True
+
+
 def test_run_source_reports_the_probe_reason(api, tmp_path, monkeypatch):
     """A scanned PDF has no text layer; the page must say that, not "error"."""
     from webui.runs import RunPlanError
@@ -826,6 +868,37 @@ def test_the_page_shows_the_translation_while_the_run_is_still_writing_it():
     assert "shown.startsWith(text.textContent)" in js
     # A checkpoint pointer is not a line of work: the log draws the run's work.
     assert 'kind === "decision" || kind === "checkpoint"' in js
+
+
+def test_the_page_counts_chunks_from_one_for_the_reader():
+    """The pipeline counts chunks from zero; the page counts them from one.
+
+    A reader counts pages from one, and a list that starts at `chunk-000`
+    reads as an off-by-one bug rather than as a name. So the web UI renumbers
+    what it shows — the list, the tooltip, the log lines, the caption under the
+    progress bar and the report — while the ids the pipeline speaks (the log
+    file, the checkpoints) stay exactly as they are.
+    """
+    from pathlib import Path
+
+    js = (Path(__file__).resolve().parents[1] / "webui" / "static" / "app.js").read_text(
+        encoding="utf-8"
+    )
+    assert "function displayChunkId(" in js
+    assert "function displayChunkText(" in js
+    # Every place a chunk is named to the reader goes through the renumbering.
+    assert 'element("span", "chunk-id", displayChunkId(cell.id))' in js
+    assert "parts = [displayChunkId(cell.id)]" in js
+    assert "chunk: displayChunkId(event.chunk_id)" in js
+    assert "displayChunkId(last.chunk_id)" in js
+    assert "displayChunkId(entry.id)" in js
+    # A message the pipeline wrote with the raw id ("chunk-000: ...") is
+    # renumbered too, or the row would show two numbers for one chunk.
+    assert "displayChunkText(cell.error)" in js
+    assert "displayChunkText(" in js
+    # The ids themselves are untouched: the cells are still keyed by the
+    # pipeline's own `chunk-000`, so the events still match them.
+    assert 'const id = `chunk-${String(i).padStart(3, "0")}`;' in js
 
 
 # --- Problems and redaction ------------------------------------------------
@@ -1566,22 +1639,14 @@ def test_the_history_panel_scrolls_and_keeps_its_action_in_reach():
     assert ".buttons button:focus " not in css.replace(".buttons button:focus-visible ", "")
 
 
-def test_folding_the_library_slides_and_the_row_carries_no_domain():
+def test_folding_the_library_slides():
     """Two things about the library's own column.
 
-    Folding it used to be a snap: `data-rail` changed the grid's first track and
-    the column was suddenly 64px wide with nothing in between. Both tracks are
-    lengths, so the track itself is worth interpolating — the column travels.
-
-    And a row said its domain. Almost every run in a library shares one, so it
-    was a column of the same word, drawn from the row's second line where the
-    pair, the size and the state are what tell one run from another. It stays a
-    fact of the open run, in the report, which is where a reader goes to ask
-    what a run was asked to do.
+    The column was a plain snap before: `data-rail` changed the grid's first
+    track and the column was suddenly 64px wide with nothing in between. Both
+    tracks are lengths, so the track itself is worth interpolating — the column
+    travels.
     """
-    from pathlib import Path
-
-    root = Path(__file__).resolve().parents[1]
     css = call(repo_api(), "GET", "/static/app.css").body.decode("utf-8")
     layout = css.split(".layout {", 1)[1].split("}", 1)[0]
     assert "transition: grid-template-columns" in layout
@@ -1591,14 +1656,6 @@ def test_folding_the_library_slides_and_the_row_carries_no_domain():
     assert '.layout[data-rail="collapsed"] { grid-template-columns: var(--rail-folded)' in css
     for token in ("--rail: 240px", "--rail-folded: 64px"):
         assert token in css, token
-
-    js = (root / "webui" / "static" / "app.js").read_text(encoding="utf-8")
-    # The row's own second line: the pair and the size, and no domain beside
-    # them. The report keeps it, and is asserted to, further up this file.
-    sub = js[js.index('const sub = element("span", "job-row-sub")') :]
-    sub = sub[: sub.index("button.append(sub)")]
-    assert "run.domain" not in sub
-    assert 'element("span", null, run.domain)' not in js
 
 
 def test_folding_the_library_is_a_cross_fade_and_not_a_swap():
@@ -1952,7 +2009,7 @@ def test_the_rail_is_a_few_phases_and_ticks_them_as_the_run_moves_on():
 
 
 def test_the_run_settings_moved_from_the_title_to_the_report():
-    """What a run was asked to do — the language pair, the domain, the chunk
+    """What a run was asked to do — the language pair, the chunk
     count, when it started — sat in a row of chips under the title, competing
     with the badge and the controls for the same corner and saying nothing about
     the translation being read. Those are facts about the translation, so they
@@ -1965,12 +2022,54 @@ def test_the_run_settings_moved_from_the_title_to_the_report():
     # The heading keeps the document's name and the badge: its chip row is gone.
     assert "show(meta, false)" in js
     assert 'element("span", "tag", tag)' not in js
-    # And the four facts are in the report, ahead of the verdict that ends it.
-    for label in ('["Cặp ngôn ngữ"', '["Lĩnh vực"', '["Số chunk"', '["Bắt đầu"'):
+    # And the three facts are in the report, ahead of the verdict that ends it.
+    for label in ('["Cặp ngôn ngữ"', '["Số chunk"', '["Bắt đầu"'):
         assert label in js, label
     # Listed before the verdict, so the report still ends on how the run went.
     facts = js[js.index("function reportFacts(report)") : js.index("function reportTable")]
     assert facts.index('["Cặp ngôn ngữ"') < facts.index('"Kết thúc"')
+
+
+def test_the_running_clock_measures_the_attempt_and_not_the_whole_run():
+    """A continued run must not report the time it spent failed as running time.
+
+    A run keeps the day it was created, and one that sat failed for an hour
+    before the reader pressed "Tiếp tục" showed an hour of running time while
+    the attempt actually being watched was a minute old — a healthy run read
+    as one that had been stuck for an hour. The clock under the progress bar
+    starts again with every attempt, which is what the newest `run_start`
+    record says.
+    """
+    from pathlib import Path
+
+    js = (Path(__file__).resolve().parents[1] / "webui" / "static" / "app.js").read_text(
+        encoding="utf-8"
+    )
+    assert "function attemptStart(events, run)" in js
+    # The attempt is the newest run_start in the log.
+    assert 'event.type === "run_start"' in js
+    # The clock reads the attempt, not the run's creation.
+    assert "formatClock(until - began)" in js
+    assert "formatClock(until - run.started)" not in js
+
+
+def test_the_resume_notice_is_raised_once_and_not_on_every_poll():
+    """The notice about a continued run is a fact about the start of the attempt.
+
+    The resume record stays in the log for the whole run, so re-stamping the
+    banner on every poll made it blink in and out for as long as the run went
+    on — a warning about the attempt's first minute chasing the reader through
+    the hour that followed. It is raised once, for the record it belongs to.
+    """
+    from pathlib import Path
+
+    js = (Path(__file__).resolve().parents[1] / "webui" / "static" / "app.js").read_text(
+        encoding="utf-8"
+    )
+    # The notice is tied to the resume record it describes, by its time.
+    assert "ts: Number(event.ts) || 0," in js
+    assert "resume.ts !== state.resumeSeen" in js
+    assert "state.resumeSeen = resume.ts;" in js
 
 
 def test_the_view_switch_has_a_row_of_its_own_and_the_badge_its_own_space():

@@ -101,7 +101,9 @@ class AgentConfig(BaseModel):
     timeout: float = Field(default=DEFAULT_TIMEOUT, gt=0)
     max_retries: int = Field(default=2, ge=0)
     # Backup endpoint used when the primary keeps failing (rate limits,
-    # timeouts, connection errors). Configured via ``<NAME>_BACKUP_*`` vars.
+    # timeouts, connection errors). One endpoint for the whole pipeline,
+    # configured via the shared ``LLM_BACKUP_*`` vars; embedding has none
+    # (the Reasoning Bank is best-effort).
     backup_base_url: str = ""
     backup_model: str = ""
     backup_api_key: str = ""
@@ -129,7 +131,7 @@ class AgentConfig(BaseModel):
         """Backup endpoint needs BOTH base_url and model (or neither)."""
         if bool(self.backup_base_url) != bool(self.backup_model):
             raise ValueError(
-                "backup endpoint requires both <NAME>_BACKUP_BASE_URL and <NAME>_BACKUP_MODEL"
+                "backup endpoint requires both LLM_BACKUP_BASE_URL and LLM_BACKUP_MODEL"
             )
         return self
 
@@ -161,6 +163,21 @@ def _read_source_group_env() -> dict[str, str]:
     }
 
 
+def _read_global_backup_env() -> tuple[str, str, str]:
+    """The backup endpoint every agent shares when it has none of its own.
+
+    One place to name a second provider for the whole pipeline: Planner,
+    Translator, Critic, Refiner and Verifier all fall back to it. Embeddings
+    are not part of it: the Reasoning Bank is best-effort and a missing backup
+    there costs a trace, not a translation.
+    """
+    return (
+        os.getenv("LLM_BACKUP_BASE_URL", "").strip(),
+        os.getenv("LLM_BACKUP_MODEL", "").strip(),
+        os.getenv("LLM_BACKUP_API_KEY", "").strip(),
+    )
+
+
 def _agent_from_env(name: str) -> AgentConfig:
     """Build one AgentConfig from ``<NAME>_*`` env vars, raising clearly.
 
@@ -177,9 +194,6 @@ def _agent_from_env(name: str) -> AgentConfig:
     model = os.getenv(f"{prefix}MODEL", "").strip()
     api_key = os.getenv(f"{prefix}API_KEY", "").strip()
     temperature_raw = os.getenv(f"{prefix}TEMPERATURE", "").strip()
-    backup_base_url = os.getenv(f"{prefix}BACKUP_BASE_URL", "").strip()
-    backup_model = os.getenv(f"{prefix}BACKUP_MODEL", "").strip()
-    backup_api_key = os.getenv(f"{prefix}BACKUP_API_KEY", "").strip()
     # Per-agent timeout override (e.g., VERIFIER_TIMEOUT=30); falls back to
     # LLM_TIMEOUT / DEFAULT_TIMEOUT when not set.
     timeout_raw = os.getenv(f"{prefix}TIMEOUT", "").strip()
@@ -200,6 +214,14 @@ def _agent_from_env(name: str) -> AgentConfig:
         if not temperature_raw and shared["temperature"]:
             temperature_raw = shared["temperature"]
             group_used = True
+
+    # The backup endpoint: one for the whole pipeline, so every agent has
+    # somewhere to go when its own provider stops answering. A pipeline that
+    # names a backup for one endpoint and forgets another is the case this
+    # closes — the forgotten one would have had nothing to fall back to. A
+    # half-set pair is left as it is on purpose: the config check below turns
+    # it into a clear error instead of quietly looking the other way.
+    backup_base_url, backup_model, backup_api_key = _read_global_backup_env()
 
     missing = [field for field, value in (("BASE_URL", base_url), ("MODEL", model)) if not value]
     if missing and not mock:
@@ -324,18 +346,10 @@ class AppConfig(BaseModel):
     #: straight to the Verifier. Defaults to ``critic_threshold`` so behaviour is
     #: unchanged unless raised explicitly.
     refine_min_score: float = Field(default=7.0, ge=0, le=10)
-    #: When True the summary tree asks the Planner LLM to summarize every
-    #: chunk (one request per chunk). Those per-chunk summaries are never used
-    #: downstream, so this defaults to False to avoid wasted requests/tokens.
-    summary_tree_chunk_summaries: bool = False
 
     # ------------------------------------------------------------------
     # Workflow knobs (see the README's architecture section)
     # ------------------------------------------------------------------
-    #: ONE Planner request produces summary + strategy + glossary + complexity +
-    #: section notes. Set ``UNIFIED_PLANNER=0`` to fall back to the legacy
-    #: summary-tree-then-plan path.
-    unified_planner: bool = True
     #: Adaptive quality pipeline: route simple, confidently-translated chunks
     #: straight to the Verifier instead of Critic -> Refiner -> Verifier.
     adaptive_quality: bool = True
@@ -557,12 +571,6 @@ def get_app_config() -> AppConfig:
         kwargs["max_concurrency"] = _get_int_env("MAX_CONCURRENCY", 1)
     if os.getenv("REFINE_MIN_SCORE"):
         kwargs["refine_min_score"] = _get_float_env("REFINE_MIN_SCORE", 7.0)
-    if os.getenv("SUMMARY_TREE_CHUNK_SUMMARIES"):
-        kwargs["summary_tree_chunk_summaries"] = _get_bool_env(
-            "SUMMARY_TREE_CHUNK_SUMMARIES", False
-        )
-    if os.getenv("UNIFIED_PLANNER"):
-        kwargs["unified_planner"] = _get_bool_env("UNIFIED_PLANNER", True)
     if os.getenv("ADAPTIVE_QUALITY"):
         kwargs["adaptive_quality"] = _get_bool_env("ADAPTIVE_QUALITY", True)
     if os.getenv("FAST_PATH_MAX_COMPLEXITY"):

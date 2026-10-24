@@ -9,6 +9,7 @@ redraw. Full structured logs still go to ``logs/run_<ts>.jsonl``.
 from __future__ import annotations
 
 import json
+import sys
 from pathlib import Path
 from typing import Annotated
 
@@ -65,6 +66,16 @@ def main(
     ] = None,
 ) -> None:
     """polyglot-lc: multi-agent long-context translation."""
+    # Rich's legacy Windows renderer writes through the stream's own codec,
+    # and it is chosen at Console construction from the environment — a
+    # redirected run on Windows still hits it. A cp1252 console would then
+    # raise on a Vietnamese glyph in the final report, *after* the output
+    # files are written, so the exit code lied about an otherwise good run.
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            stream.reconfigure(encoding="utf-8", errors="replace")
+        except (AttributeError, ValueError, OSError):
+            pass  # a stream that cannot be reconfigured is not worth a crash
 
 
 def _token_report() -> str:
@@ -132,9 +143,6 @@ def translate(
         str, typer.Option("--src", "-s", help="Source language ('auto' = langdetect).")
     ] = "auto",
     tgt: Annotated[str, typer.Option("--tgt", "-t", help="Target language code.")] = "vi",
-    domain: Annotated[
-        str, typer.Option("--domain", "-d", help="Domain hint (tech, legal, ...).")
-    ] = "general",
     glossary: Annotated[
         Path | None,
         typer.Option(
@@ -215,7 +223,6 @@ def translate(
             file_path=file,
             src=src,
             tgt=tgt,
-            domain=domain,
             glossary=str(glossary) if glossary else None,
             out=str(out) if out else None,
             max_tokens=max_tokens,
@@ -267,6 +274,53 @@ def translate(
             f"  resumed chunks: {result.resumed_chunks}"
             f"  consistency patches: {result.consistency_patches}"
             f"  elapsed: {result.elapsed_s:.1f}s",
+            markup=False,
+        )
+    if result.consistency_patch_budget:
+        # What the pass was allowed to cost. Each patch sends one chunk's whole
+        # translation (plus the glossary) and gets it back, so a document with
+        # hundreds of drifting chunks can spend a lot of tokens here; the
+        # ceiling belongs in the report, not only in the log.
+        console.print(
+            f"  consistency patch budget: {result.consistency_patch_budget} request(s), "
+            f"{result.consistency_patches} used",
+            markup=False,
+        )
+    if result.consistency_skipped or result.consistency_rejected:
+        # The document is *not* fully consistent: the pass ran out of budget, or
+        # refused rewrites that would have cost the translation. Saying so is
+        # the point of the count.
+        console.print(
+            f"  consistency left {result.consistency_skipped} chunk(s) drifting"
+            f"  patch rejected: {result.consistency_rejected}",
+            markup=False,
+        )
+    if result.consistency_stopped_early:
+        # The pass gave up on the editor, not on the document: its remaining
+        # budget went unspent and the untouched chunks are already counted.
+        console.print(
+            "  consistency: stopped after two patches in a row were refused; "
+            "remaining budget unspent",
+            markup=False,
+        )
+    if result.consistency_label_drift:
+        console.print(
+            f"  consistency: {result.consistency_label_drift} label(s) drifted"
+            f" out of {result.consistency_labels} compared",
+            markup=False,
+        )
+    if result.consistency_no_pairs:
+        # "0 inconsistencies" over zero terms is not a clean document: the
+        # Planner fell back (or no glossary existed), so only labels were
+        # compared. Saying which one it was keeps the two from reading alike.
+        console.print(
+            "  consistency: no glossary term to compare - only labels were checked",
+            markup=False,
+        )
+    if result.verify_skipped:
+        console.print(
+            f"  verifier unavailable for {result.verify_skipped} chunk(s): "
+            "shipped without a verdict",
             markup=False,
         )
     if (

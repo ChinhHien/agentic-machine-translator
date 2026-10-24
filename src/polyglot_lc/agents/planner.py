@@ -4,7 +4,6 @@ Prompt construction deliberately lives with the workflow that owns it, so a
 planner prompt and its parser stay in one file:
 
 * the single document plan — :mod:`polyglot_lc.analysis.unified_planner`
-* the legacy section/document summaries — :mod:`polyglot_lc.segment.summary_tree`
 * the SkillOpt textual gradient — :mod:`polyglot_lc.skillopt.optimizer`
 
 This class only names the role, so PLANNER_* provider/model settings resolve

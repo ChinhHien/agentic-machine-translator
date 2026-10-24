@@ -112,6 +112,16 @@ PERMANENT_HINTS = (
     "invalid_request_error",
 )
 
+#: The options the translate command takes, and the ones that are plain flags.
+#: A run's stored command is a snapshot of the command line of the day that run
+#: started, and a resumed run replays it verbatim so it keeps hitting the very
+#: same checkpoints. An option the CLI has since dropped would stop the child
+#: before it started, so a stored command is filtered down to these first.
+CLI_VALUE_OPTIONS = frozenset(
+    {"--file", "--src", "--tgt", "--glossary", "--max-tokens", "--out", "--format"}
+)
+CLI_FLAGS = frozenset({"--quiet", "--resume"})
+
 
 class RunPlanError(RuntimeError):
     """The document could not be planned, so no run was started."""
@@ -129,6 +139,35 @@ def _chunk_order(chunk_id: str) -> tuple[int, str]:
     """
     digits = "".join(character for character in chunk_id if character.isdigit())
     return (int(digits) if digits else 0, chunk_id)
+
+
+def _current_options(argv: list[str]) -> list[str]:
+    """*argv* without the options the CLI no longer accepts.
+
+    Only long options are looked at: the interpreter and the module name at the
+    head of the command are not options of the translate command, and the short
+    forms were never written into a record. An option that is gone takes its
+    value with it, or the value would be read as an argument of its own.
+    """
+    kept: list[str] = []
+    index = 0
+    while index < len(argv):
+        token = argv[index]
+        index += 1
+        if not token.startswith("--"):
+            kept.append(token)
+            continue
+        name, separator, _ = token.partition("=")
+        if name in CLI_FLAGS:
+            kept.append(token)
+        elif name in CLI_VALUE_OPTIONS:
+            kept.append(token)
+            if not separator and index < len(argv):
+                kept.append(argv[index])
+                index += 1
+        elif not separator and index < len(argv) and not argv[index].startswith("--"):
+            index += 1
+    return kept
 
 
 def _note(record: RunRecord, text: str) -> None:
@@ -366,7 +405,6 @@ class RunManager:
         file: str,
         src: str,
         tgt: str,
-        domain: str,
         glossary: str | None,
         max_tokens: int | None,
         mock: bool,
@@ -402,14 +440,13 @@ class RunManager:
             file=Path(file).name,
             src=src,
             tgt=tgt,
-            domain=domain,
             chunks=int(plan.get("chunks") or 0),
             exit_code=None,
             output_path=str(output_path),
             mock=mock,
             pid=None,
             command=self._argv(
-                source, src, tgt, domain, glossary, max_tokens, output_path, output_format
+                source, src, tgt, glossary, max_tokens, output_path, output_format
             ),
         )
         return self._launch(record)
@@ -420,13 +457,17 @@ class RunManager:
         "Tiếp tục" is not a new translation. The chunks the stopped attempt
         already finished are the work left to continue, and the checkpoint
         store keys them by the command that produced them — file, languages,
-        domain, glossary, token budget — plus the Translator model. So the
+        glossary, token budget — plus the Translator model. So the
         command the run actually ran is relaunched verbatim with ``--resume``
         (rebuilding flags from today's settings would re-chunk the document
         under another token budget and miss every checkpoint), the model the
         run itself reported is pinned into the child's env, and the run keeps
         its id, log directory, output path and start time. The page goes on
         watching one run instead of gaining a second one for the same document.
+
+        One thing is not replayed: an option the CLI has since dropped is
+        removed from the stored command (see :func:`_current_options`), or the
+        child would stop before it started and the run could never continue.
 
         ``KeyError`` for an unknown run; ``RuntimeError`` when it is still
         running (a second child would write the same log and artefacts) or when
@@ -439,7 +480,7 @@ class RunManager:
             raise RuntimeError(f"run {run_id} is still running")
         if not record.command:
             raise RuntimeError(f"run {run_id} has no stored command to continue")
-        argv = list(record.command)
+        argv = _current_options(list(record.command))
         if "--resume" not in argv:
             argv.append("--resume")
         record.command = argv
@@ -507,7 +548,6 @@ class RunManager:
         source: Path,
         src: str,
         tgt: str,
-        domain: str,
         glossary: str | None,
         max_tokens: int | None,
         output_path: Path,
@@ -525,8 +565,6 @@ class RunManager:
             src,
             "--tgt",
             tgt,
-            "--domain",
-            domain,
             "--out",
             str(output_path),
             "--format",

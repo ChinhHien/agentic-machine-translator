@@ -10,7 +10,7 @@ import json
 
 import pytest
 
-from webui.store import GlossaryStore, RunRecord, RunsStore, SkillsStore
+from webui.store import GlossaryStore, RunRecord, RunsStore
 
 
 def _record(run_id: str = "r1", **over) -> RunRecord:
@@ -22,7 +22,6 @@ def _record(run_id: str = "r1", **over) -> RunRecord:
         "file": "f.pdf",
         "src": "en",
         "tgt": "vi",
-        "domain": "tech",
         "chunks": 3,
         "exit_code": 0,
         "output_path": "o.md",
@@ -149,46 +148,6 @@ def test_tail_output_falls_back_to_stdout_and_tolerates_absence(tmp_path):
     assert s.tail_output("r1") == "Configuration error: missing key"
     assert s.tail_output("nope") == ""
     assert s.tail_output("../escape") == ""
-
-
-# -------------------------------- skill store -------------------------------
-def test_list_skills_skips_directories_and_bad_json(tmp_path):
-    (tmp_path / "en-vi").mkdir(parents=True)
-    (tmp_path / "en-vi" / "general.json").write_text(
-        json.dumps(
-            {
-                "instruction": "i",
-                "mean_score": 8.5,
-                "domain": "general",
-                "src_lang": "en",
-                "tgt_lang": "vi",
-            }
-        ),
-        encoding="utf-8",
-    )
-    (tmp_path / "en-vi" / "broken.json").write_text("{not json", encoding="utf-8")
-    (tmp_path / "en-vi" / "session_abc.json").write_text("{}", encoding="utf-8")
-    (tmp_path / "en-vi" / "a-directory.json").mkdir()
-
-    st = SkillsStore(tmp_path)
-    names = [(s["pair"], s["domain"]) for s in st.list_skills()]
-    assert names == [("en-vi", "general")]
-    assert st.get_skill("en-vi", "general")["mean_score"] == 8.5
-    assert st.get_skill("en-vi", "broken") is None
-
-
-def test_skill_history_is_read(tmp_path):
-    (tmp_path / "en-vi").mkdir(parents=True)
-    (tmp_path / "en-vi" / "general.json").write_text("{}", encoding="utf-8")
-    (tmp_path / "en-vi" / "general.history.jsonl").write_text(
-        '{"score": 7.0, "ts": 1}\n{"score": 9.0, "ts": 2}\n', encoding="utf-8"
-    )
-    assert [h["score"] for h in SkillsStore(tmp_path).history("en-vi", "general")] == [7.0, 9.0]
-
-
-def test_skill_history_tolerates_a_missing_file(tmp_path):
-    (tmp_path / "en-vi").mkdir(parents=True)
-    assert SkillsStore(tmp_path).history("en-vi", "general") == []
 
 
 # ------------------------------ glossary store ------------------------------

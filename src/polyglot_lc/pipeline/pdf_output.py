@@ -14,13 +14,20 @@ looks like the page it replaces. Two things the source expressed through
 * a **contents entry**'s dot leader is measured back in between the translated
   title and its page number, which stays against the right margin.
 
-A block is printed at the size the source set it in, and the part of a longer
-translation that does not fit its box continues on a new page inserted after it,
-at the same size and in the same column. Shrinking the type to squeeze a
-Vietnamese sentence into the English line's box is what a rebuilt page cannot
-afford: at the 55% floor it printed 10 pt body text at 5.5 pt, over the block
-below. A table cell is the one exception, because what surrounds it *is* the
-layout.
+A block is printed at the size the source set it in. A translation longer than
+the box the English was cut for does not lose its tail to an inserted page
+straight away: the page is filled top to bottom, so a block that ran long pushes
+the blocks under it further down — through the white between the source's own
+lines, as far down as the page itself reaches (never shorter than the room the
+source's own text used) — and only what still has no room continues overleaf, on
+a new page inserted after it, at the same size and in the same column. A block
+is never pushed over what the page keeps where it is: text left in English, a
+table's cells and the page's images stand in the way, and the block stops above
+them (see :func:`_page_anchors`), and it never shrinks its type to make the rest
+fit: 11 pt body text printed at 6 pt is not the same document, and a reader
+notices the change in size before the extra page. Only a table cell shrinks
+(70%, ``_CELL_MIN_SCALE``), because what surrounds a cell *is* the layout and it
+has nowhere else to go.
 
 A **table** is rebuilt cell by cell, inside the grid the source page already
 drew: the rules stay exactly where they were and each translated cell is printed
@@ -192,6 +199,21 @@ _FONT_CANDIDATES: tuple[str, ...] = (
 #: Room, in points, kept between a rebuilt block and the page's bottom edge.
 _BOTTOM_MARGIN = 28.0
 
+#: Faces that carry both Vietnamese and the symbols prose uses in formulae
+#: (∈, ∑, ≤, →): Arial and Times carry neither ∈ nor most of that set, so a
+#: block using one needs a wider face. Ordered so each platform finds its own:
+#: DejaVu and Noto on Linux, Cambria on Windows (its collection's first face),
+#: Arial Unicode on macOS. A candidate is only used when it actually covers the
+#: text being printed — Segoe UI Symbol covers the maths but not Vietnamese.
+_WIDE_FONT_CANDIDATES: tuple[str, ...] = (
+    "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+    "/usr/share/fonts/truetype/noto/NotoSans-Regular.ttf",
+    "C:/Windows/Fonts/cambria.ttc",
+    "C:/Windows/Fonts/arialuni.ttf",
+    "/Library/Fonts/Arial Unicode.ttf",
+    "/System/Library/Fonts/Supplemental/Arial Unicode.ttf",
+)
+
 #: Room, in points, kept above a continued block on the page it continues on.
 #: The source page's top margin is not recorded per block, and every page of a
 #: book open with roughly this much white above the first line.
@@ -236,9 +258,9 @@ class RebuildStats:
     #: paragraph): their own lines are cleared and nothing is printed in their
     #: place, because that paragraph already carries their words.
     merged: int = 0
-    #: Pages added for blocks whose translation did not fit the box the source
-    #: set it in. Their text is printed there at the source size, never shrunk
-    #: into a neighbour's lines.
+    #: Pages added for blocks whose translation did not fit the room their page
+    #: had left for them (see the module docstring). Their text is printed
+    #: there at the source size, never shrunk into a neighbour's lines.
     continued: int = 0
     #: Table cells printed with their translation, and cells that fell back to
     #: their own source text because the translation would not fit the box.
@@ -308,6 +330,59 @@ def _covers_vietnamese(font_file: str) -> bool:
     except Exception:  # noqa: BLE001 - an unreadable font is simply not a match
         return False
     return all(font.has_glyph(ord(ch)) for ch in _VIETNAMESE_PROBE)
+
+
+@lru_cache(maxsize=4096)
+def _covers_codepoints(font_file: str, codepoints: tuple[int, ...]) -> bool:
+    """True when *font_file* has a glyph for every code point in *codepoints*.
+
+    Vietnamese coverage is not enough: a paragraph about Big O holds ``∈``,
+    which Times and Arial do not have. PyMuPDF prints a missing glyph as its
+    ``.notdef`` box, so the face has to be checked against the text it will
+    actually carry.
+    """
+    import pymupdf
+
+    try:
+        font = pymupdf.Font(fontfile=font_file)
+    except Exception:  # noqa: BLE001 - an unreadable font cannot print anything
+        return False
+    return all(font.has_glyph(code) for code in codepoints)
+
+
+def _printable_face(chosen: str | None, text: str, default_font: str | Path | None) -> str:
+    """A face that can print every character of *text*.
+
+    The block's matched face is kept whenever it covers the text — changing a
+    page's typeface for one symbol would read as a formatting mistake. When it
+    does not, the default face and then the wide faces (:data:`_WIDE_FONT_CANDIDATES`)
+    are tried, and the first one that covers the whole text is used. A character
+    no installed face covers is left to the chosen face, with a warning naming
+    it: a box on the page is better than a missing word, and the log says why.
+    """
+    codepoints = tuple(sorted({ord(ch) for ch in text if not ch.isspace()}))
+    if not codepoints:
+        return str(chosen or default_font or "")
+    if chosen and _covers_codepoints(str(chosen), codepoints):
+        return str(chosen)
+    candidates = [str(default_font)] if default_font else []
+    candidates.extend(_WIDE_FONT_CANDIDATES)
+    for candidate in candidates:
+        if candidate and Path(candidate).is_file() and _covers_codepoints(candidate, codepoints):
+            if chosen and candidate != str(chosen):
+                logger.debug(
+                    "PDF rebuild: {} lacks {}; printing this block in {}",
+                    Path(chosen).name,
+                    "".join(sorted({chr(code) for code in codepoints})[:4]),
+                    Path(candidate).name,
+                )
+            return candidate
+    logger.warning(
+        "PDF rebuild: no installed face covers every character of a block ({}); "
+        "some will print as a box",
+        "".join(sorted({chr(code) for code in codepoints}))[:8],
+    )
+    return str(chosen or default_font or "")
 
 
 @lru_cache(maxsize=1)
@@ -468,6 +543,11 @@ class _Placement:
     #: opts out, and the runs have to respect that too: otherwise a font the
     #: caller chose on purpose would come back for the bold names only.
     match_style: bool = True
+    #: Where this block's source continues on the next page, as
+    #: ``(page, top)``. A paragraph split by the page break knows the y its own
+    #: continuation started at, and its translated tail belongs there — not in
+    #: the margin above the page's running head.
+    resume: tuple[int, float] | None = None
 
 
 #: How far a one-line block may be stretched, in points, from the text column.
@@ -501,6 +581,11 @@ def _page_geometry(
 #: How much white a grown box leaves above whatever stands below it.
 _BLOCK_CLEARANCE = 2.0
 
+#: One line's band at the source size, in multiples of that size: the least room
+#: in which a block can print anything at all. Below it the block continues
+#: overleaf whole rather than printing over what stands in its way.
+_LINE_BAND = 1.4
+
 #: How many characters of the source size a box must be able to hold before the
 #: translation is printed in it — a backstop, two characters wide. A block whose
 #: rectangle is narrower than this cannot be set a sentence on (PyMuPDF wraps it
@@ -514,6 +599,8 @@ _MIN_BOX_WIDTH_FACTOR = 2.0
 def _grown_down(
     box: tuple[float, float, float, float],
     occupied: list[tuple[float, float, float, float]],
+    *,
+    source_bottom: float,
 ) -> tuple[float, float, float, float]:
     """A box allowed to reach down through the empty room under its own lines.
 
@@ -524,12 +611,18 @@ def _grown_down(
     — what this module used to do — the whole block shrunk to fit the English
     line's box. The box stops at whatever is printed below it, so nothing is
     printed over: the caller clamps the bottom to the page's own margin.
+
+    The room is measured from *source_bottom*, the source line's own bottom,
+    not from the box's padded one: the pad hangs over the next line whenever the
+    source sets its lines tight, and a test that counted that pad as free room
+    grew the box through the next line entirely — the wrapped translation then
+    printed over the block below it.
     """
     x0, top, x1, bottom = box
     below = [
         other
         for other in occupied
-        if other[1] >= bottom - 1 and other[0] < x1 - 1 and other[2] > x0 + 1
+        if other[1] >= source_bottom - 1 and other[0] < x1 - 1 and other[2] > x0 + 1
     ]
     if not below:
         return box
@@ -542,8 +635,17 @@ def _stretched_box(
     occupied: list[tuple[float, float, float, float]],
     own: list[tuple[float, float, float, float]],
     column: tuple[float, float] | None,
+    *,
+    source_bottom: float,
 ) -> tuple[float, float, float, float]:
-    """A one-line box widened to its column, when the room is actually free."""
+    """A one-line box widened to its column, when the room is actually free.
+
+    ``source_bottom`` is where the source line's own row ends, before the pad
+    the box carries under it: the pad hangs over the line *below* whenever the
+    source sets its lines tight, and treating that pad as room on this line
+    refused every widening — the longer translation then wrapped inside the
+    short source box and printed its second line over the label below it.
+    """
     x0, top, x1, bottom = box
     if column is None or len(own) != 1:
         return box
@@ -554,7 +656,7 @@ def _stretched_box(
         if (px0, ptop, px1, pbottom) in own:
             continue
         # Something else already sits on this line, to the right of the block.
-        if ptop < bottom - 1 and pbottom > top + 1 and px0 < hi - 1 and px1 > x1 + 1:
+        if ptop < source_bottom - 1 and pbottom > top + 1 and px0 < hi - 1 and px1 > x1 + 1:
             return box
     center, column_center = (x0 + x1) / 2, (lo + hi) / 2
     if abs(center - column_center) < _CENTER_TOLERANCE:
@@ -576,6 +678,16 @@ def _placement(
         return None
     page = int(rects[0][0])
     on_page = [r for r in rects if int(r[0]) == page]
+    # A block whose lines run over a page break has rects on more than one page.
+    # Its translation is printed from this page's box, and the tail continues at
+    # the y the source's continuation started at (see ``resume``); only this
+    # page's rects may be redacted here, because ``apply_redactions`` works on
+    # one page and coordinates from another page would clear the wrong text.
+    later = [r for r in rects if int(r[0]) > page]
+    resume = None
+    if later:
+        next_page = min(int(r[0]) for r in later)
+        resume = (next_page, min(float(r[2]) for r in later if int(r[0]) == next_page))
     x0 = min(r[1] for r in on_page)
     x1 = max(r[3] for r in on_page)
     top = min(r[2] for r in on_page)
@@ -589,12 +701,13 @@ def _placement(
         occupied or [],
         [(r[1], r[2], r[3], r[4]) for r in on_page],
         column,
+        source_bottom=bottom,
     )
-    box = _grown_down(box, occupied or [])
+    box = _grown_down(box, occupied or [], source_bottom=bottom)
     color = tuple(float(part) for part in geo.get("color") or ()) or None
     return _Placement(
         page=page,
-        redact=[(r[1], r[2], r[3], r[4]) for r in rects],
+        redact=[(r[1], r[2], r[3], r[4]) for r in on_page],
         box=box,
         source_box=(x0, top, x1, bottom + max(size * 0.6, 4.0)),
         size=size,
@@ -602,6 +715,7 @@ def _placement(
         kind=kind,
         color=color,
         toc=toc,
+        resume=resume,
     )
 
 
@@ -672,39 +786,94 @@ def _inside_any(
 
 #: Most room, in points, between a merged block and the box that covers it.
 #: Its translation is printed *there*, so a block further down the page is not
-#: part of that sentence and must not be cleared with it.
-_MERGE_GAP = 1.0
+#: part of that sentence and must not be cleared with it. One blank line's
+#: worth is still part of it: a listing the translator merged across that blank
+#: line is one paragraph translated above, and folding it is what ``None`` says.
+_MERGE_GAP = 2.0
 
 
-def _absorb(item: _Placement | None, geo: dict[str, Any]) -> bool:
+def _absorb(
+    item: _Placement | None,
+    geo: dict[str, Any],
+) -> tuple[bool, list[tuple[int, float, float, float, float]]]:
     """Give *item* the lines of a block whose words it already translates.
 
     A block the translator folded into the paragraph above it leaves its own
     source lines behind: they are part of a sentence that is printed in the
     item's box, so they are added to the redaction and the box grows over them —
     a wrapped title owns both of its lines, not just the first. Returns whether
-    the block could be covered; when it cannot, the caller leaves it alone
-    rather than clearing text that nothing was printed over.
+    the block could be covered, plus rects that sit on *another page*.
+
+    Only the rects on the item's own page may join its box: a block whose lines
+    run over the page break would otherwise drag the next page's coordinates —
+    which start again near the top — into a box spanning the whole page, printing
+    over everything already there, while its redaction cleared the wrong page.
+    Those other-page rects come back for the caller to clear where they stand;
+    when the block cannot be covered at all, neither half happens, because
+    nothing was printed over it.
     """
     rects = geo.get("rects") or []
     if item is None or item.kind == "cell" or not rects:
-        return False
-    if int(rects[0][0]) != item.page:
-        return False
+        return False, []
     boxes = [(float(r[1]), float(r[2]), float(r[3]), float(r[4])) for r in rects]
+    on_page = [
+        (int(r[0]), box) for box, r in zip(boxes, rects, strict=True) if int(r[0]) == item.page
+    ]
+    off_page = [
+        (int(r[0]), box) for box, r in zip(boxes, rects, strict=True) if int(r[0]) != item.page
+    ]
+    if not on_page:
+        # Every line stands on another page than the item that prints these
+        # words, so there is no same-page geometry to doubt the fold against:
+        # the fold is all there is, and it says the words were translated above.
+        return False, [(page, *box) for page, box in off_page]
     # The *source* box, not the printed one: a box grown down through the page's
     # white reaches whatever stands below it, and a sentence that was printed
     # high up the page is not the sentence of a block 120 pt further down.
     own = item.source_box or item.box
-    if min(box[1] for box in boxes) > own[3] + item.size * _MERGE_GAP:
-        return False
-    item.redact.extend(boxes)
+    if min(box[1] for _page, box in on_page) > own[3] + item.size * _MERGE_GAP:
+        return False, []
+    item.redact.extend([box for _page, box in on_page])
     x0, top, x1, bottom = item.box
-    for box in boxes:
+    for _page, box in on_page:
         x0, top = min(x0, box[0]), min(top, box[1])
         x1, bottom = max(x1, box[2]), max(bottom, box[3])
     item.box = (x0, top, x1, bottom)
-    return True
+    return True, [(page, *box) for page, box in off_page]
+
+
+def _clear_placements(
+    rects: list[tuple[int, float, float, float, float]],
+) -> list[_Placement]:
+    """Redaction-only placements: source lines cleared on the page they stand on.
+
+    Their words are printed for the block above them — on some other page — so
+    there is nothing to print here, only English to take off the page. ``kind``
+    is ``"clear"``: the rebuild redacts them and skips the insert.
+    """
+    grouped: dict[int, list[tuple[float, float, float, float]]] = {}
+    for page, x0, top, x1, bottom in rects:
+        grouped.setdefault(page, []).append((x0, top, x1, bottom))
+    items: list[_Placement] = []
+    for page, boxes in grouped.items():
+        union = (
+            min(box[0] for box in boxes),
+            min(box[1] for box in boxes),
+            max(box[2] for box in boxes),
+            max(box[3] for box in boxes),
+        )
+        items.append(
+            _Placement(
+                page=page,
+                redact=boxes,
+                box=union,
+                source_box=union,
+                size=6.0,
+                text="",
+                kind="clear",
+            )
+        )
+    return items
 
 
 def _source_cell(source: list[list[str]] | None, row: int, column: int) -> str | None:
@@ -772,6 +941,9 @@ def _table_placements(
                 item.font_file = match_font(str(geo.get("font") or ""), bool(bold), bool(italic))
             if item.font_file is None and default_font is not None:
                 item.font_file = str(default_font)
+            # Even a pinned face is checked: a caller chooses the typography,
+            # not boxes where a symbol should be.
+            item.font_file = _printable_face(item.font_file, text, default_font)
             items.append(item)
     if not items:
         return None
@@ -824,6 +996,8 @@ def placements(
     (family, weight, slant); it is switched off when the caller pinned the font.
     """
     built: list[_Placement] = []
+    #: Placements that only clear lines on another page; joined at the end.
+    clears: list[_Placement] = []
     kept = 0
     merged = 0
     columns, occupied = _page_geometry(doc)
@@ -838,8 +1012,13 @@ def placements(
         if index in texts and texts[index] is None:
             # The translator's paragraph for this block's sentence is printed
             # for the block above it: this block's own lines go with it.
-            if _absorb(built[-1] if built else None, geo):
+            absorbed, off_page = _absorb(built[-1] if built else None, geo)
+            if absorbed or off_page:
                 merged += 1
+                # Collected beside the items, never among them: an item that
+                # only clears lines on another page has nothing printed in its
+                # box, and the next fold must not give its lines to that.
+                clears.extend(_clear_placements(off_page))
             else:
                 kept += 1
             continue
@@ -905,6 +1084,23 @@ def placements(
             )
         if item.font_file is None and default_font is not None:
             item.font_file = str(default_font)
+        # The block's text may use a character the source face cannot print
+        # (∈, ∑, ≤ — Arial and Times both lack ∈). Printing it in that face is a
+        # box on the page, so the face is checked against the text it will carry.
+        # A pinned face is still preferred; it is only set aside for a block it
+        # genuinely cannot print.
+        item.font_file = _printable_face(item.font_file, item.text, default_font)
+        # The block's own lines on later pages: their words are printed here as
+        # this block's translation, so they are cleared where they stand. The
+        # whole set was in ``redact`` before, which redacted them on the wrong
+        # page and left the English untouched on the page they belong to.
+        off_page = [
+            (int(r[0]), float(r[1]), float(r[2]), float(r[3]), float(r[4]))
+            for r in geo.get("rects") or []
+            if int(r[0]) != item.page
+        ]
+        if off_page:
+            clears.extend(_clear_placements(off_page))
         if kind in _RUN_KINDS and _has_tokens(block.text) and emphasis.agrees_with(block.text, raw):
             # The tokens are the model's own placement, and they are only trusted
             # because the source's counts match; two distinct styles are what a
@@ -915,6 +1111,7 @@ def placements(
             if len({(bold, italic) for text, bold, italic in runs if text}) >= 2:
                 item.runs = runs
         built.append(item)
+    built.extend(clears)
     return built, kept, merged
 
 
@@ -1133,17 +1330,20 @@ class _RunText:
         # not printed in the regular face of the same family — a failure the page
         # shows no error for.
         faces: dict[tuple[bool, bool], str] = {}
-        for _text, bold, italic in item.runs or []:
-            style = (bold, italic)
-            if style in faces:
-                continue
+        run_text: dict[tuple[bool, bool], list[str]] = {}
+        for text, bold, italic in item.runs or []:
+            run_text.setdefault((bold, italic), []).append(text)
+        for style, pieces in run_text.items():
+            bold, italic = style
             found = match_font(styled, bold, italic) if styled else None
             if found is None and style != (False, False):
                 logger.debug(
                     "PDF rebuild: no local {} face; printing that run plain",
                     "bold" if bold else "italic",
                 )
-            faces[style] = str(found or base)
+            # A style's face may lack a character this run uses (∈ is in no
+            # Arial or Times face); that run is printed in a face that has it.
+            faces[style] = _printable_face(str(found or base), " ".join(pieces), base)
         self.words: list[tuple[str, str]] = [
             (word, faces[(bold, italic)])
             for text, bold, italic in item.runs or []
@@ -1251,15 +1451,27 @@ class _RunText:
 
 
 def _insert(
-    page: Any, item: _Placement, pymupdf: Any, default_font: Path | str, measurer: _Measurer
-) -> tuple[str | None, _Overflow | None]:
+    page: Any,
+    item: _Placement,
+    pymupdf: Any,
+    default_font: Path | str,
+    measurer: _Measurer,
+) -> tuple[str | None, _Overflow | None, float]:
     """Print *item* inside its box, at the size the source set it in.
 
-    Returns ``(outcome, overflow)``: ``"block"`` once the text is on the page
-    (``None`` when nothing could be placed, which a cell can still answer), and
-    the part of a block that did not fit its box, for the caller to continue on a
-    new page. A table cell is handed to :func:`_insert_cell` and never continues
-    overleaf: the rules around it are the layout.
+    A block's type is never shrunk to make a longer translation fit: 11 pt body
+    text printed at 6 pt is not the same document, and readers notice it before
+    they notice an extra page. Whatever the box does not hold continues overleaf
+    at the source size. Only a **table cell** may shrink (see
+    :func:`_insert_cell`), because a cell has nowhere else to go.
+
+    Returns ``(outcome, overflow, used)``: ``"block"`` once the text is on the
+    page (``None`` when nothing could be placed, which a cell can still answer),
+    the part of a block that did not fit its box for the caller to continue on a
+    new page, and the height the text took from the box — which is where the
+    next block down the page may start. A table cell is handed to
+    :func:`_insert_cell` and never continues overleaf: the rules around it are
+    the layout.
 
     The TTF is passed on every call: ``Page.insert_font`` only registers the font
     in the resource dictionary of the page it is called on, so a page that did
@@ -1267,14 +1479,15 @@ def _insert(
     glyphs it cannot encode.
     """
     if item.kind == "cell":
-        return _insert_cell(page, item, pymupdf, default_font), None
+        outcome = _insert_cell(page, item, pymupdf, default_font)
+        return outcome, None, item.box[3] - item.box[1]
     x0, top, x1, bottom = item.box
     limit = max(page.rect.height - _BOTTOM_MARGIN, bottom)
     box = (x0, top, x1, min(bottom, limit))
     if item.runs is not None:
         runs = _RunText(item, default_font, pymupdf)
-        rest, _used = runs.print(page, box, runs.words, item.size)
-        return "block", (_Overflow(item, words=rest) if rest else None)
+        rest, used = runs.print(page, box, runs.words, item.size)
+        return "block", (_Overflow(item, words=rest) if rest else None), used
     font_file = str(item.font_file or default_font)
     fontname = _resource_name(font_file)
     text = _toc_line(item, font_file, pymupdf) if item.toc else item.text
@@ -1283,13 +1496,17 @@ def _insert(
         align = pymupdf.TEXT_ALIGN_CENTER
     tokens = _words_of(text)
 
-    def fits(candidate: str, target: tuple[float, float, float, float] = box) -> bool:
+    def fits(
+        candidate: str,
+        target: tuple[float, float, float, float] = box,
+        size: float = item.size,
+    ) -> bool:
         return measurer.fits(
             target,
             candidate,
             fontname=fontname,
             fontfile=font_file,
-            fontsize=item.size,
+            fontsize=size,
             align=align,
             lineheight=1.15,
             color=item.color,
@@ -1300,7 +1517,7 @@ def _insert(
         # The box does not even hold one line at the source size. One line is put
         # down anyway — a block gone blank is a hole in the page, and redaction
         # has already taken the source's words — and the rest moves on.
-        single = (x0, top, x1, max(top + item.size * 1.4, bottom))
+        single = (x0, top, x1, max(top + item.size * _LINE_BAND, bottom))
         count = 1 if fits(_rejoin(tokens[:1]), single) else 0
         page.insert_text(
             (x0, top + item.size),
@@ -1310,7 +1527,11 @@ def _insert(
             fontsize=item.size,
             color=item.color,
         )
-        return "block", _Overflow(item, text=_rejoin(tokens[count:]))
+        return (
+            "block",
+            _Overflow(item, text=_rejoin(tokens[count:])),
+            item.size * _LINE_BAND * count,
+        )
     unused = page.insert_textbox(
         pymupdf.Rect(*box),
         _rejoin(tokens[:count]),
@@ -1321,6 +1542,7 @@ def _insert(
         lineheight=1.15,
         color=item.color,
     )
+    rest = tokens[count:]
     if unused < 0:  # pragma: no cover - the probe and the page disagree
         page.insert_text(
             (x0, top + item.size),
@@ -1330,20 +1552,84 @@ def _insert(
             fontsize=item.size,
             color=item.color,
         )
+        return "block", _Overflow(item, text=_rejoin(rest)), item.size * _LINE_BAND
+    return (
+        "block",
+        (_Overflow(item, text=_rejoin(rest)) if rest else None),
+        (box[3] - box[1]) - unused,
+    )
+
+
+def _print_overflow(
+    page: Any,
+    over: _Overflow,
+    box: tuple[float, float, float, float],
+    pymupdf: Any,
+    default_font: Path | str,
+) -> tuple[_Overflow | None, float]:
+    """Print as much of *over* as *box* holds; return what is left and the height used.
+
+    ``(rest, used)``: ``rest`` is what did not fit (``None`` once the overflow is
+    spent), and ``used`` is how much of *box*'s height the text took — where the
+    next thing printed below may start. Every pass prints at least one line, so a
+    caller looping until nothing is left cannot spin.
+    """
+    size = over.item.size
+    if over.words is not None:
+        rest, used = _RunText(over.item, default_font, pymupdf).print(page, box, over.words, size)
+        return (_Overflow(over.item, words=rest) if rest else None), used
+    font_file = str(over.item.font_file or default_font)
+    fontname = _resource_name(font_file)
+    kwargs = {
+        "fontname": fontname,
+        "fontfile": font_file,
+        "fontsize": size,
+        "align": _align_of(over.item, pymupdf),
+        "lineheight": 1.15,
+        "color": over.item.color,
+    }
+    tokens = _words_of(over.text)
+    measurer = _Measurer(pymupdf, page)
+    try:
+        count = _head_that_fits(partial(measurer.fits, box, **kwargs), tokens)
+        if count == 0 and tokens:
+            # Not one word fits the band: it goes down anyway, so the loop makes
+            # progress rather than printing nothing again.
+            count = 1
+        unused = page.insert_textbox(pymupdf.Rect(*box), _rejoin(tokens[:count]), **kwargs)
+    finally:
+        measurer.close()
+    if unused < 0:  # pragma: no cover - the probe and the page disagree
+        page.insert_text(
+            (box[0], box[1] + size),
+            _rejoin(tokens[:count]),
+            fontname=fontname,
+            fontfile=font_file,
+            fontsize=size,
+            color=over.item.color,
+        )
+        # What was drawn up there cannot be measured, so the cursor skips the
+        # whole box rather than risk printing over it.
+        used = box[3] - box[1]
+    else:
+        used = (box[3] - box[1]) - unused
     rest = tokens[count:]
-    return "block", (_Overflow(item, text=_rejoin(rest)) if rest else None)
+    return (_Overflow(over.item, text=_rejoin(rest)) if rest else None), used
 
 
 class _Continuation:
     """The overleaf column shared by one source page's spilling blocks.
 
-    A block that did not fit its box used to insert a whole page to itself, so a
-    source page whose blocks each spilled a line or two left a run of nearly
-    empty pages behind it — one per block; on a 69-page document that ran to 48
-    extra pages. The tails instead share one column: each prints below the one
-    before it, in block order, and a fresh page is inserted only when the column
-    cannot hold one more line. They already followed the source page in that
-    order, so only the pagination changes, not the reading order.
+    This is the fallback, not the ordinary path: a tail normally continues at the
+    top of the next source page (see :func:`_carry_at_top`), which is where a
+    reader expects it. This column is used when there is no next page — the
+    document's last page — or when the page that follows leaves not one line of
+    room above its own bottom (a table over the full column, a full-width figure).
+
+    The tails share one column: each prints below the one before it, in block
+    order, and a fresh page is inserted only when the column cannot hold one more
+    line. They already followed the source page in that order, so only the
+    pagination changes, not the reading order.
     """
 
     def __init__(
@@ -1379,65 +1665,23 @@ class _Continuation:
         together those make progress the contract, so the loop cannot spin.
         """
         added = 0
-        size = over.item.size
-        x0, x1 = over.item.box[0], over.item.box[2]
         bottom = self._height - _BOTTOM_MARGIN
         while True:
-            if self._page is None or bottom - self._y < size * 1.4:
+            if self._page is None or bottom - self._y < over.item.size * _LINE_BAND:
                 self._turn()
                 added += 1
-            box = (x0, self._y, x1, bottom)
-            if over.words is not None:
-                rest, used = _RunText(over.item, self._default_font, self._pymupdf).print(
-                    self._page, box, over.words, size
-                )
-                self._y += used
-                if not rest:
-                    return added
-                over = _Overflow(over.item, words=rest)
-                continue
-            font_file = str(over.item.font_file or self._default_font)
-            fontname = _resource_name(font_file)
-            align = _align_of(over.item, self._pymupdf)
-            tokens = _words_of(over.text)
-            kwargs = {
-                "fontname": fontname,
-                "fontfile": font_file,
-                "fontsize": size,
-                "align": align,
-                "lineheight": 1.15,
-                "color": over.item.color,
-            }
-            measurer = _Measurer(self._pymupdf, self._page)
-            try:
-                count = _head_that_fits(partial(measurer.fits, box, **kwargs), tokens)
-                if count == 0 and tokens:
-                    # Not one word fits the band: it goes down anyway, so the
-                    # loop makes progress rather than printing nothing again.
-                    count = 1
-                unused = self._page.insert_textbox(
-                    self._pymupdf.Rect(*box), _rejoin(tokens[:count]), **kwargs
-                )
-            finally:
-                measurer.close()
-            if unused < 0:  # pragma: no cover - the probe and the page disagree
-                self._page.insert_text(
-                    (box[0], box[1] + size),
-                    _rejoin(tokens[:count]),
-                    fontname=fontname,
-                    fontfile=font_file,
-                    fontsize=size,
-                    color=over.item.color,
-                )
-                # What was drawn up there cannot be measured, so the cursor
-                # skips the whole page rather than risk printing over it.
-                self._y = bottom
-            else:
-                self._y += (bottom - box[1]) - unused
-            rest = tokens[count:]
-            if not rest:
+            x0, _, x1, _ = over.item.box
+            rest, used = _print_overflow(
+                self._page,
+                over,
+                (x0, self._y, x1, bottom),
+                self._pymupdf,
+                self._default_font,
+            )
+            self._y += used
+            if rest is None:
                 return added
-            over = _Overflow(over.item, text=_rejoin(rest))
+            over = rest
 
 
 #: Line advance of the hand-laid-out run path, in multiples of the type size.
@@ -1488,6 +1732,179 @@ def _repair_tounicode(document: Any, page: Any, before: set[int]) -> int:
     return repaired
 
 
+def _covered(
+    rect: tuple[float, float, float, float],
+    redacted: list[tuple[float, float, float, float]],
+) -> bool:
+    """Whether redaction took all of *rect* off the page.
+
+    A source line that no placement covers still prints its English words — the
+    rebuild only erases what it replaces — and a box pushed down must not be
+    laid over them. The rects a placement redacts are the source's own rects
+    (or grown to cover them), so *covered* means: taken away, nothing printed
+    there now.
+    """
+    x0, y0, x1, y1 = rect
+    for ox0, oy0, ox1, oy1 in redacted:
+        if ox0 - 0.75 <= x0 and oy0 - 0.75 <= y0 and ox1 + 0.75 >= x1 and oy1 + 0.75 >= y1:
+            return True
+    return False
+
+
+def _page_anchors(
+    page: Any,
+    page_items: list[_Placement],
+    occupied: list[tuple[float, float, float, float]],
+) -> list[tuple[float, float, float, float]]:
+    """What on this page a pushed-down block may not print over.
+
+    Three kinds of furniture, all fixed:
+
+    * source lines whose text was **not** replaced — a block kept in English,
+      code, a chunk the translation had nothing for — still print there;
+    * the boxes of **table cells**: the grid is the layout, so neither the cells
+      nor anything above them may shift across it;
+    * the page's own **images**.
+
+    ``page_items`` carries every redaction the page took, so what it does not
+    cover is what the page still shows of itself. Vector line art the source
+    drew (figures drawn as paths) is not in this list — the rebuild preserves it
+    as it preserves the images, but cannot see it, which is the long-standing
+    limit of redaction too.
+    """
+    redacted = [rect for item in page_items for rect in item.redact]
+    kept = [tuple(rect) for rect in occupied if not _covered(rect, redacted)]
+    return [*kept, *_fixed_furniture(page, page_items)]
+
+
+def _fixed_furniture(
+    page: Any,
+    page_items: list[_Placement],
+) -> list[tuple[float, float, float, float]]:
+    """What on this page keeps its place whatever the rebuild prints.
+
+    The cells of a table — the grid is the layout — and the page's images. Both
+    are printed where the source put them, so text may neither start under them
+    nor run into them.
+    """
+    cells = [item.source_box for item in page_items if item.kind == "cell" and item.source_box]
+    figures = [tuple(float(value) for value in info["bbox"]) for info in page.get_image_info()]
+    return [*(tuple(rect) for rect in cells), *figures]
+
+
+def _landing(
+    start: float,
+    x0: float,
+    x1: float,
+    size: float,
+    anchors: list[tuple[float, float, float, float]],
+    page_bottom: float,
+) -> tuple[float, float]:
+    """Where a block pushed down may start, and how far it may reach.
+
+    The page is filled top to bottom: *start* is where the block above it
+    ended (or the block's own top, whichever is lower), and the block reaches
+    down to the next fixed thing below it — or to the page's bottom margin when
+    nothing stands in the way. That is what "dồn dòng" buys: the white the
+    source left between its blocks is room for the longer translation, instead
+    of a reason to send its tail to a page of its own.
+
+    What stands in the way is not negotiable (see :func:`_page_anchors`): when
+    one of those boxes begins within the first line's band at *start*, the block
+    is set down below it instead — that is the only way to keep its first line
+    out of the box standing there. Returns ``(start, limit)``; a caller that
+    finds ``limit - start`` shorter than one line has a page with no room left
+    at all, and continues the block overleaf instead of printing.
+
+    Every pass either returns or moves *start* below a fixed box, and a box
+    that has been passed can only be skipped (it then ends above *start*), so
+    the loop walks each anchor at most once.
+    """
+    need = size * _LINE_BAND
+    y = start
+    while True:
+        limit = page_bottom
+        blocker: tuple[float, float, float, float] | None = None
+        for ax0, atop, ax1, abottom in anchors:
+            if ax0 >= x1 - 1 or ax1 <= x0 + 1 or abottom <= y + 1:
+                continue  # another column, or already above
+            reach = atop - _BLOCK_CLEARANCE
+            if reach < y + need:
+                blocker = (ax0, atop, ax1, abottom)
+                break
+            limit = min(limit, reach)
+        if blocker is None:
+            return y, limit
+        y = max(y, blocker[3] + _BLOCK_CLEARANCE)
+
+
+def _carry_at_top(
+    page: Any,
+    pending: list[_Overflow],
+    *,
+    page_index: int,
+    pymupdf: Any,
+    default_font: Path | str,
+    blockers: list[tuple[float, float, float, float]],
+) -> tuple[list[_Overflow], float]:
+    """Print at the top of *page* what the page before could not hold.
+
+    This is what keeps a page break from stranding a line on a page of its own:
+    the tail of the previous page's last block starts at this page's top margin,
+    in block order, and the page's own text begins below it (the caller's
+    ``floor``). The tail is ordinary text of the document and moves this page on
+    exactly as the page's own longer translation would have.
+
+    *blockers* is the page's anchor set (see :func:`_page_anchors`): what the page
+    still shows where the source put it. A tail lands in the first room they leave
+    free, with :func:`_landing`, and one that gets no line at all stays waiting for
+    a page that can take it.
+
+    A tail whose block has its own continuation *on this page* starts where the
+    source continued it, not at the page's top margin: the source's English was
+    cleared there, and the running head above it must stay clear.
+
+    Returns what is still waiting and the y this page's own text may start from —
+    ``_TOP_MARGIN`` when nothing was printed.
+    """
+    cursor = _TOP_MARGIN
+    rest: list[_Overflow] = []
+    for index, over in enumerate(pending):
+        x0, _, x1, _ = over.item.box
+        start_at = cursor
+        resume = over.item.resume
+        if resume is not None and resume[0] == page_index:
+            # The block began on the previous page; its own next-page rect is
+            # where a reader expects the sentence to go on.
+            start_at = max(start_at, resume[1])
+        start, limit = _landing(
+            start_at, x0, x1, over.item.size, blockers, page.rect.height - _BOTTOM_MARGIN
+        )
+        if limit - start < over.item.size * _LINE_BAND:
+            rest.extend(pending[index:])
+            break
+        left, used = _print_overflow(page, over, (x0, start, x1, limit), pymupdf, default_font)
+        cursor = start + used + _BLOCK_CLEARANCE
+        if left is not None:
+            rest.append(left)
+            rest.extend(pending[index + 1 :])
+            break
+    return rest, cursor
+
+
+def _whole_overflow(item: _Placement, font_file: Path | str, pymupdf: Any) -> _Overflow:
+    """The block in full, ready for the overleaf column.
+
+    Used when its page has no room even for the first line: the block prints
+    nothing where it stands (redaction has already taken its source words, and
+    what stands in the way must not be printed over), so all of it continues.
+    """
+    if item.runs is not None:
+        return _Overflow(item, words=_RunText(item, font_file, pymupdf).words)
+    text = _toc_line(item, font_file, pymupdf) if item.toc else item.text
+    return _Overflow(item, text=text)
+
+
 def rebuild_pdf(
     source: str | Path,
     doc: Document,
@@ -1520,9 +1937,14 @@ def rebuild_pdf(
 
     document = pymupdf.open(str(source))
     stats.pages = document.page_count
+    #: Everything each source page carries besides what the rebuild replaces —
+    #: the anchor set is drawn from it (see :func:`_page_anchors`).
+    _, occupied = _page_geometry(doc)
     #: Pages inserted so far. They sit after the source page they continue, so
     #: every page that follows is that many places further down the document.
     shift = 0
+    #: The tails this page could not hold, waiting for the top of the next one.
+    pending: list[_Overflow] = []
     for page_no, page_items in sorted(by_page.items()):
         #: Where the source page stands now. Pages added to continue it go
         #: after, so this index never moves while the document grows.
@@ -1535,8 +1957,6 @@ def rebuild_pdf(
         # The page's own fonts, so the ToUnicode repair below can tell them from
         # the ones our insertion adds.
         fonts_before = _font_xrefs(page)
-        #: The overleaf column this page's spilling blocks share.
-        cont: _Continuation | None = None
         for item in page_items:
             for x0, top, x1, bottom in item.redact:
                 page.add_redact_annot(pymupdf.Rect(x0, top, x1, bottom), fill=None, text=None)
@@ -1547,8 +1967,84 @@ def rebuild_pdf(
             graphics=pymupdf.PDF_REDACT_LINE_ART_NONE,
             text=pymupdf.PDF_REDACT_TEXT_REMOVE,
         )
-        for item in page_items:
-            outcome, over = _insert(page, item, pymupdf, font_file, measurer)
+        #: What the page keeps where it is: a block may be pushed down, but not
+        #: over any of this.
+        anchors = _page_anchors(page, page_items, occupied.get(page_no, []))
+        #: How far down the page the last block printed. Blocks go down in
+        #: document order (top first), so one that ran long pushes the ones
+        #: under it further down instead of losing its tail to an inserted page.
+        floor = 0.0
+        if pending:
+            #: The page before ran past its own bottom: its tail starts here,
+            #: and this page's text begins below it. That is what stops a page
+            #: break from leaving one stranded line on a page of its own.
+            rest, top = _carry_at_top(
+                page,
+                pending,
+                page_index=page_no,
+                pymupdf=pymupdf,
+                default_font=font_file,
+                blockers=anchors,
+            )
+            if top == _TOP_MARGIN and rest:
+                # Not one line of room above what this page keeps in place (a
+                # table at its top, a figure): the tail takes the overleaf page
+                # it would have had, before this one, rather than printing over
+                # the grid.
+                cont = _Continuation(
+                    document,
+                    pymupdf,
+                    font_file,
+                    after=src_index - 1,
+                    width=float(page.rect.width),
+                    height=float(page.rect.height),
+                )
+                added = 0
+                for over in pending:
+                    added += cont.carry(over)
+                shift += added
+                stats.continued += added
+                stats.pages += added
+                src_index += added
+                page = document[src_index]
+                rest = []
+            pending = rest
+            if top != _TOP_MARGIN:
+                floor = top
+        printable = sorted(
+            (item for item in page_items if item.kind != "clear"),
+            key=lambda item: (item.box[1], item.box[0]),
+        )
+        for item in printable:
+            used = 0.0
+            start = item.box[1]
+            if item.kind == "cell":
+                # A cell never moves: the grid the source drew is the layout,
+                # and its box is an anchor for the blocks around it.
+                outcome, over, _cell_used = _insert(page, item, pymupdf, font_file, measurer)
+            else:
+                x0, top, x1, bottom = item.box
+                start, limit = _landing(
+                    max(top, floor),
+                    x0,
+                    x1,
+                    item.size,
+                    anchors,
+                    # The block may reach at least as far down as its own box
+                    # did: a page whose text runs towards its bottom edge would
+                    # otherwise have its last block cut shorter than the source
+                    # set it — the rebuild must not refuse the room the page it
+                    # rebuilds actually used.
+                    max(page.rect.height - _BOTTOM_MARGIN, bottom),
+                )
+                if limit - start < item.size * _LINE_BAND:
+                    # Not one line of room before what stands below (or before
+                    # the page's own margin): the whole block continues rather
+                    # than its first line printing over what is there.
+                    outcome, over = "block", _whole_overflow(item, font_file, pymupdf)
+                else:
+                    item.box = (x0, start, x1, limit)
+                    outcome, over, used = _insert(page, item, pymupdf, font_file, measurer)
             if outcome is None:
                 stats.failures.append(f"page {page_no}: text did not fit")
                 continue
@@ -1558,32 +2054,41 @@ def rebuild_pdf(
                     stats.cells += 1
                 else:
                     stats.cells_kept += 1
+                # Past the cell's own rules, not just its text: the grid's
+                # bottom is where anything below it may start.
+                base = item.source_box or item.box
+                floor = max(floor, base[3] + _BLOCK_CLEARANCE)
+            else:
+                floor = start + used + _BLOCK_CLEARANCE
             if over is None:
                 continue
-            # The block was longer than the box the source set it in: its tail
-            # carries on overleaf, at the same size, below the tails already
-            # there — one shared column, so spilling blocks stack instead of
-            # each claiming its own nearly-empty page.
-            if cont is None:
-                cont = _Continuation(
-                    document,
-                    pymupdf,
-                    font_file,
-                    after=src_index,
-                    width=float(page.rect.width),
-                    height=float(page.rect.height),
-                )
-            added = cont.carry(over)
-            shift += added
-            stats.continued += added
-            stats.pages += added
-            # Inserting pages invalidates the page object; ask for it again —
-            # the source page, which the insertions did not move.
-            page = document[src_index]
+            # The block still had more text than the page could hold, at the
+            # source size: it carries on at the top of the next page, in block
+            # order, and that page's own text starts below it — the break never
+            # leaves a page holding a single stranded line.
+            pending.append(over)
         measurer.close()
         # Copied text is part of the output: repair the map of the fonts we
         # just inserted before the document is written.
         stats.repaired_maps += _repair_tounicode(document, page, fonts_before)
+
+    if pending:
+        # The last page had more than it could hold: the tails still waiting get
+        # pages of their own, appended after the document's last page.
+        last = document[document.page_count - 1]
+        cont = _Continuation(
+            document,
+            pymupdf,
+            font_file,
+            after=document.page_count - 1,
+            width=float(last.rect.width),
+            height=float(last.rect.height),
+        )
+        added = 0
+        for over in pending:
+            added += cont.carry(over)
+        stats.continued += added
+        stats.pages += added
 
     out = Path(out_path)
     out.parent.mkdir(parents=True, exist_ok=True)

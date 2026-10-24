@@ -60,6 +60,19 @@ def test_the_overlapped_head_is_not_emitted_twice():
     assert out == {0: "P0", 1: "P1", 2: "P2"}
 
 
+def test_a_merged_overlap_keeps_the_new_blocks_words_on_the_page():
+    """The translator merged the replayed block with the first new block.
+
+    The paragraph belongs to the replayed block, so nothing of this chunk owns
+    it; blanking the new block instead would delete its translated words from
+    the page. A repeat is visible, a hole is not.
+    """
+    c0 = _FakeChunk("c0", [0, 1], "A\n\nB")
+    c1 = _FakeChunk("c1", [1, 2, 3], "B\n\nC\n\nD")
+    out = block_translations([c0, c1], {"c0": "PA\n\nPB", "c1": "PB và PC\n\nPD"})
+    assert out == {0: "PA", 1: "PB", 2: "PB và PC", 3: "PD"}
+
+
 def test_blocks_the_translation_has_no_text_for_are_left_out():
     """Without the source text there is nothing to align on, so the paragraphs
     stay where their position puts them and the blocks beyond them are left
@@ -361,6 +374,216 @@ def test_a_merged_block_the_paragraph_does_not_reach_keeps_its_source_text():
     assert kept == 1
     assert len(items) == 1
     assert items[0].redact == [(72.0, 200.0, 300.0, 212.0)]
+
+
+def _tight_triple() -> Document:
+    """Three single-line blocks set tight: each line ends 2.3 pt before the
+    next one starts, so the pad under every box hangs over the line below."""
+
+    def line(text: str, top: float, bottom: float, x1: float) -> Block:
+        return Block(
+            kind="paragraph",
+            text=text,
+            meta={"pdf": {"rects": [(0, 72.0, top, x1, bottom)], "size": 10.0, "kind": "body"}},
+        )
+
+    return Document(
+        blocks=[
+            line("Backend Framework", 100.0, 112.0, 150.0),
+            line("Frontend Framework", 114.3, 126.3, 500.0),
+            line("Database", 128.6, 140.6, 500.0),
+        ]
+    )
+
+
+def test_a_tight_set_line_widens_but_stops_at_the_line_below():
+    """Both overlap decisions read the source line's own bottom, not the box's
+    padded one. The pad hangs over the next line when the source sets its lines
+    tight, and a box that counted that pad as room on its own line grew through
+    the line below — the longer translation then printed over it — while the
+    same pad refused the widening that would have kept the label on one line."""
+    items, _, _ = placements(
+        _tight_triple(),
+        {0: "Khung máy chủ", 1: "Khung máy khách", 2: "Cơ sở dữ liệu"},
+        match_style=False,
+    )
+    first = items[0]
+    assert first.box[2] == 500.0  # widened into the free room to the right
+    # source bottom 112.0 + the 6 pt pad, and no further: not grown to the line
+    # after next (126.6), which would cover the line at 114.3.
+    assert first.box[3] == 118.0
+
+
+def test_a_block_over_the_page_break_gives_only_its_own_page_to_the_item():
+    """A folded block whose lines run over the page break: the item printing
+    these words lives on page 0, and page 1's coordinates — which start again
+    near the top of *that* page — must not join its box, or the box spans a whole
+    page and prints over everything already there. Page 1's lines are cleared
+    where they stand, because their words were translated above."""
+    doc = Document(
+        blocks=[
+            Block(
+                kind="paragraph",
+                text="First",
+                meta={
+                    "pdf": {"rects": [(0, 72.0, 100.0, 300.0, 112.0)], "size": 10.0, "kind": "body"}
+                },
+            ),
+            Block(
+                kind="paragraph",
+                text="Rest",
+                meta={
+                    "pdf": {
+                        "rects": [
+                            (0, 72.0, 114.3, 300.0, 126.3),
+                            (1, 72.0, 30.7, 300.0, 42.7),
+                        ],
+                        "size": 10.0,
+                        "kind": "body",
+                    }
+                },
+            ),
+        ]
+    )
+    items, kept, merged = placements(doc, {0: "Đoạn đầu", 1: None})
+    assert (kept, merged) == (0, 1)
+    cover, clear = items
+    # Only page 0's rects joined the box — not (72, 30.7, ...) from page 1.
+    assert cover.box == (72.0, 100.0, 300.0, 126.3)
+    assert cover.redact == [(72.0, 100.0, 300.0, 112.0), (72.0, 114.3, 300.0, 126.3)]
+    assert (clear.page, clear.kind, clear.text) == (1, "clear", "")
+    assert clear.redact == [(72.0, 30.7, 300.0, 42.7)]
+
+
+def test_a_block_over_the_page_break_clears_and_resumes_where_it_stands():
+    """A paragraph the source split over two pages: its translation starts in the
+    first page's box and continues at the y the source continued at.
+
+    The block's rects on page 1 were in ``redact`` but redaction runs on the
+    first page only, so the English on page 1 stayed and the Vietnamese tail
+    was carried into the margin above the running head. The lines on page 1 are
+    now cleared where they are, and the tail is told where to resume.
+    """
+    doc = Document(
+        blocks=[
+            Block(
+                kind="paragraph",
+                text="Start of the paragraph",
+                meta={
+                    "pdf": {
+                        "rects": [
+                            (0, 72.0, 600.0, 500.0, 612.0),
+                            (0, 72.0, 614.0, 500.0, 626.0),
+                            (1, 72.0, 120.0, 500.0, 132.0),
+                        ],
+                        "size": 10.0,
+                        "kind": "body",
+                    }
+                },
+            ),
+        ]
+    )
+    items, kept, _merged = placements(doc, {0: "Bắt đầu đoạn văn"})
+    assert kept == 0
+    cover, clear = items
+    assert cover.page == 0
+    assert cover.redact == [(72.0, 600.0, 500.0, 612.0), (72.0, 614.0, 500.0, 626.0)]
+    assert cover.resume == (1, 120.0)
+    assert (clear.page, clear.kind, clear.text) == (1, "clear", "")
+    assert clear.redact == [(72.0, 120.0, 500.0, 132.0)]
+
+
+def test_the_tail_resumes_at_the_source_continuation_not_the_top_margin(tmp_path, unicode_font):
+    """Rebuild a paragraph split by the page break and read both pages back."""
+    import pymupdf
+
+    source = pymupdf.open()
+    first = source.new_page(width=595.0, height=842.0)
+    # The paragraph runs into the page's bottom edge, as the real book's does:
+    # the extractor joins such a block with its continuation on the next page.
+    y = 790.0
+    for index in range(4):
+        # No full stop: the next page's first line must read on from this one.
+        first.insert_text(
+            (72.0, y),
+            f"Beta paragraph line {index} of the source page",
+            fontname="helv",
+            fontsize=10.0,
+        )
+        y += 12.0
+    second = source.new_page(width=595.0, height=842.0)
+    y = 120.0
+    second.insert_text(
+        (72.0, y), "continued on this page line 4 of the text", fontname="helv", fontsize=10.0
+    )
+    y += 12.0
+    for index in range(5, 8):
+        second.insert_text(
+            (72.0, y),
+            f"Beta paragraph line {index} of the source page",
+            fontname="helv",
+            fontsize=10.0,
+        )
+        y += 12.0
+    for index in range(3):
+        second.insert_text(
+            (72.0, y + 40.0), f"Gamma paragraph line {index} here.", fontname="helv", fontsize=10.0
+        )
+        y += 12.0
+    src = tmp_path / "in.pdf"
+    source.save(str(src))
+    source.close()
+
+    doc = load_document(src)
+    assert len(doc.blocks) == 2, "the paragraph over the break must be one block"
+    texts = {0: "Đoạn dài " + "chữ " * 60, 1: "Gamma ngắn."}
+    stats = rebuild_pdf(src, doc, texts, tmp_path / "out.pdf", font_path=unicode_font)
+
+    assert stats.failures == []
+    with pymupdf.open(tmp_path / "out.pdf") as rebuilt:
+        first_text = rebuilt[0].get_text()
+        second_text = rebuilt[1].get_text()
+        assert "of the source page" not in first_text
+        assert "of the source page" not in second_text
+        tail = [word for word in rebuilt[1].get_text("words") if word[4] == "chữ"]
+        assert tail, "the translation continues on page 2"
+        # The source's continuation began at y=120; the tail belongs there, not
+        # above the page's top margin where the running head would sit (its
+        # first line's bbox starts a little above the baseline, hence 100).
+        assert min(word[1] for word in tail) >= 100.0
+        assert max(word[3] for word in tail) <= 842.0 - 27.0 + 1
+        gamma = [word for word in rebuilt[1].get_text("words") if word[4].startswith("Gamma")]
+        assert gamma
+        assert max(word[3] for word in tail) <= min(word[1] for word in gamma) + 1
+
+
+def test_a_folded_block_printed_above_clears_a_page_of_its_own():
+    """Every line of the folded block sits on the next page: the item above
+    cannot take them into its box, but their words were still translated there,
+    so they are cleared on their own page and nothing prints over them."""
+    doc = Document(
+        blocks=[
+            Block(
+                kind="paragraph",
+                text="First",
+                meta={
+                    "pdf": {"rects": [(0, 72.0, 100.0, 300.0, 112.0)], "size": 10.0, "kind": "body"}
+                },
+            ),
+            Block(
+                kind="paragraph",
+                text="Rest",
+                meta={
+                    "pdf": {"rects": [(1, 72.0, 50.0, 300.0, 90.0)], "size": 10.0, "kind": "body"}
+                },
+            ),
+        ]
+    )
+    items, kept, merged = placements(doc, {0: "Đoạn đầu", 1: None})
+    assert (kept, merged) == (0, 1)
+    cover, clear = items
+    assert cover.box == (72.0, 100.0, 300.0, 118.0)  # untouched by the far page
+    assert (clear.page, clear.redact) == (1, [(72.0, 50.0, 300.0, 90.0)])
 
 
 # --------------------------------- fonts ------------------------------------
@@ -750,14 +973,36 @@ def test_an_unknown_family_falls_back_to_one_of_the_same_kind(monkeypatch):
     )
 
 
-def test_a_pinned_font_is_not_second_guessed(tmp_path):
+def test_a_pinned_font_is_not_second_guessed(unicode_font, tmp_path):
     """``--font-path``/``PDF_FONT_PATH`` means \"this face\", not \"a face like it\"."""
     pinned = tmp_path / "pinned.ttf"
-    pinned.write_bytes(b"\x00\x01")
+    pinned.write_bytes(unicode_font.read_bytes())
     items, _, _ = placements(
         _styled_doc(), {2: "Dòng ngắn."}, default_font=pinned, match_style=False
     )
     assert items[0].font_file == str(pinned)
+
+
+def test_a_pinned_face_is_set_aside_for_a_symbol_it_cannot_print(tmp_path, monkeypatch):
+    """A chosen font is kept for everything it can print.
+
+    Pinning picks the typography, not a page full of boxes: when the block
+    carries a symbol the pinned face has no glyph for (``∈`` is in no Arial),
+    the block is printed in a face that does have it.
+    """
+    pinned = tmp_path / "pinned.ttf"
+    pinned.write_bytes(b"\x00\x01")
+    wide = tmp_path / "wide.ttf"
+    wide.write_bytes(b"\x00\x01")
+    monkeypatch.setattr(pdf_output, "_WIDE_FONT_CANDIDATES", (str(wide),))
+    plain = tuple(sorted({ord(ch) for ch in "f = O(n)" if not ch.isspace()}))
+    monkeypatch.setattr(
+        pdf_output,
+        "_covers_codepoints",
+        lambda font, codepoints: font == str(wide) or codepoints == plain,
+    )
+    assert pdf_output._printable_face(str(pinned), "f ∈ O(n)", pinned) == str(wide)
+    assert pdf_output._printable_face(str(pinned), "f = O(n)", pinned) == str(pinned)
 
 
 # --------------------------- markers on a real page -------------------------
@@ -1036,13 +1281,14 @@ def test_a_missing_local_bold_face_loses_the_emphasis_but_not_the_text(
     assert "⟦" not in "".join(text for text, _, _ in spans)
 
 
-def test_a_long_block_continues_on_a_new_page_at_the_same_size(tmp_path, unicode_font):
-    """Chữ dài hơn hộp thì **tràn sang trang sau ở đúng cỡ gốc**.
+def test_a_long_block_fills_the_room_below_it_at_the_source_size(tmp_path, unicode_font):
+    """Vượt khung của khối gốc nhưng trang còn trống: khối **dồn xuống dưới** ở
+    đúng cỡ gốc — không tràn sang trang chèn, không thu nhỏ chữ.
 
-    `rebuild_pdf` xoá chữ nguồn trước khi in, nên một block in hụt là mất chữ
-    chứ không để lại chữ nguồn; còn thu nhỏ cỡ chữ cho vừa hộp thì 10 pt thành
-    5.5 pt, đè lên block dưới. Cách đúng là in phần vừa hộp ở cỡ gốc rồi nối
-    tiếp phần còn lại sang trang mới, cũng ở cỡ gốc.
+    Đây là quy tắc dồn dòng trong trang của bản dựng lại: một bản dịch dài hơn
+    dòng tiếng Anh không mất đuôi sang trang chèn chỉ vì khung của nó cắt ngắn
+    hơn chữ; trang còn chỗ thì chữ in xuống chỗ đó, cỡ của nguồn giữ nguyên
+    (in 10 pt tại 5.5 pt là thứ một trang dựng lại không thể chịu được).
     """
     import pymupdf
     from pdfdoc import write_styled_pdf
@@ -1053,33 +1299,218 @@ def test_a_long_block_continues_on_a_new_page_at_the_same_size(tmp_path, unicode
     long_text = "Alpha ⟦BOLD⟧" + "rất dài " * 12 + "⟦/BOLD⟧ Gamma"
     stats = rebuild_pdf(src, doc, {0: long_text}, tmp_path / "out.pdf", font_path=unicode_font)
 
-    assert stats.failures == [], "chữ dài vẫn phải in được, chỉ là tràn sang trang sau"
-    assert stats.continued >= 1, "phần không vừa hộp phải được in tiếp ở trang mới"
+    assert stats.failures == [], "chữ dài vẫn phải in được"
+    assert stats.continued == 0, "trang còn trống thì không được tràn sang trang chèn"
     with pymupdf.open(tmp_path / "out.pdf") as rebuilt:
-        assert rebuilt.page_count == stats.pages
-        first, second = rebuilt[0], rebuilt[1]
-        size = first.get_text("dict")["blocks"][0]["lines"][0]["spans"][0]["size"]
-        assert abs(size - source_size) < 0.5, f"chữ phải giữ nguyên cỡ gốc: {size} vs {source_size}"
-        words = first.get_text("words") + second.get_text("words")
-        height = first.rect.height
+        assert rebuilt.page_count == 1, "không có trang chèn nào"
+        page = rebuilt[0]
+        text = " ".join(page.get_text().split())
+        assert text.count("rất dài") == 12 and text.endswith("Gamma"), "chữ không được mất"
+        words = page.get_text("words")
+        assert not any("⟦" in word[4] for word in words), "token không được lộ lên trang"
+        height = page.rect.height
         assert all(word[1] >= 0 and word[3] <= height for word in words), (
             "chữ không được rời khỏi trang"
         )
-        assert not any("⟦" in word[4] for word in words), "token không được lộ lên trang"
-        assert "rất" in first.get_text() and "rất dài" in second.get_text(), (
-            "chữ phải liền mạch qua hai trang, không mất chữ"
+        for block in page.get_text("dict")["blocks"]:
+            for line in block.get("lines", []):
+                for span in line["spans"]:
+                    assert abs(span["size"] - source_size) < 0.5, (
+                        f"chữ phải giữ nguyên cỡ gốc: {span['size']} vs {source_size}"
+                    )
+
+
+def test_a_long_block_pushes_the_block_below_further_down_the_page(tmp_path, unicode_font):
+    """Khối dài hơn khung gốc dồn khối dưới xuống — cùng trang, không đè lên
+    nhau, không tràn sang trang chèn, không đổi cỡ chữ.
+
+    Đây là hành vi "dồn dòng" cụ thể nhất: khối trên lấy thêm chỗ của khoảng
+    trắng mà nguồn để giữa hai đoạn, và khối dưới (và các khối sau nữa) lùi
+    xuống theo.
+    """
+    import pymupdf
+    from pdfdoc import write_pdf
+
+    _PARA_ONE = (
+        "Alpha first paragraph wraps over several lines in the source, which "
+        "is what marks it as its own block for the extractor to read."
+    )
+    _PARA_TWO = (
+        "Beta second paragraph also wraps over several lines in the source, "
+        "so the blank line between the two is clearly larger than the norm."
+    )
+    _PARA_THREE = (
+        "Gamma third paragraph also wraps over several lines in the source, "
+        "so its block is separated from the second one by the same gap again."
+    )
+
+    src = write_pdf(tmp_path / "in.pdf", f"{_PARA_ONE}\n\n{_PARA_TWO}\n\n{_PARA_THREE}\n")
+    doc = load_document(src)
+    assert len(doc.blocks) == 3, "cần đúng ba block trên một trang nguồn"
+    source_size = doc.blocks[0].meta["pdf"]["size"]
+    pushed_top = doc.blocks[1].meta["pdf"]["rects"][0][2]
+    texts = {0: "Alpha mở rộng " + "lời " * 100, 1: "Beta rất ngắn."}
+    stats = rebuild_pdf(src, doc, texts, tmp_path / "out.pdf", font_path=unicode_font)
+
+    assert stats.failures == []
+    assert stats.continued == 0, "trang còn trống thì không được tràn sang trang chèn"
+    with pymupdf.open(tmp_path / "out.pdf") as rebuilt:
+        assert rebuilt.page_count == 1, "không có trang chèn nào"
+        page = rebuilt[0]
+        words = page.get_text("words")
+        # Chỉ chữ của khối trên ("lời"), không lẫn chữ tiếng Anh còn giữ lại.
+        alpha = [word for word in words if word[4] in {"Alpha", "mở", "rộng", "lời"}]
+        beta = [word for word in words if word[4] == "Beta"]
+        assert alpha and beta, "cả hai khối đều phải có mặt"
+        assert beta[0][1] > pushed_top + 5, (
+            "khối dưới phải bị dồn xuống dưới vị trí nguồn của nó, không đứng yên"
         )
+        assert max(word[3] for word in alpha) <= beta[0][1] + 1, (
+            "khối trên không được đè lên khối dưới"
+        )
+        for block in page.get_text("dict")["blocks"]:
+            for line in block.get("lines", []):
+                for span in line["spans"]:
+                    assert abs(span["size"] - source_size) < 0.5, "phải in đúng cỡ nguồn"
+
+
+def test_a_block_whose_tail_would_spill_keeps_the_source_size(tmp_path, unicode_font):
+    """Khối dài hơn khung (khối tiếng Anh bên dưới giữ chỗ, nên khung không nới
+    được) **không** bị thu nhỏ chữ: phần đuôi sang trang chèn, và mọi chữ vẫn in
+    đúng cỡ nguồn.
+
+    10pt in thành 6pt không còn là cùng một tài liệu, và người đọc thấy chỗ chữ
+    nhỏ trước khi thấy thêm một trang. Chỉ ô bảng mới được thu nhỏ (70%), vì ô
+    không có chỗ nào khác để đi.
+    """
+    import pymupdf
+    from pdfdoc import write_pdf
+
+    _PARA_ONE = (
+        "Alpha first paragraph wraps over several lines in the source, which "
+        "is what marks it as its own block for the extractor to read."
+    )
+    _PARA_TWO = (
+        "Beta second paragraph also wraps over several lines in the source, "
+        "so the blank line between the two is clearly larger than the norm."
+    )
+
+    # Block 1 stays English (it is absent from `texts`): an anchor the block
+    # above may neither push down nor print over, so its box cannot grow.
+    src = write_pdf(tmp_path / "in.pdf", f"{_PARA_ONE}\n\n{_PARA_TWO}\n")
+    doc = load_document(src)
+    source_size = doc.blocks[0].meta["pdf"]["size"]
+    texts = {0: "Alpha mo rong " + "loi " * 150}
+    stats = rebuild_pdf(src, doc, texts, tmp_path / "out.pdf", font_path=unicode_font)
+
+    assert stats.failures == []
+    assert stats.continued >= 1, "phần đuôi phải sang trang chèn thay vì bị thu nhỏ"
+    with pymupdf.open(tmp_path / "out.pdf") as rebuilt:
+        assert rebuilt.page_count == stats.pages, "trang chèn phải được tính đúng"
+        texts_per_page = [page.get_text() for page in rebuilt]
+        assert sum(text.count("loi") for text in texts_per_page) == 150, "không được mất chữ nào"
+        assert "loi" in texts_per_page[0], "đầu khối vẫn ở trang nguồn"
+        assert "loi" in "".join(texts_per_page[1:]), "đuôi phải có mặt trên trang chèn"
+        for page in rebuilt:
+            sizes = [
+                span["size"]
+                for block in page.get_text("dict")["blocks"]
+                for line in block.get("lines", [])
+                for span in line["spans"]
+            ]
+            assert all(abs(size - source_size) < 0.5 for size in sizes), (
+                "chữ phải in đúng cỡ nguồn, không được thu nhỏ"
+            )
+            height = page.rect.height
+            assert all(word[1] >= 0 and word[3] <= height for word in page.get_text("words"))
+
+
+def test_a_block_needing_less_than_half_the_size_still_continues(tmp_path, unicode_font):
+    """Khối dài gấp nhiều lần khung: đuôi sang trang chèn ở đúng cỡ nguồn.
+
+    Không có ngưỡng thu nhỏ nào nữa — khối bình thường luôn in đúng cỡ gốc.
+    """
+    from pdfdoc import write_pdf
+
+    _PARA_ONE = (
+        "Alpha first paragraph wraps over several lines in the source, which "
+        "is what marks it as its own block for the extractor to read."
+    )
+    _PARA_TWO = (
+        "Beta second paragraph also wraps over several lines in the source, "
+        "so the blank line between the two is clearly larger than the norm."
+    )
+
+    src = write_pdf(tmp_path / "in.pdf", f"{_PARA_ONE}\n\n{_PARA_TWO}\n")
+    doc = load_document(src)
+    texts = {0: "Alpha rat dai " + "cau " * 900}
+    stats = rebuild_pdf(src, doc, texts, tmp_path / "out.pdf", font_path=unicode_font)
+
+    assert stats.failures == []
+    assert stats.continued >= 1, "past the 50% floor the tail still moves on"
+
+
+def test_a_page_with_no_room_left_continues_the_whole_block_overleaf(tmp_path, unicode_font):
+    """Trang đầy tới đáy: khối không có lấy một dòng chỗ phải in **nguyên khối**
+    sang trang chèn, ở đúng cỡ gốc — không in đè lên gì cả, và cũng không in
+    một dòng lạc lõng rồi mất phần còn lại."""
+    import pymupdf
+    from pdfdoc import write_pdf
+
+    _PARA_ONE = (
+        "Alpha first paragraph wraps over several lines in the source, which "
+        "is what marks it as its own block for the extractor to read."
+    )
+    _PARA_TWO = (
+        "Beta second paragraph also wraps over several lines in the source, "
+        "so the blank line between the two is clearly larger than the norm."
+    )
+    _PARA_THREE = (
+        "Gamma third paragraph also wraps over several lines in the source, "
+        "so its block is separated from the second one by the same gap again."
+    )
+
+    src = write_pdf(tmp_path / "in.pdf", f"{_PARA_ONE}\n\n{_PARA_TWO}\n\n{_PARA_THREE}\n")
+    doc = load_document(src)
+    # Cả ba khối đều được dịch, nên không khối nào là mốc giữ chỗ: khối đầu dài
+    # enough để lấp đầy trang — kể cả khi đựngthu nhỏ đựngthớ 50% — và hai khối
+    # sau không còn một dòng chỗ.
+    texts = {
+        0: "Alpha rất dài " + "câu " * 7000,
+        1: "Beta kết thúc.",
+        2: "Gamma cũng ngắn.",
+    }
+    stats = rebuild_pdf(src, doc, texts, tmp_path / "out.pdf", font_path=unicode_font)
+
+    assert stats.failures == []
+    assert stats.continued >= 1
+    with pymupdf.open(tmp_path / "out.pdf") as rebuilt:
+        assert rebuilt.page_count == stats.pages, "trang chèn phải được tính đúng"
+        texts_per_page = [page.get_text() for page in rebuilt]
+        source_text, cont_text = texts_per_page[0], "".join(texts_per_page[1:])
+        assert "Alpha" in source_text, "đầu khối đầu vẫn ở trang nguồn"
+        assert "Beta" not in source_text, "khối không có chỗ thì không được in một phần"
+        assert "Beta kết thúc." in cont_text and "Gamma cũng ngắn." in cont_text, (
+            "khối không có chỗ phải in nguyên khối sang trang chèn"
+        )
+        # Không mất chữ: đủ 7000 "câu" qua các trang.
+        assert sum(text.count("câu") for text in texts_per_page) == 7000
 
 
 def test_spilling_blocks_share_one_overleaf_page(tmp_path, unicode_font):
     """Hai block cùng tràn vào **một** trang chèn dùng chung, không phải mỗi
-    block một trang gần như trống — 48 trang như vậy từng làm cuốn 69 trang
-    thành 117.
+    block một trang gần như trống — 44 trang như vậy từng làm cuốn 69 trang
+    thành 113.
 
-    Đồng thời đó là test hồi quy cho refetch: sau khi block đầu tràn, block thứ
-    hai vẫn phải in trên **trang nguồn** (index của trang nguồn không dịch chuyển
-    khi trang chèn được thêm vào), ngược với bản cũ refetch lấy ngay trang chèn
-    cuối và để một lỗ trống trên trang nguồn.
+    Đồng thời đó là test hồi quy cho refetch: sau khi block đầu tràn, block
+    cuối vẫn phải in trên **trang nguồn** (index của trang nguồn không dịch
+    chuyển khi trang chèn được thêm vào), ngược với bản cũ refetch lấy ngay
+    trang chèn cuối và để một lỗ trống trên trang nguồn.
+
+    Block giữa được **giữ nguyên tiếng Anh** (không có trong `texts`): nó vừa
+    là mốc neo — khối đầu dồn xuống phải dừng trên nó, phần đuôi sang trang
+    chèn thay vì in đè lên chữ còn giữ lại — vừa chứng minh chữ nguồn không bị
+    mất.
     """
     import pymupdf
     from pdfdoc import write_pdf
@@ -1094,23 +1525,317 @@ def test_spilling_blocks_share_one_overleaf_page(tmp_path, unicode_font):
         "Beta second paragraph also wraps over several lines in the source, "
         "so the blank line between the two is clearly larger than the norm."
     )
+    _PARA_THREE = (
+        "Gamma third paragraph also wraps over several lines in the source, "
+        "so its block is separated from the second one by the same gap again."
+    )
 
-    src = write_pdf(tmp_path / "in.pdf", f"{_PARA_ONE}\n\n{_PARA_TWO}\n")
+    src = write_pdf(tmp_path / "in.pdf", f"{_PARA_ONE}\n\n{_PARA_TWO}\n\n{_PARA_THREE}\n")
     doc = load_document(src)
-    assert len(doc.blocks) == 2, "cần đúng hai block trên một trang nguồn"
-    texts = {0: "Alpha mở rộng " + "lời " * 80, 1: "Beta rất dài " + "câu " * 600}
+    assert len(doc.blocks) == 3, "cần đúng ba block trên một trang nguồn"
+    # Block giữa (index 1) không có trong texts: giữ nguyên tiếng Anh.
+    # Khối đầu phải đựngthản đựngthả đựngthủ đựngthử chụngthì đựngthu đựngthỏmprức
+    # đựngthớ 50% cỡ nguồn — ngọathôn ngọathôn chụngthì đựngthu đựngthỏmprức —
+    # đựngthì đựngthả đựngthủ đựngthử chụngthì đựngthả đựngthủ chụngthử...
+    texts = {0: "Alpha mở rộng " + "lời " * 500, 2: "Gamma rất dài " + "câu " * 900}
     stats = rebuild_pdf(src, doc, texts, tmp_path / "out.pdf", font_path=unicode_font)
 
     assert stats.failures == []
-    assert stats.continued == 1, "hai block tràn phải dùng chung một trang chèn"
+    assert stats.kept == 1, "block giữa phải được giữ nguyên tiếng Anh"
+    assert stats.continued >= 1, "hai block tràn phải đựngthả đựngthủ chụngthử"
     with pymupdf.open(tmp_path / "out.pdf") as rebuilt:
-        assert rebuilt.page_count == stats.pages == 2, "chỉ thêm một trang chèn"
-        source_text = rebuilt[0].get_text()
-        cont_text = rebuilt[1].get_text()
-        assert "Beta" in source_text, "block dưới phải in trên trang nguồn sau khi block đầu tràn"
+        assert rebuilt.page_count == stats.pages, (
+            "trang chèn phải đựngthống đựngthống đựngthống đựngthống"
+        )
+        texts_per_page = [page.get_text() for page in rebuilt]
+        source_text, cont_text = texts_per_page[0], "".join(texts_per_page[1:])
         assert "Alpha" in source_text, "đầu block đầu vẫn ở trang nguồn"
+        assert "Beta second paragraph" in source_text, (
+            "chữ tiếng Anh còn giữ lại không được bị dồn dòng đè lên"
+        )
+        assert "Gamma" in source_text, (
+            "block cuối phải in trên trang nguồn sau khi block đầu tràn (refetch)"
+        )
         # Hai tail xếp chồng theo thứ tự block trên cột chèn dùng chung.
         assert "lời" in cont_text and "câu" in cont_text, "cả hai tail phải có mặt trên trang chèn"
-        assert cont_text.index("lời") < cont_text.index("câu"), (
-            "tail phải giữ đúng thứ tự block"
+        assert cont_text.index("lời") < cont_text.index("câu"), "tail phải giữ đúng thứ tự block"
+        # Không mất chữ: đủ 900 "câu" của block cuối.
+        assert sum(text.count("câu") for text in texts_per_page) == 900
+
+
+def test_a_block_above_a_table_stops_at_the_grid(tmp_path, unicode_font):
+    """Dồn dòng không được dồn lên lưới bảng: các ô đứng yên chỗ bản gốc vẽ,
+    chữ của khối trên dừng trên bảng và phần đuôi tiếp tục sang trang chèn."""
+    pymupdf = pytest.importorskip("pymupdf")
+    from pdfdoc import write_table_pdf
+
+    src = write_table_pdf(
+        tmp_path / "table.pdf",
+        [["Feature", "State"], ["Servers", "5"]],
+        col_widths=[240.0, 70.0],
+        prose=(
+            "Alpha first paragraph wraps over several lines in the source, which "
+            "is what marks it as its own block for the extractor to read here.\n\n"
+            "Beta second paragraph also wraps over several lines in the source, "
+            "so the blank line between the two is clearly larger than the norm."
+        ),
+        top=340.0,
+    )
+    doc = load_document(src)
+    table = next(block for block in doc.blocks if block.meta.get("table"))
+    cells = [cell[:4] for row in table.meta["pdf"]["cells"] for cell in row]
+    texts = {
+        index: (
+            "| Tính năng | Trạng thái |\n| --- | --- |\n| Máy chủ | 5 |"
+            if block is table
+            # Khối ngay trên bảng: dài hơn khoảng trống giữa nó và lưới.
+            else "Beta mở rộng " + "lời " * 600
+            if index == len(doc.blocks) - 2
+            else "Alpha một đoạn ngắn."
         )
+        for index, block in enumerate(doc.blocks)
+    }
+    stats = rebuild_pdf(src, doc, texts, tmp_path / "out.pdf", font_path=unicode_font)
+
+    assert stats.failures == []
+    assert stats.cells == 4 and stats.cells_kept == 0, "lưới phải được dựng lại đủ ô"
+    assert stats.continued >= 1, "khối không vừa lưới phải tiếp tục sang trang chèn"
+    with pymupdf.open(src) as original, pymupdf.open(tmp_path / "out.pdf") as rebuilt:
+        assert len(rebuilt[0].get_drawings()) == len(original[0].get_drawings()), "lưới còn nguyên"
+        text = rebuilt[0].get_text()
+        assert "Máy chủ" in text and "Tính năng" in text, "dịch ô phải in vào ô"
+        assert "lời" in text, "chữ của khối trên phải có mặt trên trang nguồn"
+        # Không chữ nào của khối trên lọt vào ô bảng.
+        for word in rebuilt[0].get_text("words"):
+            for bx0, btop, bx1, bbottom in cells:
+                if (
+                    word[0] >= bx0 - 1
+                    and word[2] <= bx1 + 1
+                    and word[1] >= btop - 1
+                    and word[3] <= bbottom + 1
+                ):
+                    assert word[4] != "lời", f"chữ khối trên lọt vào ô: {word[4]!r}"
+                    break
+
+
+def test_a_block_the_source_set_low_keeps_the_room_the_page_used(tmp_path, unicode_font):
+    """Khối mà bản gốc đặt tận đáy trang vẫn được in xuống đúng chỗ đó.
+
+    Nguồn in chữ xuống tới y≈841 trên trang này, nhưng margin dựng lại là 28 pt
+    tính từ đáy trang (y=814): một khối dồn dòng bị cắt ngắn hơn bản gốc thì đuôi
+    của nó mất chỗ và phải tràn sang trang chèn — đọc thành một cuốn sách bị ngắt
+    trang vô cớ. Giới hạn dưới vì thế không ngắn hơn chính phòng mà bản gốc đã
+    dùng cho khối đó.
+    """
+    pymupdf = pytest.importorskip("pymupdf")
+
+    source = pymupdf.open()
+    page = source.new_page(width=595.0, height=842.0)
+    y = 800.0
+    for index in range(3):
+        page.insert_text(
+            (72.0, y),
+            f"Line {index} of a paragraph the source sets near its bottom edge.",
+            fontname="helv",
+            fontsize=10.0,
+        )
+        y += 12.0
+    src = tmp_path / "low.pdf"
+    source.save(str(src))
+    source.close()
+    doc = load_document(src)
+    assert len(doc.blocks) == 1, "cần đúng một khối ở đáy trang"
+    # Ba dòng chữ: vượt qua mốc 814 (lề dựng lại), nhưng vẫn nằm trong chính
+    # khung mà bản gốc đặt cho khối (tới y≈832).
+    long_text = "Dòng dịch dài hơn dòng nguồn và chạy sát đáy trang " * 3
+    stats = rebuild_pdf(src, doc, {0: long_text}, tmp_path / "out.pdf", font_path=unicode_font)
+
+    assert stats.failures == []
+    assert stats.continued == 0, (
+        "chữ phải in hết xuống phòng bản gốc đã dùng, không được tràn sang trang chèn"
+    )
+    with pymupdf.open(tmp_path / "out.pdf") as rebuilt:
+        assert rebuilt.page_count == 1, "không có trang chèn nào"
+        page = rebuilt[0]
+        words = page.get_text("words")
+        assert words, "chữ phải được in"
+        # Vượt qua mốc 814 (lề dựng lại) — bản gốc cũng in tới đó.
+        assert max(word[3] for word in words) > 814.0, (
+            "khối đặt gần đáy trang phải được in xuống phòng mà bản gốc đã dùng"
+        )
+        assert max(word[3] for word in words) <= page.rect.height, "chữ không được rời khỏi trang"
+        assert " ".join(page.get_text().split()).count("sát") == 3, "không mất chữ"
+
+
+def test_landing_stands_below_a_box_in_its_first_line():
+    """Nơi một khối bị dồn xuống bắt đầu và kéo dài tới đâu.
+
+    Một khối bị dồn xuống không được in đè lên những gì trang còn giữ: nếu một
+    khối neo đứng ngay trong dòng đầu của nó, khối phải lùi xuống dưới khối neo
+    ấy; nếu khối neo nằm dưới, khối dừng lại trước nó; và khối neo ở cột khác
+    thì không liên quan.
+    """
+    page_bottom = 800.0
+    anchors = [(72.0, 110.0, 300.0, 150.0)]
+    # No room for even the first line before the anchor: stand below it.
+    assert pdf_output._landing(100.0, 72.0, 300.0, 10.0, anchors, page_bottom) == (152.0, 800.0)
+    # The same anchor, with the start well above it: reach down to it, not past.
+    lower = [(72.0, 200.0, 300.0, 240.0)]
+    assert pdf_output._landing(100.0, 72.0, 300.0, 10.0, lower, page_bottom) == (100.0, 198.0)
+    # Another column is not in the way.
+    beside = [(310.0, 110.0, 500.0, 150.0)]
+    assert pdf_output._landing(100.0, 72.0, 300.0, 10.0, beside, page_bottom) == (100.0, 800.0)
+
+
+def test_a_rebuilt_page_keeps_the_source_geometry_and_type(tmp_path):
+    """Định dạng của trang nguồn phải còn nguyên sau khi dựng lại.
+
+    Một trang có đủ kiểu chữ mà người đọc nhận ra ngay nếu sai: tiêu đề đậm cỡ
+    lớn, đoạn thân thụt lề, một đoạn chữ màu. Bản dịch ở đây ngắn, nên không
+    khối nào phải dồn xuống hay tràn trang: vị trí, cỡ chữ, độ đậm và màu của
+    từng khối phải trùng bản gốc, và trang vẫn đúng một trang cùng khổ.
+    """
+    import pymupdf
+
+    source = pymupdf.open()
+    page = source.new_page(width=595.0, height=842.0)
+    page.insert_text((72.0, 120.0), "Chapter Two", fontname="hebo", fontsize=17.0)
+    page.insert_text(
+        (90.0, 170.0), "Body text of the first paragraph.", fontname="helv", fontsize=11.0
+    )
+    page.insert_text((90.0, 182.0), "It carries a second line.", fontname="helv", fontsize=11.0)
+    page.insert_text(
+        (72.0, 240.0),
+        "A paragraph printed in colour.",
+        fontname="helv",
+        fontsize=11.0,
+        color=(0.8, 0.0, 0.0),
+    )
+    src = tmp_path / "in.pdf"
+    source.save(str(src))
+    source.close()
+
+    doc = load_document(src)
+    assert len(doc.blocks) == 3, "cần ba khối trên trang nguồn"
+    texts = {
+        0: "Chương Hai",
+        1: "Đoạn thân thứ nhất.",
+        2: "Một đoạn in bằng màu.",
+    }
+    # Không ghim font: đây là đường chạy thật, nơi khối tự tìm lại họ chữ và độ
+    # đậm của bản gốc.
+    stats = rebuild_pdf(src, doc, texts, tmp_path / "out.pdf")
+    assert stats.failures == []
+    assert stats.continued == 0, "bản dịch ngắn thì không được tràn trang"
+
+    def spans_of(page, needle):
+        found = [
+            span
+            for block in page.get_text("dict")["blocks"]
+            for line in block.get("lines", [])
+            for span in line["spans"]
+            if needle in span["text"]
+        ]
+        assert found, f"không thấy chữ {needle!r} trên trang"
+        return found[0]
+
+    with pymupdf.open(src) as original, pymupdf.open(tmp_path / "out.pdf") as rebuilt:
+        assert rebuilt.page_count == original.page_count == 1
+        assert rebuilt[0].rect == original[0].rect, "khổ trang phải giữ nguyên"
+        for needle, source_span in (
+            ("Chương", spans_of(original[0], "Chapter Two")),
+            ("thân", spans_of(original[0], "Body text")),
+            ("màu", spans_of(original[0], "printed in colour")),
+        ):
+            span = spans_of(rebuilt[0], needle)
+            assert abs(span["origin"][0] - source_span["origin"][0]) < 1.0, (
+                f"lề trái của {needle!r} phải giữ nguyên"
+            )
+            # Dòng đầu đứng đúng chỗ: sai số còn lại là độ cao ascender của mặt
+            # chữ dùng để in so với mặt chữ gốc (dưới 2pt ở mọi cỡ), không phải
+            # một khối bị dồn đi chỗ khác.
+            assert abs(span["origin"][1] - source_span["origin"][1]) < 2.0, (
+                f"dòng đầu của {needle!r} phải đứng đúng chỗ"
+            )
+            assert abs(span["size"] - source_span["size"]) < 0.2, (
+                f"cỡ chữ của {needle!r} phải giữ nguyên"
+            )
+            assert span["color"] == source_span["color"], f"màu chữ của {needle!r} phải giữ nguyên"
+        assert "Bold" in spans_of(rebuilt[0], "Chương")["font"], "tiêu đề phải in đậm"
+        assert "Bold" not in spans_of(rebuilt[0], "thân")["font"], "thân bài không đậm"
+
+
+def test_a_page_break_never_strands_a_tail_on_a_page_of_its_own(tmp_path, unicode_font):
+    """Trang trước tràn khỏi đáy: phần đuôi in **đầu trang sau**, chữ của trang
+    sau lùi xuống dưới nó — không sinh thêm một trang chỉ có một dòng.
+
+    Đây là lỗi người đọc thấy trên cuốn tài liệu thật: một trang gần như trắng,
+    chỉ còn một gạch đầu dòng lạc lõng, rồi trang sau mới tiếp tục. Trang chèn
+    riêng cho phần đuôi là thứ phải biến mất: văn bản chảy sang trang sau như
+    một dòng chữ bình thường, đúng cỡ nguồn.
+    """
+    import pymupdf
+
+    source = pymupdf.open()
+    first = source.new_page(width=595.0, height=842.0)
+    # Ba dòng mỗi khối: extractor tách block theo khoảng cách dòng, và một đoạn
+    # đúng một dòng sẽ tự biến khoảng trắng của nó thành chuẩn (xem pdfdoc).
+    y = 150.0
+    for index in range(3):
+        first.insert_text(
+            (72.0, y), f"Alpha paragraph line {index} of the page.", fontname="helv", fontsize=10.0
+        )
+        y += 12.0
+    # Khối cuối nằm sát đáy trang: bản dịch dài hơn không còn chỗ nào dưới nó.
+    y = 790.0
+    for index in range(3):
+        first.insert_text(
+            (72.0, y), f"Beta last paragraph line {index} here.", fontname="helv", fontsize=10.0
+        )
+        y += 12.0
+
+    second = source.new_page(width=595.0, height=842.0)
+    y = 120.0
+    for index in range(3):
+        second.insert_text(
+            (72.0, y), f"Gamma next page line {index} of text.", fontname="helv", fontsize=10.0
+        )
+        y += 12.0
+    src = tmp_path / "in.pdf"
+    source.save(str(src))
+    source.close()
+
+    doc = load_document(src)
+    assert len(doc.blocks) == 3, "cần hai khối ở trang đầu và một khối ở trang sau"
+    texts = {
+        0: "Alpha ngắn.",
+        1: "Beta dài " + "chữ " * 40,
+        2: "Gamma ngắn.",
+    }
+    stats = rebuild_pdf(src, doc, texts, tmp_path / "out.pdf", font_path=unicode_font)
+
+    assert stats.failures == []
+    assert stats.continued == 0, "phần đuôi phải chảy sang trang sau, không cần trang chèn"
+    with pymupdf.open(tmp_path / "out.pdf") as rebuilt:
+        assert rebuilt.page_count == 2, "không được thêm trang chỉ cho phần đuôi"
+        first_page, second_page = rebuilt[0], rebuilt[1]
+        assert "Beta" in first_page.get_text(), "đầu khối vẫn ở trang nguồn"
+        tail = [word for word in second_page.get_text("words") if word[4] == "chữ"]
+        gamma = [word for word in second_page.get_text("words") if word[4] == "Gamma"]
+        assert tail and gamma, "trang sau phải có cả phần đuôi lẫn chữ của chính nó"
+        assert min(word[1] for word in tail) < min(word[1] for word in gamma), (
+            "phần đuôi phải in trên chữ của trang sau"
+        )
+        assert max(word[3] for word in tail) <= min(word[1] for word in gamma) + 1, (
+            "chữ của trang sau phải lùi xuống dưới phần đuôi, không đè lên"
+        )
+        assert " ".join(rebuilt[0].get_text().split()).count("chữ") + len(tail) == 40, (
+            "không được mất chữ nào của phần đuôi"
+        )
+        for page in rebuilt:
+            height = page.rect.height
+            assert all(word[1] >= 0 and word[3] <= height for word in page.get_text("words"))
+            for block in page.get_text("dict")["blocks"]:
+                for line in block.get("lines", []):
+                    for span in line["spans"]:
+                        assert abs(span["size"] - 10.0) < 0.5, "phải in đúng cỡ nguồn"

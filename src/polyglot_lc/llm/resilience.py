@@ -9,6 +9,9 @@ Classification rules
   429-free 5xx: retry with exponential backoff.
 * :class:`PermanentError`   — 400/401/403/404/422, bad replies, anything a
   different endpoint cannot fix: fail fast, no retry, no fallback.
+* :class:`NoBackupError`    — raised once the attempts are spent and there was
+  no backup endpoint to switch to: the pipeline's own state, not the
+  provider's, and the signal for the chunk layer to stop instead of ask again.
 
 Every retry logs provider/model, HTTP status, attempt, wait seconds and the
 reason. Once retries are exhausted the caller may fall back to a backup
@@ -60,6 +63,21 @@ class TransientError(LLMError):
 
 class PermanentError(LLMError):
     """Auth, bad request, malformed reply — retrying cannot fix these."""
+
+    def __init__(self, message: str, status: int | None = None) -> None:
+        super().__init__(message)
+        self.status = status
+
+
+class NoBackupError(LLMError):
+    """The attempts are spent and there is no backup endpoint to switch to.
+
+    The provider did not answer and there is nowhere else to go: asking the
+    same endpoint again would be the same question with the same answer. The
+    chunk layer reads this as *stop*, not as *wait* — a pipeline with no
+    backup fails with the reason instead of spinning on a dead provider for as
+    long as the reader keeps the page open.
+    """
 
     def __init__(self, message: str, status: int | None = None) -> None:
         super().__init__(message)
@@ -423,9 +441,16 @@ def _fallback_or_raise(
     backup_provider: str,
     backup_model: str,
 ) -> Any:
-    """Switch to the backup endpoint, or re-raise when there is none."""
+    """Switch to the backup endpoint, or fail when there is none."""
     if backup is None:
-        raise cause from None
+        # The attempts are spent and there is no other endpoint to try. This is
+        # not the provider's error any more: it is the pipeline's own state,
+        # and the caller is told so it can stop rather than ask again.
+        raise NoBackupError(
+            f"{provider or '?'}/{model or '?'} failed after its attempts and no "
+            f"backup endpoint is configured: {cause}",
+            status=getattr(cause, "status", None),
+        ) from cause
     logger.warning(
         "LLM fallback | primary={}/{} failed ({}) -> backup={}/{}",
         provider or "?",

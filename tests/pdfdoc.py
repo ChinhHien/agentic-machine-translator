@@ -119,6 +119,7 @@ def write_table_pdf(
     left: float = _LEFT,
     top: float = _TOP,
     size: float = 9.0,
+    prose: str = "",
 ) -> Path:
     """Write *rows* as a ruled table on one PDF page and return the path.
 
@@ -126,6 +127,10 @@ def write_table_pdf(
     rules, not from how the glyphs happen to line up, so every row boundary gets
     a horizontal line and every column boundary a vertical one. The first row is
     set in bold, the way a header would be.
+
+    *prose* writes body paragraphs above the table (from the top of the text
+    column, wrapping like :func:`write_pdf`), for the tests where the rebuild
+    has to keep a translated block from being pushed down onto the grid.
     """
     import pymupdf
 
@@ -134,6 +139,18 @@ def write_table_pdf(
     height = row_height * len(rows)
     doc = pymupdf.open()
     page = doc.new_page(width=_WIDTH, height=_HEIGHT)
+
+    y = _TOP
+    for raw in prose.splitlines():
+        line = raw.strip()
+        if not line:
+            y += _GAP
+            continue
+        for piece in textwrap.wrap(
+            _plain(line), width=_WRAP, break_long_words=False, break_on_hyphens=False
+        ) or [""]:
+            page.insert_text((left, y), piece, fontname=_BODY_FONT, fontsize=_BODY_SIZE)
+            y += _ADVANCE
 
     def column_x(column: int) -> float:
         return left + sum(widths[:column])

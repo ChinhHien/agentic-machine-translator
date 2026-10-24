@@ -21,15 +21,20 @@ def _heading_levels(text: str) -> list[int]:
 class VerifyResult:
     """Outcome of verification: pass/fail plus human-readable reasons."""
 
-    def __init__(self, ok: bool, reasons: list[str]) -> None:
+    def __init__(self, ok: bool, reasons: list[str], *, skipped: bool = False) -> None:
         self.ok = ok
         self.reasons = reasons
+        #: True when there is no verdict at all: the Verifier could not run.
+        #: ``ok`` still reads True — a broken QA service must not block a
+        #: translation — but a caller must never report that as "checked and
+        #: passed", which is what an ``ok=True``-only contract invited.
+        self.skipped = skipped
 
     def __bool__(self) -> bool:  # allows `if verify_result:`
         return self.ok
 
     def __repr__(self) -> str:
-        return f"VerifyResult(ok={self.ok}, reasons={self.reasons})"
+        return f"VerifyResult(ok={self.ok}, skipped={self.skipped}, reasons={self.reasons})"
 
 
 def hard_checks(source: str, translation: str) -> list[str]:
@@ -54,6 +59,8 @@ class VerifierAgent(Agent):
         src_lang: str,
         tgt_lang: str,
         glossary_md: str = "",
+        *,
+        hard_issues: list[str] | None = None,
     ) -> VerifyResult:
         """Run hard checks first, then an LLM adequacy verdict.
 
@@ -61,8 +68,14 @@ class VerifierAgent(Agent):
         chunk unverified, and the chunker has already bounded the size. When
         *glossary_md* is supplied the verdict also covers terminology, which is
         otherwise only policed document-wide by the consistency pass.
+
+        *hard_issues* lets a caller that already ran
+        :func:`hard_checks` on this exact pair of strings pass the result in
+        instead of paying for the same scan again; ``None`` means "not
+        computed yet" and is the only value that triggers a scan, so an empty
+        list is a real "no problems".
         """
-        problems = hard_checks(source, translation)
+        problems = hard_checks(source, translation) if hard_issues is None else hard_issues
         if problems:
             return VerifyResult(ok=False, reasons=problems)
 
@@ -115,5 +128,5 @@ class VerifierAgent(Agent):
             logger.warning(
                 "VERIFIER failed after {:.1f}s | error={} model={}", elapsed, exc, self.config.model
             )
-            return VerifyResult(ok=True, reasons=["verifier unavailable; skipped"])
+            return VerifyResult(ok=True, reasons=["verifier unavailable; skipped"], skipped=True)
         return VerifyResult(ok=ok, reasons=reasons)

@@ -77,9 +77,13 @@ def chunk_document(
     chunks: list[Chunk] = []
     current: list[tuple[int, Block, str]] = []
     current_tokens = 0
+    #: True while *current* holds nothing but the overlap replayed from the
+    #: previous chunk: such a tail can be dropped instead of flushed as a chunk
+    #: of its own.
+    tail_only = False
 
     def flush() -> None:
-        nonlocal current, current_tokens
+        nonlocal current, current_tokens, tail_only
         if not current:
             return
         body = "\n\n".join(t for _, _, t in current).strip()
@@ -105,6 +109,12 @@ def chunk_document(
             tail_tokens = 0
             for item in reversed(current):
                 t = len(enc.encode(item[2]))
+                if t > overlap_tokens:
+                    # A block bigger than the whole overlap window is not
+                    # context: replaying it carries its full size into the next
+                    # chunk (one 1 383-token block replayed as written produced
+                    # a 1 588-token chunk against a 700-token budget).
+                    break
                 if tail_tokens + t > overlap_tokens and tail:
                     break
                 tail.insert(0, item)
@@ -112,23 +122,35 @@ def chunk_document(
             current, current_tokens = tail, tail_tokens
         else:
             current, current_tokens = [], 0
+        tail_only = bool(current)
 
     for idx, block, text in texts:
         t = len(enc.encode(text))
         if current_tokens + t > max_tokens and current:
-            flush()
+            if not tail_only:
+                flush()  # the chunk that just filled up keeps its own content
+            if current_tokens + t > max_tokens and current:
+                # What is left is a replayed tail — or the flush above produced
+                # one — that cannot share this block. The overlap is context,
+                # not content: flushing it alone would translate it a second
+                # time, and keeping it here is an over-budget chunk.
+                current, current_tokens = [], 0
         current.append((idx, block, text))
         current_tokens += t
+        tail_only = False
     flush()
 
-    # Drop overlap-only duplicates (chunks with no fresh content).
+    # Drop overlap-only chunks — those whose blocks an earlier chunk already
+    # carries. Comparing *text* instead, as this used to, also dropped a chunk
+    # holding a different block that happens to read the same (a repeated
+    # heading, the same exercise twice): its content disappeared with it.
     deduped: list[Chunk] = []
-    seen_texts: set[str] = set()
+    covered: set[int] = set()
     for c in chunks:
-        if c.text in seen_texts:
+        if c.block_refs and all(ref in covered for ref in c.block_refs):
             continue
-        seen_texts.add(c.text)
         deduped.append(c)
+        covered.update(c.block_refs)
     for i, c in enumerate(deduped):
         c.index = i
         c.id = f"chunk-{i:03d}"

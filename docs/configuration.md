@@ -34,9 +34,21 @@ Planner và Verifier **độc lập** với nhóm này.
 
 ### Endpoint dự phòng
 
-`<NAME>_BACKUP_BASE_URL` + `<NAME>_BACKUP_MODEL` (+ `_BACKUP_API_KEY`) chỉ dùng
+`LLM_BACKUP_BASE_URL` + `LLM_BACKUP_MODEL` (+ `LLM_BACKUP_API_KEY`) chỉ dùng
 sau khi endpoint chính đã cạn lượt thử lại. **Cần cả hai** biến base_url và
 model — đặt lẻ một trong hai là lỗi cấu hình.
+
+Dự phòng phủ **mọi agent của pipeline** — Planner, Translator, Critic, Refiner,
+Verifier — và **trừ embedding**: Reasoning Bank là phần best-effort, thiếu dự
+phòng ở đó mất một trace chứ không mất bản dịch. Một endpoint dự phòng, đặt
+một lần cho cả pipeline: endpoint nào chết thì nhóm agent đang dùng nó rơi
+sang endpoint này.
+
+**Không có endpoint dự phòng thì lượt chạy dừng, không quay vòng vô hạn.** Khi
+một agent đã cạn lượt thử lại mà không có nơi để chuyển sang, chunk đó được
+hỏi **một lần** rồi lượt chạy kết thúc với lý do rõ ràng (mã thoát 1) — thay vì
+chờ mãi trên một endpoint đã từ chối trả lời. Có endpoint dự phòng thì vòng
+lặp cấp chunk vẫn chạy: mỗi vòng thử lại chính rồi dự phòng.
 
 ## 2. Toàn bộ biến
 
@@ -55,41 +67,26 @@ Bảng dưới viết cho Planner; bốn agent còn lại có đúng bộ biến
 | `PLANNER_API_KEY` | (trống) | Khoá cho endpoint trên. Ollama/vLLM thường nhận giá trị bất kỳ. |
 | `PLANNER_TEMPERATURE` | `0.3` | Độ ngẫu nhiên. Hạ xuống cho công việc cần ổn định; `0.0` cho Verifier là hợp lý. |
 | `PLANNER_TIMEOUT` | `45` | Trần thời gian một request (giây), thay cho `LLM_TIMEOUT` cho riêng agent này. |
-| `PLANNER_BACKUP_BASE_URL` | (trống) | Endpoint dự phòng; phải đi cùng `_BACKUP_MODEL`. |
-| `PLANNER_BACKUP_MODEL` | (trống) | Model của endpoint dự phòng. |
-| `PLANNER_BACKUP_API_KEY` | (trống) | Khoá của endpoint dự phòng. |
 | `TRANSLATOR_BASE_URL` | (nhóm đọc-nguồn) | Ghi đè nhóm cho riêng Translator. |
 | `TRANSLATOR_MODEL` | (nhóm đọc-nguồn) | Model dịch. Cũng là một phần danh tính checkpoint của lượt chạy. |
 | `TRANSLATOR_API_KEY` | (nhóm đọc-nguồn) | Ghi đè khoá cho riêng Translator. |
 | `TRANSLATOR_TEMPERATURE` | `0.3` | Độ ngẫu nhiên khi dịch. Thấp hơn cho tài liệu kỹ thuật. |
 | `TRANSLATOR_TIMEOUT` | `45` | Trần thời gian một request dịch (giây). |
-| `TRANSLATOR_BACKUP_BASE_URL` | (trống) | Endpoint dự phòng cho Translator. |
-| `TRANSLATOR_BACKUP_MODEL` | (trống) | Model của endpoint dự phòng cho Translator. |
-| `TRANSLATOR_BACKUP_API_KEY` | (trống) | Khoá của endpoint dự phòng cho Translator. |
 | `CRITIC_BASE_URL` | (nhóm đọc-nguồn) | Ghi đè nhóm cho riêng Critic. |
 | `CRITIC_MODEL` | (nhóm đọc-nguồn) | Model chấm điểm draft. |
 | `CRITIC_API_KEY` | (nhóm đọc-nguồn) | Ghi đè khoá cho riêng Critic. |
 | `CRITIC_TEMPERATURE` | `0.3` | Độ ngẫu nhiên khi chấm điểm. |
 | `CRITIC_TIMEOUT` | `45` | Trần thời gian một request chấm điểm (giây). |
-| `CRITIC_BACKUP_BASE_URL` | (trống) | Endpoint dự phòng cho Critic. |
-| `CRITIC_BACKUP_MODEL` | (trống) | Model của endpoint dự phòng cho Critic. |
-| `CRITIC_BACKUP_API_KEY` | (trống) | Khoá của endpoint dự phòng cho Critic. |
 | `REFINER_BASE_URL` | (nhóm đọc-nguồn) | Ghi đè nhóm cho riêng Refiner. |
 | `REFINER_MODEL` | (nhóm đọc-nguồn) | Model sửa draft theo critique. |
 | `REFINER_API_KEY` | (nhóm đọc-nguồn) | Ghi đè khoá cho riêng Refiner. |
 | `REFINER_TEMPERATURE` | `0.3` | Độ ngẫu nhiên khi sửa. |
 | `REFINER_TIMEOUT` | `45` | Trần thời gian một request sửa (giây). |
-| `REFINER_BACKUP_BASE_URL` | (trống) | Endpoint dự phòng cho Refiner. |
-| `REFINER_BACKUP_MODEL` | (trống) | Model của endpoint dự phòng cho Refiner. |
-| `REFINER_BACKUP_API_KEY` | (trống) | Khoá của endpoint dự phòng cho Refiner. |
 | `VERIFIER_BASE_URL` | (bắt buộc) | Endpoint của Verifier; nhóm riêng, không chung với nhóm đọc-nguồn. |
 | `VERIFIER_MODEL` | (bắt buộc) | Model kiểm tra ngữ nghĩa cuối cùng. |
 | `VERIFIER_API_KEY` | (trống) | Khoá của Verifier. |
 | `VERIFIER_TEMPERATURE` | `0.3` | Đặt `0.0` là lựa chọn thường dùng cho Verifier. |
 | `VERIFIER_TIMEOUT` | `45` | Trần thời gian một request kiểm tra (giây). |
-| `VERIFIER_BACKUP_BASE_URL` | (trống) | Endpoint dự phòng cho Verifier. |
-| `VERIFIER_BACKUP_MODEL` | (trống) | Model của endpoint dự phòng cho Verifier. |
-| `VERIFIER_BACKUP_API_KEY` | (trống) | Khoá của endpoint dự phòng cho Verifier. |
 
 ### 2.2 Nhóm, embedding, và trần chung
 
@@ -99,6 +96,9 @@ Bảng dưới viết cho Planner; bốn agent còn lại có đúng bộ biến
 | `SOURCE_GROUP_MODEL` | (bắt buộc cho nhóm) | Model dùng chung cho ba agent đó. |
 | `SOURCE_GROUP_API_KEY` | (trống) | Khoá dùng chung cho ba agent đó. |
 | `SOURCE_GROUP_TEMPERATURE` | `0.3` | Nhiệt độ dùng chung; đặt riêng từng agent vẫn thắng. |
+| `LLM_BACKUP_BASE_URL` | (trống) | Endpoint dự phòng dùng chung cho **mọi** agent; phải đi cùng `LLM_BACKUP_MODEL`. |
+| `LLM_BACKUP_MODEL` | (trống) | Model của endpoint dự phòng chung. |
+| `LLM_BACKUP_API_KEY` | (trống) | Khoá của endpoint dự phòng chung. |
 | `EMBED_BASE_URL` | (bắt buộc) | Endpoint embedding cho Reasoning Bank. |
 | `EMBED_MODEL` | (bắt buộc) | Model embedding; đổi model làm Reasoning Bank tự reset collection. |
 | `EMBED_API_KEY` | (trống) | Khoá cho endpoint embedding. |
@@ -139,8 +139,6 @@ Bảng dưới viết cho Planner; bốn agent còn lại có đúng bộ biến
 
 | Biến | Mặc định | Ý nghĩa và khi nào nên đổi |
 |---|---|---|
-| `UNIFIED_PLANNER` | `1` | `1` là một request Planner duy nhất cho cả tài liệu; `0` quay lại summary-tree rồi plan. |
-| `SUMMARY_TREE_CHUNK_SUMMARIES` | `0` | Chỉ có tác dụng khi `UNIFIED_PLANNER=0`. `1` tốn thêm request tóm tắt mỗi chunk. |
 | `ADAPTIVE_QUALITY` | `1` | `0` là mọi chunk đi đúng đường đầy đủ Translate-Critic-Refiner-Verify. |
 | `FAST_PATH_MAX_COMPLEXITY` | `0.35` | Chunk phức tạp hơn mức này không được đi đường tắt (0-1). |
 | `FAST_PATH_MIN_SCORE` | `9.0` | Điểm tất định tối thiểu để một chunk được đi đường tắt (0-10). |
@@ -151,7 +149,7 @@ Bảng dưới viết cho Planner; bốn agent còn lại có đúng bộ biến
 | Biến | Mặc định | Ý nghĩa và khi nào nên đổi |
 |---|---|---|
 | `CONSISTENCY_CHECK` | `1` | Kiểm tra thuật ngữ xuyên chunk sau khi dịch; chunk lệch được vá chứ không dịch lại. |
-| `CONSISTENCY_MAX_PATCHES` | `5` | Trần số bản vá mỗi tài liệu; `0` là tắt vá. |
+| `CONSISTENCY_MAX_PATCHES` | `5` | **Sàn** số bản vá mỗi lượt: thực tế vá `max(giá trị này, 30% số chunk lệch)`, và chunk lệch nhiều thuật ngữ nhất được vá trước. Mỗi bản vá là một request `REFINER` trên một chunk, gửi cả bản dịch kèm glossary và nhận lại cả bản dịch; trần đó lên `consistency_patch_budget` trong `run_end` và dòng CLI. Hai bản vá liền bị từ chối thì pass dừng, không đốt nốt ngân sách. `0` là tắt vá. |
 
 ### 2.8 Retry, timeout, hàng đợi
 

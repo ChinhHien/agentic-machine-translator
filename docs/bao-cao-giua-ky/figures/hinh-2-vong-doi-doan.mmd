@@ -1,0 +1,25 @@
+%% Hình 2. Vòng đời một đoạn văn bản và hai đường xử lý.
+flowchart TD
+    CHUNK["Đoạn văn bản nguồn đã chia"]
+    DRAFT["Tác tử Dịch tạo bản nháp"]
+    GATE["Cổng tất định (0 token):<br/>cấu trúc, độ dài, placeholder,<br/>mật độ thuật ngữ"]
+    Q{"Đoạn đơn giản và<br/>bản nháp sạch?"}
+    CRIT["Tác tử Phản biện:<br/>chấm điểm, nêu lỗi"]
+    REF["Tác tử Hiệu chỉnh:<br/>sửa theo nhận xét"]
+    VER["Tác tử Kiểm chứng:<br/>kiểm tra cứng và phán quyết"]
+    AGAIN["Dịch lại kèm lý do,<br/>tối đa một lần,<br/>rồi kiểm chứng lại"]
+    CK["Ghi checkpoint và trace<br/>của đoạn"]
+    FINAL["Rà soát nhất quán và<br/>hợp nhất toàn tài liệu"]
+
+    CHUNK --> DRAFT
+    DRAFT --> Q
+    GATE -.-> Q
+    Q -->|đạt| VER
+    Q -->|chưa đạt| CRIT
+    CRIT -->|chưa đạt ngưỡng| REF
+    REF -->|lặp tới ngưỡng| CRIT
+    CRIT -->|điểm đạt| VER
+    VER -->|đạt| CK
+    CK --> FINAL
+    VER -->|không đạt| AGAIN
+    AGAIN --> VER

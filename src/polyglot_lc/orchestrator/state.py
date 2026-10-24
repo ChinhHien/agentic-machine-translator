@@ -21,17 +21,23 @@ class ChunkState(TypedDict, total=False):
     chunk: Any  # segment.chunker.Chunk
     src_lang: str
     tgt_lang: str
-    domain: str
     strategy: str
     few_shot: list[str]
     pitfalls: list[str]
     glossary_md: str
+    #: Promoted SkillOpt skill for this pair (dict) or None. Document-level,
+    #: copied into every chunk: LangGraph drops keys this state does not carry.
+    skill: dict[str, Any] | None
 
     # Adaptive routing (per chunk)
     complexity: float | None  # 0..1 difficulty; None disables the fast path
     section_note: str  # Planner guidance for this chunk's section
     draft_score: float  # deterministic draft quality, 0-10
     draft_issues: list[str]
+    #: Deterministic hard-check problems for ``draft``, computed once when the
+    #: draft is prepared (see ``make_chunk_graph.prepare_draft``) and reused by
+    #: the faster and the LLM verify path. ``None`` means "not computed".
+    draft_hard_issues: list[str]
     fast_path: bool  # True -> skip Critic/Refiner, verify directly
     skip_llm_verify: bool  # True -> deterministic hard checks only
 

@@ -67,32 +67,69 @@ def _normalize_para(text: str) -> str:
     return _WS_RE.sub(" ", text.strip()).casefold()
 
 
-def _textual_overlap_count(paragraphs: list[str]) -> int:
-    """Count how many leading paragraphs in *paragraphs* are near-duplicates.
+def _overlap_paragraph_cut(
+    chunk: Any, prev_refs: list[int] | None, refs: list[int], paragraphs: list[str]
+) -> int:
+    """How many leading paragraphs of a chunk are *only* the replayed overlap.
 
-    A leading paragraph is considered a duplicate when its first 120
-    normalised characters match a subsequent paragraph in the same list.
-    This detects chunks whose overlap was translated slightly differently.
+    The chunker replays the previous chunk's tail source blocks as the head of
+    this chunk, so their translation arrives twice. Counting paragraphs assumed
+    the translator answers with one paragraph per block: a heading it merged
+    with the paragraph below, or a line break it dropped, put new content in
+    paragraph 0 — and a count then cut it away. So the blocks are aligned to the
+    paragraphs (the same evidence :func:`block_translations` uses) and only a
+    leading paragraph whose blocks are *all* replayed is dropped. A paragraph
+    that also carries a new block's words stays, which at worst leaves a visible
+    duplicate and never a hole.
     """
-    if len(paragraphs) < 2:
+    if not prev_refs:
         return 0
-    # Build a set of normalised paragraph prefixes from the second half.
-    second_half = {
-        _normalize_para(p)[:120]
-        for p in paragraphs[1:]
-        if len(p.strip()) > 30  # ignore short fragments
-    }
-    drop = 0
-    for p in paragraphs:
-        norm = _normalize_para(p)[:120]
-        if len(p.strip()) < 30:
-            break
-        if norm in second_half:
-            drop += 1
-        else:
-            break
-    # Never drop everything.
-    return min(drop, len(paragraphs) - 1)
+    drop = _overlap_prefix_count(prev_refs, refs)
+    if drop <= 0 or not paragraphs:
+        return 0
+    sources = str(getattr(chunk, "text", "") or "").split(CHUNK_SEPARATOR)
+    if len(sources) != len(refs) or not all(source.strip() for source in sources):
+        return min(drop, max(0, len(paragraphs) - 1))
+    # Only a leading paragraph can be cut, so only a short prefix needs aligning.
+    # The grid is quadratic in the chunk, and the incremental (``PARTIAL_OUTPUT``)
+    # file runs this once per completed chunk; the window grows only while the
+    # answer is still "the whole window is replay".
+    longest = max(len(sources), len(paragraphs))
+    limit = min(max(drop + 2, 4), longest)
+    while True:
+        window = paragraphs[:limit]
+        prefix = sources[:limit]
+        owners = _align_paragraphs(prefix, window, _ratio_norm(window, prefix))
+        if owners is None:
+            return min(drop, max(0, len(paragraphs) - 1))
+        # Which source blocks each paragraph carries. A block the translator
+        # folded into the paragraph above its own (``[]``) is attributed to that
+        # paragraph too: its words are there, and dropping the paragraph would
+        # drop them.
+        holders: dict[int, set[int]] = {}
+        last = -1
+        for block, owned in enumerate(owners):
+            if owned is None:
+                continue  # left out entirely: it holds no paragraph
+            if not owned:
+                if last >= 0:
+                    holders.setdefault(last, set()).add(block)
+                continue
+            last = max(owned)
+            for index in owned:
+                holders.setdefault(index, set()).add(block)
+        replayed = set(range(drop))
+        cut = 0
+        # A paragraph no block was pinned to (``holders`` has no entry for it) is
+        # never cut: its owner is unknown, and keeping it costs a visible
+        # duplicate at worst.
+        while cut < len(window) and holders.get(cut, {-1}) <= replayed:
+            cut += 1
+        if cut < len(window) or limit >= longest:
+            # Never cut the chunk away entirely: the last paragraph stays even
+            # if the alignment says every word of it was already printed.
+            return min(cut, max(0, len(paragraphs) - 1))
+        limit = min(limit * 2, longest)
 
 
 def _dedup_predecessor(prev: Any | None, translations: dict[str, str]) -> Any | None:
@@ -145,40 +182,27 @@ def _chunk_emission(
     With chunk overlap, a later chunk re-contains the previous chunk's tail
     source blocks; the translation of that region would be emitted twice. We
     drop the *translation* of those leading blocks (split on the paragraph
-    separator the translator is told to preserve). It conservatively never
-    strips more paragraphs than the overlap count, so new content is never lost.
+    separator the translator is told to preserve), and only the paragraphs that
+    belong to nothing but the replayed blocks — see
+    :func:`_overlap_paragraph_cut` — so new content is never lost.
 
     ``prev_chunk`` must be a chunk that actually contributed text (see
     :func:`_dedup_predecessor`): there is nothing to de-duplicate against when
     the previous chunk emitted nothing, and the overlap is then the only copy.
 
-    Additionally, when block_refs are unavailable, we perform paragraph-level
-    textual deduplication against the previous chunk's trailing paragraphs to
-    catch rephrased overlap.
+    A reworded duplicate that the cut cannot place is caught at the boundary by
+    :func:`assemble` (:func:`_repeat_of`), not here: this function only ever sees
+    one chunk's reply.
     """
     if text is None:
         return default if default is not None else text
     refs = _block_refs(chunk)
     prev_refs = _block_refs(prev_chunk) if prev_chunk is not None else None
-
-    # ---- Strategy 1: block-ref-based overlap removal ----
-    if refs and prev_refs:
-        drop = _overlap_prefix_count(prev_refs, refs)
-        if drop > 0:
-            paragraphs = text.split(CHUNK_SEPARATOR)
-            drop = min(drop, max(0, len(paragraphs) - 1))
-            return CHUNK_SEPARATOR.join(paragraphs[drop:])
-
-    # ---- Strategy 2: textual similarity dedup (fallback) ----
-    # When the previous chunk is available, check if any leading paragraphs
-    # of this chunk are near-duplicates of trailing paragraphs of the previous.
-    if prev_chunk is not None and text and hasattr(prev_chunk, "id"):
+    if refs and prev_refs and text:
         paragraphs = text.split(CHUNK_SEPARATOR)
-        if len(paragraphs) > 1:
-            drop = _textual_overlap_count(paragraphs)
-            if drop > 0:
-                return CHUNK_SEPARATOR.join(paragraphs[drop:])
-
+        cut = _overlap_paragraph_cut(chunk, prev_refs, refs, paragraphs)
+        if cut > 0:
+            return CHUNK_SEPARATOR.join(paragraphs[cut:])
     return text
 
 
@@ -191,11 +215,13 @@ def assemble(
 
     Ordering comes from the chunk list, not from completion order or dict
     ordering, so bounded-concurrency runs always emit the same document. Chunks
-    that share overlap are de-duplicated so each source block appears once.
-    Shielded code blocks are restored from *code_map* here, once, after
-    translation.
+    that share overlap are de-duplicated so each source block appears once: the
+    replay is cut by block ownership (:func:`_chunk_emission`), and a reworded
+    replay that survived the cut is folded only across the chunk boundary where
+    it can occur (:func:`_repeat_of`). Shielded code blocks are restored from
+    *code_map* while each chunk is placed.
     """
-    parts: list[str] = []
+    paragraphs: list[str] = []
     for i, chunk in enumerate(chunks):
         if not translations.get(chunk.id):
             # A chunk that never got a translation (its retries were exhausted)
@@ -207,17 +233,24 @@ def assemble(
                 chunks[i + 1] if i + 1 < len(chunks) else None,
             )
             note = _lost_block_note(chunk, neighbours, translations)
-            parts.append(f"<!-- {chunk.id}: untranslated{note} -->")
+            paragraphs.append(f"<!-- {chunk.id}: untranslated{note} -->")
             continue
         prev = _dedup_predecessor(chunks[i - 1] if i > 0 else None, translations)
         text = _chunk_emission(chunk, prev, translations.get(chunk.id, ""), default="")
-        parts.append(restore_code(text, code_map or {}))
-    assembled = CHUNK_SEPARATOR.join(parts)
+        incoming = restore_code(text, code_map or {}).split(CHUNK_SEPARATOR)
+        if paragraphs and incoming and _repeat_of(paragraphs[-1], incoming[0]):
+            # The same paragraph translated twice, once on each side of a chunk
+            # boundary: keep the longer rendering. Only that pair is compared —
+            # see :func:`_repeat_of` for why the document is not swept as a whole.
+            if len(_normalize_para(incoming[0])) > len(_normalize_para(paragraphs[-1])):
+                paragraphs[-1] = incoming[0]
+            incoming = incoming[1:]
+        paragraphs.extend(incoming)
     # The sentinels are the vocabulary the *model* is given; a reader gets real
     # Markdown, so they are rendered here, last, after code has been restored.
     # ``to_markdown`` only touches its own four tokens, so restored code — which
     # may contain anything, brackets included — cannot be damaged by it.
-    return emphasis.to_markdown(_deduplicate_paragraphs(assembled))
+    return emphasis.to_markdown(CHUNK_SEPARATOR.join(paragraphs))
 
 
 #: A token a translation is expected to keep as it stands: a number, a
@@ -286,10 +319,24 @@ def _shape_score(source: str, paragraph: str) -> float:
     return score
 
 
-def _pair_score(source: str, paragraph: str, norm: float) -> float:
-    """How much *paragraph* looks like the translation of *source*."""
-    anchors = _anchor_tokens(source)
-    shared = len(anchors & _anchor_tokens(paragraph)) / len(anchors) if anchors else 0.0
+def _pair_score(
+    source: str,
+    paragraph: str,
+    norm: float,
+    *,
+    anchors: set[str] | None = None,
+    paragraph_anchors: set[str] | None = None,
+) -> float:
+    """How much *paragraph* looks like the translation of *source*.
+
+    *anchors* and *paragraph_anchors* are the tokens already extracted for the
+    two texts. Every cell of the alignment grid asks the same question of the
+    same strings, so extracting them per cell made the score quadratic in the
+    document by itself: 174 000 regex scans for one 187-page book.
+    """
+    anchors = _anchor_tokens(source) if anchors is None else anchors
+    others = _anchor_tokens(paragraph) if paragraph_anchors is None else paragraph_anchors
+    shared = len(anchors & others) / len(anchors) if anchors else 0.0
     ratio = math.exp(-abs(math.log(max(len(paragraph), 1) / max(len(source), 1) / norm)))
     return (
         _PAIR_BASE
@@ -347,7 +394,21 @@ def _align_paragraphs(
     n, m = len(sources), len(paragraphs)
     if n == 0 or m == 0:
         return None
-    scores = [[_pair_score(s, p, norm) for p in paragraphs] for s in sources]
+    source_anchors = [_anchor_tokens(source) for source in sources]
+    paragraph_anchors = [_anchor_tokens(paragraph) for paragraph in paragraphs]
+    scores = [
+        [
+            _pair_score(
+                sources[i],
+                paragraphs[j],
+                norm,
+                anchors=source_anchors[i],
+                paragraph_anchors=paragraph_anchors[j],
+            )
+            for j in range(m)
+        ]
+        for i in range(n)
+    ]
     best: list[list[float]] = [[_UNREACHED] * (m + 1) for _ in range(n + 1)]
     move: list[list[str]] = [[""] * (m + 1) for _ in range(n + 1)]
     best[0][0] = 0.0
@@ -427,6 +488,11 @@ def block_translations(
     block whose words went into the paragraph above it maps to ``None``: its
     source lines are part of a sentence that was translated there, so they are
     cleared and nothing is printed in their place.
+
+    Alignment runs over the whole chunk, replayed blocks included, and the
+    replayed blocks are then skipped: cutting the paragraph list by the overlap
+    *count* first, as this used to, moved a paragraph that also carried a new
+    block's words off that block whenever the translator merged two of them.
     """
     out: dict[int, str | None] = {}
     for i, chunk in enumerate(chunks):
@@ -436,30 +502,63 @@ def block_translations(
             continue
         prev = _dedup_predecessor(chunks[i - 1] if i > 0 else None, translations)
         paragraphs = text.split(CHUNK_SEPARATOR)
-        drop = 0
         prev_refs = _block_refs(prev) if prev is not None else None
-        if prev_refs:
-            drop = _overlap_prefix_count(prev_refs, refs)
+        drop = _overlap_prefix_count(prev_refs, refs) if prev_refs else 0
         drop = min(drop, max(0, len(paragraphs) - 1))
-        kept, targets = paragraphs[drop:], refs[drop:]
-        if not targets:
-            continue
         # The chunk carries its own source text — one piece per block, which is
         # what the chunker joined it from — so the evidence is available without
         # a second argument. A caller that cannot supply it keeps the old
         # position-by-position pairing rather than guessing at an alignment.
-        sources = str(getattr(chunk, "text", "") or "").split(CHUNK_SEPARATOR)[drop:]
-        alignable = len(sources) == len(targets) and all(source.strip() for source in sources)
-        owners = _align_paragraphs(sources, kept, _ratio_norm(kept, sources)) if alignable else None
+        sources = str(getattr(chunk, "text", "") or "").split(CHUNK_SEPARATOR)
+        alignable = len(sources) == len(refs) and all(source.strip() for source in sources)
+        owners = (
+            _align_paragraphs(sources, paragraphs, _ratio_norm(paragraphs, sources))
+            if alignable
+            else None
+        )
         if owners is not None:
-            for ref, owned in zip(targets, owners):
+            # Which blocks each paragraph carries, and which paragraph a block
+            # with no paragraph of its own (``[]``) was folded into.
+            owns: dict[int, set[int]] = {}
+            folded: dict[int, int] = {}
+            last = -1
+            for block, owned in enumerate(owners):
                 if owned is None:
                     continue  # the translator left it out: its source text stays
                 if not owned:
-                    # Covered by the paragraph printed for the block above it.
-                    out[ref] = None
-                else:
-                    out[ref] = CHUNK_SEPARATOR.join(kept[index] for index in owned)
+                    if last >= 0:
+                        folded[block] = last
+                    continue
+                last = max(owned)
+                for index in owned:
+                    owns.setdefault(index, set()).add(block)
+            for block, ref in enumerate(refs):
+                owned = owners[block]
+                if owned is None:
+                    continue
+                if not owned:
+                    if block < drop:
+                        continue  # words of a replayed block: already printed
+                    holder = folded.get(block)
+                    if holder is None:
+                        continue
+                    if any(other >= drop for other in owns.get(holder, ())):
+                        # A block of this chunk owns that paragraph and prints it:
+                        # this block's lines are part of it, and would repeat it.
+                        out[ref] = None
+                    else:
+                        # The only paragraph carrying these words was the replayed
+                        # block's, which the previous chunk has already printed —
+                        # from its own, narrower translation. Printing it here is
+                        # a repeat; printing nothing is a hole.
+                        out[ref] = paragraphs[holder]
+                    continue
+                if block < drop:
+                    continue  # the previous chunk already emitted this block
+                out[ref] = CHUNK_SEPARATOR.join(paragraphs[index] for index in owned)
+            continue
+        kept, targets = paragraphs[drop:], refs[drop:]
+        if not targets:
             continue
         for ref, paragraph in zip(targets, kept):
             out[ref] = paragraph
@@ -469,6 +568,46 @@ def block_translations(
             # dropping the tail.
             out[targets[-1]] = CHUNK_SEPARATOR.join(kept[len(targets) - 1 :])
     return out
+
+
+#: How short a reply may be relative to its chunk's source before it counts
+#: as cut off. Vietnamese runs longer than the English it replaces: every
+#: complete chunk-translation measured across two real runs came out at
+#: 0.97-1.16 of its source length, while every reply known to have been cut
+#: mid-chunk (two different translators, two runs) measured 0.67 or less.
+#: 0.85 sits in that gap. A block-level merge or split changes the paragraph
+#: count without changing the word count, so it never approaches the floor.
+_MIN_COVERAGE_RATIO = 0.85
+
+
+def coverage_error(chunk: Any, translated: str) -> str | None:
+    """Why *translated* cannot be the whole of *chunk*, or ``None``.
+
+    ``finish_reason == "length"`` catches a reply cut at the provider's token
+    limit (:class:`TruncatedError`), but an early model stop can end the reply
+    mid-word while still reporting ``stop``: the text then simply stops and
+    the tail of the chunk is never translated — which shipped whole sections
+    in English and deleted them from the Markdown, with no marker and no
+    retry. Length is the signal that survives both mechanisms: a translation
+    of the whole chunk measures at least as long as its source (in practice
+    longer), so a reply under :data:`_MIN_COVERAGE_RATIO` of the source is
+    missing words and must be asked again rather than checkpointed.
+
+    The measure is only meaningful for a real provider asked to translate the
+    whole chunk; the mock harness answers with a canned pseudo-reply by
+    design, so callers decide whether to measure at all.
+    """
+    source = str(getattr(chunk, "text", "") or "")
+    if not source or not translated.strip():
+        return None  # nothing to measure against; the empty reply has its own path
+    ratio = len(translated) / len(source)
+    if ratio >= _MIN_COVERAGE_RATIO:
+        return None
+    return (
+        f"truncated translation: {len(translated)} characters is "
+        f"{ratio:.0%} of the {len(source)}-character source "
+        f"(a complete reply measures at least {int(_MIN_COVERAGE_RATIO * 100)}%)"
+    )
 
 
 def _ratio_norm(paragraphs: list[str], sources: list[str]) -> float:
@@ -511,32 +650,31 @@ def assemble_partial(
     return emphasis.to_markdown(CHUNK_SEPARATOR.join(parts))
 
 
-def _deduplicate_paragraphs(text: str) -> str:
-    """Remove consecutive near-duplicate paragraphs from the assembled document.
+def _repeat_of(previous: str, first: str) -> bool:
+    """True when *first* is *previous* rendered again at a chunk boundary.
 
-    After per-chunk overlap removal, some duplicates remain because the
-    translator rendered the same source content twice at a chunk boundary, in
-    slightly different words. This pass collapses *consecutive* paragraphs whose
-    normalised text is at least :data:`_NEAR_DUPLICATE_RATIO` similar, keeping
-    the longer one (the prefix-equality test this replaces missed reworded
-    duplicates, which is what survived into the output).
+    Chunk overlap is translated twice, and the second rendering can be worded
+    differently, so a near-duplicate check still has to run. It runs on the one
+    pair that can be that duplicate: the last paragraph emitted for the chunk
+    before and the first paragraph of the next. Two similar paragraphs *inside* a
+    chunk are two paragraphs the author wrote — a pair of exercises differing by
+    one number, two clauses differing by one figure — and the document-wide pass
+    that used to collapse them deleted real content without leaving a marker.
+
+    The anchors have to agree as well (see :data:`_ANCHOR_RE`): the same sentence
+    with a different number, identifier or code marker is a different sentence.
     """
-    paragraphs = text.split(CHUNK_SEPARATOR)
-    if len(paragraphs) < 2:
-        return text
-    kept: list[str] = [paragraphs[0]]
-    for para in paragraphs[1:]:
-        prev_norm = _normalize_para(kept[-1])
-        curr_norm = _normalize_para(para)
-        both_toc = bool(_TOC_ENTRY_RE.search(prev_norm) and _TOC_ENTRY_RE.search(curr_norm))
-        if len(prev_norm) > 40 and len(curr_norm) > 40 and curr_norm != prev_norm and not both_toc:
-            ratio = difflib.SequenceMatcher(None, prev_norm, curr_norm).ratio()
-            if ratio >= _NEAR_DUPLICATE_RATIO:
-                if len(curr_norm) > len(prev_norm):
-                    kept[-1] = para
-                continue
-        kept.append(para)
-    return CHUNK_SEPARATOR.join(kept)
+    prev_norm, first_norm = _normalize_para(previous), _normalize_para(first)
+    if len(prev_norm) <= 40 or len(first_norm) <= 40:
+        return False
+    both_toc = bool(_TOC_ENTRY_RE.search(prev_norm) and _TOC_ENTRY_RE.search(first_norm))
+    if both_toc:
+        return False
+    if _anchor_tokens(previous) != _anchor_tokens(first):
+        return False
+    if prev_norm == first_norm:
+        return True
+    return difflib.SequenceMatcher(None, prev_norm, first_norm).ratio() >= _NEAR_DUPLICATE_RATIO
 
 
 def output_paths(

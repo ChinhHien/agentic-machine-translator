@@ -20,7 +20,30 @@ skills/**/session_*.json
 !docs/**/*.md
 *.pdf
 .tmp-webui
+.tmp-chunkdiag
+.tmp-cmp
+.tmp-fixpage
+.tmp-ingestcheck
+.tmp-rebuild-check
+.tmp-vi-translate
 .superpowers/
 output/
 input/
 %SystemDrive%/
+
+# Scratch files: temporary analysis dumps, generated checkpoints, local runs.
+.tmp-*
+_*.txt
+data/test-checkpoints/
+
+# Tool caches and coverage output.
+.coverage
+.coverage.*
+htmlcov/
+.mypy_cache/
+
+# Editor and operating-system noise.
+.DS_Store
+Thumbs.db
+desktop.ini
+~$*

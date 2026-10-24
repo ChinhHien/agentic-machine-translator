@@ -53,7 +53,12 @@ class ConsistencyAgent(Agent):
                 "role": "user",
                 "content": (
                     "You are a terminology consistency editor.\n"
-                    f"Current translation:\n{translation[:2500]}\n\n"
+                    # The WHOLE translation, never a slice: the model answers
+                    # with what it is shown, so a truncated view became a
+                    # truncated rewrite — one that still carried the wanted
+                    # term and replaced a complete translation with a
+                    # fragment.
+                    f"Current translation:\n{translation}\n\n"
                     "The translators of the other sections used these exact terms:\n"
                     f"{wanted}\n\n"
                     "Fix ONLY the terminology above so it matches. Change nothing "

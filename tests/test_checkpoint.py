@@ -22,9 +22,14 @@ def _write(tmp_path, text: str = DOC, name: str = "doc.pdf"):
     return write_pdf(tmp_path / name, text)
 
 
-def _key(path, *, src="en", tgt="vi", domain="general", model="mock-model", hashes=("h0", "h1")):
+def _key(path, *, src="en", tgt="vi", model="mock-model", hashes=("h0", "h1"), glossary=""):
     return CheckpointStore.doc_key(
-        path, src=src, tgt=tgt, domain=domain, model=model, chunk_hashes=list(hashes)
+        path,
+        src=src,
+        tgt=tgt,
+        model=model,
+        chunk_hashes=list(hashes),
+        glossary=glossary,
     )
 
 
@@ -92,6 +97,20 @@ def test_doc_key_changes_when_the_job_changes(tmp_path):
     assert base != _key(path)  # edited document
 
 
+def test_doc_key_changes_when_the_glossary_changes(tmp_path):
+    """Terminology is part of the job: a chunk translated without a term the
+    reader has since added is not the same deliverable."""
+    path = _write(tmp_path)
+    base = _key(path)
+    assert _key(path, glossary="NMT\tDịch máy neural") != base
+    assert _key(path, glossary="NMT\tDịch máy neural") != _key(
+        path, glossary="NMT\tDịch máy nơ-ron"
+    )
+    # No glossary still keys exactly as it did before the glossary was part of
+    # the identity, so old checkpoints stay reachable.
+    assert base == _key(path, glossary="")
+
+
 def test_doc_key_ignores_a_rewrite_that_changes_no_bytes(tmp_path):
     """Re-uploading a document must not orphan chunks that are still valid.
 
@@ -143,6 +162,30 @@ def test_resume_without_checkpoints_re_translates(mock_env, tmp_path):
     result = _run(path, out=str(tmp_path / "a.md"), resume=True)
     assert result.resumed_chunks == 0
     assert TokenUsage.snapshot()["calls"] > 0
+
+
+def test_resuming_with_a_new_glossary_asks_the_chunks_again(mock_env, tmp_path):
+    """A changed CSV must not be papered over by a checkpoint hit.
+
+    The terminology is part of the checkpoint's identity, so the chunks
+    translated without the new term are asked again instead of being replayed
+    and leaving that term out of the file.
+    """
+    clear_mock_replies()
+    path = _write(tmp_path)
+    csv_a = tmp_path / "a.csv"
+    csv_a.write_text("NMT,Dịch máy neural\n", encoding="utf-8")
+    csv_b = tmp_path / "b.csv"
+    csv_b.write_text("NMT,Dịch máy nơ-ron\n", encoding="utf-8")
+
+    first = _run(path, out=str(tmp_path / "a.md"), glossary=str(csv_a))
+    assert first.chunks >= 1
+
+    same = _run(path, out=str(tmp_path / "b.md"), resume=True, glossary=str(csv_a))
+    assert same.resumed_chunks == same.chunks
+
+    changed = _run(path, out=str(tmp_path / "c.md"), resume=True, glossary=str(csv_b))
+    assert changed.resumed_chunks == 0
 
 
 def test_the_resume_record_makes_a_replay_visible_early(mock_env, tmp_path):
@@ -405,6 +448,56 @@ def test_a_rate_limited_chunk_is_waited_out_not_left_behind(mock_env, tmp_path, 
     assert (end["status"], end["exit_code"]) == ("done", 0)
     assert end["chunks_failed"] == 0
     assert end["chunk_retries"] == 5
+
+
+def test_a_chunk_with_no_backup_left_stops_the_run_instead_of_waiting_forever(
+    mock_env, tmp_path, monkeypatch
+):
+    """The attempts are spent and there is no backup: the run ends and says so.
+
+    Waiting on an endpoint that has already said no is how a run used to sit at
+    "0/38" for an hour. The chunk is asked once, the run stops, the chunks
+    after it are not asked at all, and the record says what happened.
+    """
+    import json
+
+    from polyglot_lc.agents.context import extract_source
+    from polyglot_lc.agents.translator import TranslatorAgent
+    from polyglot_lc.llm.resilience import NoBackupError
+
+    monkeypatch.setenv("MAX_CONCURRENCY", "1")  # deterministic chunk order
+    monkeypatch.setenv("CHUNK_OVERLAP_TOKENS", "0")
+    monkeypatch.setenv("CHUNK_RETRY_BASE_DELAY", "0.01")
+    monkeypatch.setenv("CHUNK_RETRY_MAX_DELAY", "0.02")
+    monkeypatch.setenv("LOG_JSONL", "1")
+    clear_mock_replies()
+    path = _write(tmp_path, DOC + "\nA third paragraph to translate as well.\n")
+    chunks = _chunks_of(path)
+    assert len(chunks) >= 3
+    doomed = chunks[1].id
+    attempts = {"n": 0}
+
+    def dying_translate(self, prompt, chunk_id=""):
+        if chunk_id == doomed:
+            attempts["n"] += 1
+            raise NoBackupError("no backup endpoint is configured: 429")
+        return "T::" + extract_source(prompt)
+
+    monkeypatch.setattr(TranslatorAgent, "translate", dying_translate)
+    out = tmp_path / "stopped.md"
+    result = _run(path, out=str(out), max_tokens=15)  # must not raise
+
+    # One attempt, not a wait: the chunk was asked once and the run gave up.
+    assert attempts["n"] == 1
+    assert result.chunks_failed >= 1
+    assert any("no backup endpoint" in error for error in result.errors), result.errors
+    records = [
+        json.loads(line) for line in Path(result.log_path).read_text(encoding="utf-8").splitlines()
+    ]
+    # No chunk was waited out: the run did not sit on the dead endpoint.
+    assert not [record for record in records if record.get("type") == "retry_wait"]
+    end = [record for record in records if record.get("type") == "run_end"][-1]
+    assert (end["status"], end["exit_code"]) == ("failed", 1)
 
 
 def test_an_interrupted_run_is_not_recorded_as_a_finished_one(mock_env, tmp_path, monkeypatch):

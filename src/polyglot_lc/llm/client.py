@@ -7,7 +7,7 @@ the same code path. Supports mock mode (``LLM_MOCK=1``) for demos/tests.
 Resilience: transient failures (rate limits, timeouts, connection errors) are
 retried with provider-hinted or exponential backoff (see
 ``polyglot_lc.llm.resilience``); when retries are exhausted, chat calls fail
-over to the per-agent backup endpoint configured via ``<NAME>_BACKUP_*`` vars.
+over to the backup endpoint the whole pipeline shares (``LLM_BACKUP_*``).
 """
 
 from __future__ import annotations
@@ -285,9 +285,9 @@ def clear_mock_replies() -> None:
 class LLMClient:
     """Chat + embeddings client for one OpenAI-compatible endpoint.
 
-    When the agent config defines a backup endpoint (``<NAME>_BACKUP_BASE_URL``
-    + ``<NAME>_BACKUP_MODEL``), chat calls that exhaust their retries on the
-    primary are executed once against the backup instead of failing.
+    When the agent config carries a backup endpoint (the one the whole
+    pipeline shares, ``LLM_BACKUP_*``), chat calls that exhaust their retries
+    on the primary are executed once against the backup instead of failing.
     """
 
     def __init__(self, config: AgentConfig | EmbedConfig) -> None:

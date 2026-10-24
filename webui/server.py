@@ -11,9 +11,9 @@ writes the system configuration. There is no ``/api/config``: the application
 has no view of ``.env`` — not a value, not a key name, not whether a credential
 is set. Runs inherit the server's environment, and a human changes that from a
 terminal. The only translation preferences the API accepts are the ones that
-belong to a single run (languages, domain, glossary, chunk budget, output
+belong to a single run (languages, glossary, chunk budget, output
 format), and the page sends just the document, its two languages and
-the output format: the domain, the terms and the chunk budget are the
+the output format: the terms and the chunk budget are the
 pipeline's own to work out from the text. Continuing a run ("Tiếp tục") accepts
 none of those preferences: it carries the id of the run being continued, and
 what gets relaunched is that run's own stored command with ``--resume``.
@@ -93,6 +93,16 @@ PDF_MAGIC = b"%PDF-"
 #: Markdown, for the route that returns the translated document.
 MARKDOWN_TYPE = "text/markdown; charset=utf-8"
 
+#: The pipeline's sentinels around emphasised words and shielded code. Mirrored
+#: from the page (`TYPE_MARKER_RE` in ``app.js``): the pane and a downloaded file
+#: have to agree on which runs of text are machinery. Local rather than imported
+#: from ``polyglot_lc`` — this server never loads the package (see the package
+#: docstring).
+TYPE_MARKER_RE = re.compile(r"⟦(?:/?BOLD|/?ITALIC|CODE_\d+)⟧")
+
+#: One matched pair of emphasis sentinels, innermost words in group 2.
+_EMPHASIS_PAIR_RE = re.compile(r"⟦(BOLD|ITALIC)⟧(.*?)⟦/\1⟧", re.DOTALL)
+
 #: The rebuilt, layout-preserving PDF.
 PDF_TYPE = "application/pdf"
 
@@ -112,7 +122,6 @@ RUN_SUMMARY_FIELDS = (
     "file",
     "src",
     "tgt",
-    "domain",
     "chunks",
     "exit_code",
     "output_path",
@@ -132,6 +141,30 @@ def _redact(text: str) -> str:
     if not text:
         return ""
     return _SECRET_RE.sub("***", text)
+
+
+def _as_markdown(text: str) -> str:
+    """The extraction with its machinery written as Markdown.
+
+    ``⟦BOLD⟧…⟦/BOLD⟧`` and ``⟦ITALIC⟧…⟦/ITALIC⟧`` become ``**…**`` and
+    ``*…*``: the pipeline holds those pairs apart from the model so they survive
+    translation, and a file a reader keeps should show the emphasis they carried.
+    ``⟦CODE_n⟧`` is dropped instead — the block it stands for is not in this text
+    at all — as is any token left unmatched, which has nothing left to express.
+    """
+    out = text
+    while True:
+        replaced = _EMPHASIS_PAIR_RE.sub(
+            lambda match: (
+                ("**" if match.group(1) == "BOLD" else "*")
+                + match.group(2)
+                + ("**" if match.group(1) == "BOLD" else "*")
+            ),
+            out,
+        )
+        if replaced == out:
+            return TYPE_MARKER_RE.sub("", out)
+        out = replaced
 
 
 def _content_disposition(name: str) -> str:
@@ -375,7 +408,11 @@ class Api:
             if parts[1] == "bundle":
                 return self._run_bundle(run_id)
             if parts[1] == "source":
-                return self._run_source(run_id)
+                return self._run_source(
+                    run_id,
+                    download=_flagged(query, "download"),
+                    keep_markers=_first(query, "markers") == "keep",
+                )
             if parts[1] == "partial":
                 return self._run_partial(run_id)
         if len(parts) == 2 and method == "POST" and parts[1] == "stop":
@@ -550,7 +587,6 @@ class Api:
                 file=file,
                 src=str(data.get("src") or "auto"),
                 tgt=str(data.get("tgt") or "vi"),
-                domain=str(data.get("domain") or "general"),
                 glossary=glossary,
                 max_tokens=max_tokens,
                 # Kept for the test suite and for a demo deployment driven from
@@ -568,7 +604,7 @@ class Api:
     def _resume_run(self, data: dict[str, Any]) -> Response:
         """Continue the run named by ``run_id``, in place.
 
-        Everything the child needs — document, languages, domain, glossary,
+        Everything the child needs — document, languages, glossary,
         token budget, output path, Translator model — is stored on that run's
         own record, so the page sends only its id. The run keeps its identity:
         same run_id, same log directory, same output file, and its earlier
@@ -705,13 +741,21 @@ class Api:
             return error(404, f"no such run: {run_id}")
         return json_response(self.manager.partial(run_id))
 
-    def _run_source(self, run_id: str) -> Response:
+    def _run_source(
+        self, run_id: str, download: bool = False, keep_markers: bool = False
+    ) -> Response:
         """The source document's own text, for the pane a reader compares to.
 
         Extraction is the pipeline's own (through the probe), so the text shown
         is the text that was translated, and it is cached by file identity:
         re-reading a 40-page book on every pane switch would make the page feel
         broken.
+
+        With ``download`` the same text is answered as a Markdown file instead of
+        JSON, in either of the two shapes a reader may want to keep: the
+        extraction exactly as the pipeline wrote it (``keep_markers``), markers
+        and all, or the same words with the emphasis written the Markdown way and
+        the code markers gone (see :func:`_as_markdown`).
         """
         record = self.runs.read_record(run_id)
         if record is None:
@@ -726,17 +770,27 @@ class Api:
         key = (str(path), info.st_size, info.st_mtime_ns)
         cached = self._source_cache.get(key)
         if cached is not None:
-            return json_response({**cached, "cached": True})
-        try:
-            payload = self.manager.probe(["--text", str(path)])
-        except RunPlanError as exc:
-            return error(422, f"could not read the source document: {exc}")
-        if not isinstance(payload, dict) or "text" not in payload:
-            return error(502, "the extractor returned no text")
-        if len(self._source_cache) >= 4:  # bound it: a book is megabytes
-            self._source_cache.pop(next(iter(self._source_cache)))
-        self._source_cache[key] = payload
-        return json_response({**payload, "cached": False})
+            payload, fresh = cached, False
+        else:
+            try:
+                payload = self.manager.probe(["--text", str(path)])
+            except RunPlanError as exc:
+                return error(422, f"could not read the source document: {exc}")
+            if not isinstance(payload, dict) or "text" not in payload:
+                return error(502, "the extractor returned no text")
+            if len(self._source_cache) >= 4:  # bound it: a book is megabytes
+                self._source_cache.pop(next(iter(self._source_cache)))
+            self._source_cache[key] = payload
+            fresh = True
+        if not download:
+            return json_response({**payload, "cached": not fresh})
+        text = str(payload.get("text") or "")
+        body = text if keep_markers else _as_markdown(text)
+        stem = Path(record.file).stem
+        # The extraction keeps its own name; the cleaned copy says so, because
+        # the two land in the same folder and differ only in what was removed.
+        name = f"{stem}.goc.md" if keep_markers else f"{stem}.goc-sach.md"
+        return Response(200, body.encode("utf-8"), MARKDOWN_TYPE, _content_disposition(name))
 
     # Static ------------------------------------------------------------
     @property

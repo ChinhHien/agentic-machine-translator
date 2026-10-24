@@ -41,6 +41,7 @@ class TranslatorAgent(Agent):
         glossary_md: str = "",
         extra_critique: str = "",
         section_note: str = "",
+        skill_instruction: str = "",
     ) -> list[dict[str, str]]:
         """Assemble the translation prompt (exposed for SkillOpt testing).
 
@@ -60,6 +61,10 @@ class TranslatorAgent(Agent):
             )
         ]
         user_parts: list[str] = []
+        if skill_instruction:
+            # Constant for the whole run, first in the dynamic part: the skill
+            # is read once per run, so this line does not churn between chunks.
+            user_parts.append("Style learned over previous runs: " + skill_instruction)
         if few_shot:
             user_parts.append("Examples:\n" + "\n".join(few_shot))
         tm_hits = self.tm.lookup(chunk_text, src_lang, tgt_lang)

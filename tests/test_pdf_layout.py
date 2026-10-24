@@ -17,6 +17,7 @@ from polyglot_lc.ingest.pdf_layout import (
     _page_lines,
     _table_grid,
     bind_page_geometry,
+    line_spans,
     line_text,
     looks_like_code,
     normalize_glyphs,
@@ -136,6 +137,29 @@ def test_line_text_keeps_words_without_internal_spaces():
     assert line_text(line["chars"]) == "ArrayList methods"
 
 
+def test_a_raised_small_glyph_keeps_its_exponent():
+    """``n²`` is a small raised 2 in the PDF, not the letter n and a digit.
+
+    Reading the raised glyph as an ordinary ``2`` is how the translator was
+    asked to translate ``n2`` and the rebuilt page lost the exponent.
+    """
+    chars = [
+        {"text": "n", "x0": 100.0, "x1": 107.0, "size": 12.0, "bottom": 112.0},
+        {"text": "2", "x0": 107.0, "x1": 110.0, "size": 7.0, "bottom": 108.0},
+    ]
+    assert line_text(chars) == "n²"
+    assert line_spans(chars)[0][0] == "n²"
+
+
+def test_a_small_glyph_on_the_baseline_stays_a_digit():
+    """Small type is not an exponent unless it is raised above the line."""
+    chars = [
+        {"text": "n", "x0": 100.0, "x1": 107.0, "size": 12.0, "bottom": 112.0},
+        {"text": "2", "x0": 107.0, "x1": 110.0, "size": 7.0, "bottom": 112.0},
+    ]
+    assert line_text(chars) == "n2"
+
+
 # ----------------------------- classifications ------------------------------
 def test_monospace_run_becomes_code_with_indentation():
     lines = [
@@ -203,9 +227,7 @@ def test_cover_fields_that_each_open_with_a_bold_label_are_separate_blocks():
         ("Backend Framework:", "Django"),
     ]
     lines = [
-        _styled_line(
-            [(_words(label), BOLD_FACE), (_words(value), BODY)], top=100.0 + 14.5 * i
-        )
+        _styled_line([(_words(label), BOLD_FACE), (_words(value), BODY)], top=100.0 + 14.5 * i)
         for i, (label, value) in enumerate(fields)
     ]
     md = pages_to_markdown([_page(lines)])
@@ -233,14 +255,157 @@ def test_a_wrapped_paragraph_of_bold_lead_ins_still_stays_one_block():
     assert "⟦BOLD⟧Deployment Steps:⟦/BOLD⟧ The application is deployed" in md
 
 
-def test_running_head_is_dropped():
-    lines = [
-        _line(["10", "Chapter", "2", "Analysis"], top=91.0, font=BOLD),
-        _line(["Body", "text", "here."], top=127.0),
+def _with_folios(*contents: list[dict], height: float = 842.0) -> list:
+    """Pages that print a bare folio in their foot band, one per page.
+
+    Without that, the document says nothing about its own pagination and the
+    extractor keeps an edge number as content (see `_looks_like_running_head`).
+    """
+    return [
+        _page(
+            [*lines, _line([str(index + 1)], top=height - 20.0, x0=300.0)],
+            height=height,
+        )
+        for index, lines in enumerate(contents)
     ]
-    md = pages_to_markdown([_page(lines)])
-    assert "10 Chapter 2 Analysis" not in md
+
+
+def test_running_head_is_dropped_when_it_carries_this_page_folio():
+    """Một dòng ở đầu trang mang **đúng số trang của chính trang đó** là trang trí.
+
+    Bằng chứng là số trang, không phải việc dòng bắt đầu hay kết thúc bằng một số:
+    tài liệu tự khai số trang của mỗi trang qua các dòng chỉ có số.
+    """
+    pages = _with_folios([], [], [])
+    pages.append(
+        _page(
+            [
+                _line(["4", "Chapter", "2", "Analysis"], top=91.0, font=BOLD),
+                _line(["Body", "text", "here."], top=127.0),
+            ],
+            height=842.0,
+        )
+    )
+    md = pages_to_markdown(pages)
+    assert "Chapter 2 Analysis" not in md
     assert "Body text here." in md
+
+
+def test_lines_at_the_top_of_a_page_are_not_furniture_just_because_of_a_number():
+    """Số ở đầu dòng chưa phải số trang: mục danh sách, hàng bảng, mục lục.
+
+    Ba thứ từng bị xoá khỏi trang thật, vì ở dải đầu trang một số ở mép dòng là
+    "số trang": bốn mục đầu của danh sách bước trong báo cáo sinh viên, dòng
+    tiêu đề và dòng đầu của bảng phụ lục, và mục lục trỏ tới trang khác.
+    """
+    pages = _with_folios([], [], [])
+    pages.append(
+        _page(
+            [
+                _line(["1.", "The", "administrator", "opens", "the", "page."], top=55.0),
+                _line(["2.", "The", "administrator", "selects", "the", "function."], top=70.0),
+                _line(["1", "IBM", "Armonk", "New", "York", "USA"], top=95.0),
+                _line(["Most", "Common", "Evidence", "Used", "by", "Authors", "38"], top=120.0),
+            ],
+            height=842.0,
+        )
+    )
+    md = pages_to_markdown(pages)
+    assert "The administrator opens the page." in md, "mục danh sách đầu trang bị mất"
+    assert "The administrator selects the function." in md
+    assert "IBM Armonk New York USA" in md, "hàng bảng bị mất"
+    assert "Most Common Evidence Used by Authors 38" in md, "mục lục bị mất"
+
+
+def test_a_bullet_whose_text_is_a_roman_numeral_survives():
+    """\"• C\" là mục danh sách ngôn ngữ, không phải số trang C (100).
+
+    Một dãy chữ thuộc bộ chữ số La Mã không phải số La Mã: `id` (I+D) và `• C`
+    từng bị coi là số trang và xoá cả dòng.
+    """
+    md = pages_to_markdown([_page([_line(["•", "C"], top=80.0)], height=842.0)])
+    assert "C" in md
+
+
+def test_a_running_head_without_a_page_number_is_dropped_when_it_repeats():
+    """Tiêu đề in lại ở đầu trang, không có số trang, vẫn là trang trí.
+
+    Không có số nào để đối chiếu, nên bằng chứng là sự lặp lại: cùng một dòng, ở
+    cùng dải lề, trên một phần năm số trang. Dòng tiêu đề ở đây còn được đặt cỡ
+    lớn hơn thân bài, nên phép thử này phải chạy *trước* bước nhận diện tiêu đề
+    mục — nếu không, 122 bản sao của nó trong tài liệu CDC sẽ thành 122 mục lục.
+    """
+    pages = [
+        _page(
+            [
+                _line(["A", "GUIDE", "TO", "WRITING"], top=30.0, size=14.0, font=BOLD),
+                _line(["First", "line", "of", "prose"], top=120.0),
+                _line(["Second", "line", "of", "prose"], top=136.0),
+                _line(["Third", "line", "of", "prose"], top=152.0),
+            ],
+            height=842.0,
+        )
+        for _ in range(4)
+    ]
+    md = pages_to_markdown(pages)
+    assert "A GUIDE TO WRITING" not in md, "tiêu đề lặp lại vẫn nằm trong luồng văn bản"
+    assert "First line of prose" in md
+
+
+def test_a_line_repeated_on_two_pages_is_still_content():
+    """Hai lần lặp chưa phải trang trí: một tiêu đề mục dùng lại là chữ thật."""
+    pages = [
+        _page(
+            [
+                *([_line(["Draft", "copy"], top=30.0)] if n < 2 else []),
+                _line(["Body", str(n)], top=120.0),
+            ],
+            height=842.0,
+        )
+        for n in range(5)
+    ]
+    md = pages_to_markdown(pages)
+    assert md.count("Draft copy") == 2
+
+
+def test_a_line_repeated_inside_the_text_block_is_content():
+    """Từ lặp lại trong thân bài là nội dung, dù nó xuất hiện ở mọi trang.
+
+    Đầu đề cột của bảng, đáp án in dưới từng bài tập — những thứ này nằm trong
+    khối chữ, không nằm ở dải lề, nên phép thử theo dải lề không đụng tới.
+    """
+    pages = [
+        _page(
+            [_line(["Example"], top=200.0), _line(["Body", "text", str(n)], top=300.0)],
+            height=842.0,
+        )
+        for n in range(5)
+    ]
+    md = pages_to_markdown(pages)
+    assert md.count("Example") == 5
+
+
+def test_a_running_foot_is_furniture_even_though_its_page_number_changes():
+    """Chân trang chỉ đổi số trang thì vẫn là một dòng lặp lại.
+
+    ``Last update: May 2019 41 of 163`` không bao giờ trùng khớp tuyệt đối giữa
+    hai trang, nhưng số được bỏ trống trước khi so — và nếu nó ở lại trong luồng
+    văn bản, nó dính vào câu đầu của trang sau (dòng cuối trang không có dấu
+    chấm, dòng sau bắt đầu bằng chữ thường, nên thành một đoạn).
+    """
+    pages = [
+        _page(
+            [
+                _line(["Body", "text", str(n)], top=120.0),
+                _line(["Last", "update:", "May", "2019", str(n + 1), "of", "4"], top=820.0),
+            ],
+            height=842.0,
+        )
+        for n in range(4)
+    ]
+    md = pages_to_markdown(pages)
+    assert "Last update" not in md
+    assert md.count("Body text") == 4
 
 
 # ------------------------- document-derived parameters ---------------------
@@ -849,6 +1014,29 @@ def test_a_numbered_list_records_its_labels(tmp_path):
     geo = _geometry("Một câu mở đầu.\n\n1. mục đầu\n2. mục sau\n", tmp_path)
     assert geo[1]["kind"] == "list"
     assert geo[1]["markers"] == ["1.", "2."]
+
+
+def test_a_numbered_entry_past_nine_is_not_glued_to_the_line_above():
+    """A numbered line was recognized by its second and third character only —
+    single-digit markers — so an entry numbered ``10.`` read as body text and
+    was folded as the previous item's continuation: entries 10 onward all ran
+    on into the ninth, one contents line holding the rest of the contents."""
+    lines = [
+        _line(["9.", "Conclusion"], top=200.0),
+        _line(["10.", "Security", "and", "Privacy"], top=218.0),
+        _line(["11.", "Future", "Work"], top=236.0),
+    ]
+    md = pages_to_markdown([_page(lines)])
+    assert "Conclusion 10." not in md
+    assert "10. Security and Privacy" in md
+    assert "11. Future Work" in md
+
+
+def test_a_list_with_sixteen_items_records_every_label(tmp_path):
+    items = "\n".join(f"{n}. mục {n}" for n in range(1, 17))
+    geo = _geometry(f"Một câu mở đầu.\n\n{items}\n", tmp_path)
+    assert geo[1]["kind"] == "list"
+    assert geo[1]["markers"] == [f"{n}." for n in range(1, 17)]
 
 
 # ------------------------- emphasis spans in a line -------------------------

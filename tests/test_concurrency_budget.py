@@ -24,12 +24,6 @@ PLAIN = (
 MAX_TOKENS = 15
 EXPECTED_CHUNKS = 3
 
-# Several headed sections, so the per-section planning cost is visible.
-MANY_SECTIONS = "".join(
-    f"## Section {i}\n\nParagraph {i} describes a distinct part of the system.\n\n"
-    for i in range(6)
-)
-
 
 @pytest.fixture(autouse=True)
 def _clean_mock_replies():
@@ -152,25 +146,6 @@ def test_request_budget_full_quality_path(mock_env, tmp_path, monkeypatch):
     assert snap["calls"] < 3 * n + len(sections) + 3
     assert result.standard_path_chunks == n
     assert result.fast_path_chunks == 0
-
-
-def test_merged_planner_beats_legacy_section_by_section_planning(mock_env, tmp_path, monkeypatch):
-    """P0 regression: planning costs 1 request, not one per section.
-
-    Section counts depend on chunk boundaries, so the legacy planner is compared
-    against the same document rather than against a hard-coded number.
-    """
-    path = _write(tmp_path, MANY_SECTIONS)
-    _chunks, sections = _expected_chunks(path)
-
-    _result, _snap, unified = _run(mock_env, monkeypatch, path, concurrency=1)
-    assert _calls(unified, "PLANNER") == 2  # 1 plan + 1 SkillOpt gradient
-
-    monkeypatch.setenv("UNIFIED_PLANNER", "0")
-    _result, _snap, legacy = _run(mock_env, monkeypatch, path, concurrency=1)
-    # legacy: one request per section + doc summary + plan + SkillOpt gradient
-    assert _calls(legacy, "PLANNER") == len(sections) + 3
-    assert _calls(legacy, "PLANNER") > _calls(unified, "PLANNER")
 
 
 def test_request_budget_critic_requires_refine(mock_env, tmp_path, monkeypatch):
@@ -412,16 +387,6 @@ def _ctx(mock_env, rb):
     )
 
 
-def test_plan_document_survives_rb_failure(mock_env):
-    from polyglot_lc.orchestrator.graph import plan_document
-
-    ctx = _ctx(mock_env, _BoomRB())
-    plan = plan_document(
-        ctx, doc_summary="tech doc", src_lang="en", tgt_lang="vi", domain="general", glossary_md=""
-    )
-    assert plan["strategy"]  # planning continued without traces
-
-
 def test_chunk_survives_rb_upsert_failure(mock_env, tmp_path):
     from polyglot_lc.orchestrator.graph import make_chunk_graph
 
@@ -434,7 +399,6 @@ def test_chunk_survives_rb_upsert_failure(mock_env, tmp_path):
             "chunk": chunks[0],
             "src_lang": "en",
             "tgt_lang": "vi",
-            "domain": "general",
             "strategy": "literal",
             "few_shot": [],
             "pitfalls": [],
@@ -444,6 +408,43 @@ def test_chunk_survives_rb_upsert_failure(mock_env, tmp_path):
     )
     assert out["translated"]
     assert out["stored"] is False  # RB failure swallowed
+
+
+def test_a_chunk_is_hard_checked_once_per_draft(mock_env, tmp_path, monkeypatch):
+    """Hard checks ran up to three times over the same text; now once.
+
+    The translator scored the draft with ``draft_signals`` (one scan), the fast
+    verify path scanned it again, and ``VerifierAgent.verify`` scanned it a
+    third time. Every draft is prepared once now, and its problems travel with
+    the state to both verify paths.
+    """
+    from polyglot_lc.orchestrator import graph as graph_module
+    from polyglot_lc.orchestrator.graph import make_chunk_graph
+
+    calls: list[str] = []
+    real = graph_module.hard_checks
+
+    def counting(source, translation):
+        calls.append(source)
+        return real(source, translation)
+
+    monkeypatch.setattr(graph_module, "hard_checks", counting)
+    path = _write(tmp_path, PLAIN)
+    chunks, _ = _expected_chunks(path)
+    out = make_chunk_graph(_ctx(mock_env, None)).invoke(
+        {
+            "chunk": chunks[0],
+            "src_lang": "en",
+            "tgt_lang": "vi",
+            "strategy": "literal",
+            "few_shot": [],
+            "pitfalls": [],
+            "glossary_md": "",
+        },
+        config={"recursion_limit": 100},
+    )
+    assert out["translated"]
+    assert len(calls) == 1
 
 
 def test_skillopt_failure_does_not_fail_run(mock_env, tmp_path, monkeypatch):
@@ -456,6 +457,62 @@ def test_skillopt_failure_does_not_fail_run(mock_env, tmp_path, monkeypatch):
     path = _write(tmp_path, PLAIN)
     result, _snap, _by = _run(mock_env, monkeypatch, path, concurrency=2)
     assert result.skill_promoted is False
+    assert result.output_path and __import__("pathlib").Path(result.output_path).exists()
+
+
+def test_a_run_promotes_the_skill_to_skill_md(mock_env, tmp_path, monkeypatch):
+    """A finished run with good critic scores writes the one skill.md file
+    (frontmatter + markdown body), acceptance criterion 1."""
+    path = _write(tmp_path, PLAIN)
+    result, _snap, _by = _run(mock_env, monkeypatch, path, concurrency=2)
+    assert result.skill_promoted is True  # mock critic scores are 8.5
+    skill_file = tmp_path / "skills" / "en-vi" / "skill.md"
+    assert skill_file.exists()
+    text = skill_file.read_text(encoding="utf-8")
+    assert text.startswith("---") and "mean_score:" in text
+    assert "\nInstruction\n" in text and "\nRationale\n" in text
+
+
+def test_promoted_skill_reaches_every_translator_prompt(mock_env, tmp_path, monkeypatch):
+    """The read loop: a skill.md on disk puts its instruction into every
+    Translator prompt of the next run — main site and retranslate site alike
+    (the verifier-failure reply forces the retry). Acceptance criterion 2."""
+    skill_dir = tmp_path / "skills" / "en-vi"
+    skill_dir.mkdir(parents=True)
+    (skill_dir / "skill.md").write_text(
+        "---\nsrc_lang: en\ntgt_lang: vi\nmean_score: 8.42\n---\n"
+        "Instruction\nNever invent names.\n\nFew-shot\nHai => Two\n\nRationale\nr\n",
+        encoding="utf-8",
+    )
+    seen: list[str] = []
+    seen_few_shot: list[list[str]] = []
+    from polyglot_lc.agents.translator import TranslatorAgent
+
+    orig = TranslatorAgent.build_prompt
+
+    def spy(self, *args, **kwargs):
+        seen.append(str(kwargs.get("skill_instruction", "")))
+        seen_few_shot.append(list(kwargs.get("few_shot") or []))
+        return orig(self, *args, **kwargs)
+
+    monkeypatch.setattr(TranslatorAgent, "build_prompt", spy)
+    path = _write(tmp_path, PLAIN)
+    replies = {"translation QA verifier": '{"pass": false, "reasons": ["dropped"]}'}
+    _run(mock_env, monkeypatch, path, concurrency=1, replies=replies)
+    assert seen, "build_prompt never ran"
+    assert all(s == "Never invent names." for s in seen), seen
+    # The skill's few-shot is merged into every prompt's examples too
+    # (acceptance criterion 2, second half).
+    assert all("Hai => Two" in fs for fs in seen_few_shot), seen_few_shot
+
+
+def test_corrupt_skill_md_does_not_fail_the_run(mock_env, tmp_path, monkeypatch):
+    """A hand-damaged skill.md reads as no skill; the translation still ends."""
+    skill_dir = tmp_path / "skills" / "en-vi"
+    skill_dir.mkdir(parents=True)
+    (skill_dir / "skill.md").write_text("garbage without frontmatter", encoding="utf-8")
+    path = _write(tmp_path, PLAIN)
+    result, _snap, _by = _run(mock_env, monkeypatch, path, concurrency=2)
     assert result.output_path and __import__("pathlib").Path(result.output_path).exists()
 
 
@@ -527,7 +584,6 @@ def test_a_lopsided_emphasis_pair_is_recorded_as_an_emphasis_error(mock_env, tmp
             "chunk": chunks[0],
             "src_lang": "en",
             "tgt_lang": "vi",
-            "domain": "general",
             "strategy": "literal",
             "few_shot": [],
             "pitfalls": [],

@@ -184,6 +184,43 @@ def glossary_to_md(terms: list[GlossaryTerm]) -> str:
 #: without bound with a large CSV (insertion order preserved, deterministic).
 MAX_USER_GLOSSARY_TERMS = 200
 
+#: The terminology a language pair starts from, before the Planner or the user
+#: say anything. Each chunk's prompt is built independently, so without one
+#: agreed target form a book calls the same concept "hàm tạo", "hàm dựng" and
+#: "hàm khởi tạo" in three chapters. Only core concepts belong here — an
+#: identifier is not translated, and forcing a term the domain does not use is
+#: worse than the drift.
+DEFAULT_GLOSSARIES: dict[tuple[str, str], dict[str, str]] = {
+    ("en", "vi"): {
+        "constructor": "hàm khởi tạo",
+        "instance variable": "biến thực thể",
+    },
+}
+
+
+def default_glossary(src: str, tgt: str) -> dict[str, str]:
+    """The built-in terminology for a language pair, as a fresh dictionary."""
+    return dict(DEFAULT_GLOSSARIES.get((src.strip().lower(), tgt.strip().lower()), {}))
+
+
+#: The glossary a document deserves grows with it: a fixed 40 leaves most of a
+#: 1000-page book's terminology unpinned, while 200 terms on a memo would be
+#: noise in every chunk's prompt. One term per :data:`TERMS_PER_CHARS`
+#: characters — roughly one per page and a half — with the old 40 as the floor
+#: and the user CSV's 200 as the ceiling, so machine terms can never outweigh the
+#: user's own dictionary.
+GLOSSARY_TERMS_FLOOR = 40
+GLOSSARY_TERMS_CEILING = MAX_USER_GLOSSARY_TERMS
+TERMS_PER_CHARS = 8_000
+
+
+def glossary_budget(chars: int) -> int:
+    """How many glossary terms a document of *chars* characters deserves."""
+    return max(
+        GLOSSARY_TERMS_FLOOR,
+        min(GLOSSARY_TERMS_CEILING, GLOSSARY_TERMS_FLOOR + max(0, chars) // TERMS_PER_CHARS),
+    )
+
 
 def render_user_glossary(mapping: dict[str, str], limit: int = MAX_USER_GLOSSARY_TERMS) -> str:
     """Render a user glossary mapping as prompts bullets, capped at *limit*."""

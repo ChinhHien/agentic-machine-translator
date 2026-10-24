@@ -3,7 +3,8 @@
 After each chunk we collect (prompt, output, critic_score). The Planner LLM
 proposes a *textual gradient* — an improved instruction/few-shot text. A new
 skill is only promoted when the mean critic score of the last 20 chunks beats
-the currently promoted skill's recorded mean.
+the currently promoted skill's recorded mean. Scores and skill live together
+in one ``skills/<src>-<tgt>/skill.md`` file per language pair.
 """
 
 from __future__ import annotations
@@ -18,6 +19,8 @@ from polyglot_lc.skillopt.skill_store import SkillStore
 
 WINDOW = 20
 
+_DEFAULT_INSTRUCTION = "Translate faithfully and fluently."
+
 
 class SkillOptimizer:
     """Collect per-chunk feedback and promote improved Translator skills."""
@@ -29,6 +32,7 @@ class SkillOptimizer:
     ) -> None:
         self.store = store
         self.planner = planner
+        #: Flat buffer: one run is one language pair.
         self._buffer: list[dict[str, Any]] = []
 
     # ------------------------------------------------------------------
@@ -36,7 +40,6 @@ class SkillOptimizer:
         self,
         src: str,
         tgt: str,
-        domain: str,
         prompt: str,
         output: str,
         critic_score: float,
@@ -46,26 +49,21 @@ class SkillOptimizer:
             {
                 "src": src,
                 "tgt": tgt,
-                "domain": domain,
                 "prompt": prompt,
                 "output": output,
                 "score": critic_score,
             }
         )
-        self.store.append_score(src, tgt, domain, critic_score)
+        self.store.record_score(src, tgt, critic_score)
 
     # ------------------------------------------------------------------
-    def propose_gradient(self, src: str, tgt: str, domain: str) -> dict[str, Any] | None:
+    def propose_gradient(self, src: str, tgt: str) -> dict[str, Any] | None:
         """Ask the Planner for a textual gradient over the current skill.
 
         Returns {instruction, few_shot, rationale} or None on failure.
         """
-        current = self.store.load(src, tgt, domain) or {
-            "instruction": "Translate faithfully and fluently.",
-            "few_shot": [],
-            "mean_score": None,
-        }
-        recent = self._recent_observations(src, tgt, domain)
+        current = self.store.load(src, tgt) or {}
+        recent = self._recent_observations(src, tgt)
         if not recent:
             return None
 
@@ -76,10 +74,10 @@ class SkillOptimizer:
         )
         prompt = (
             "You optimize translation prompts via textual gradient descent.\n"
-            f"Language pair: {src}->{tgt}; domain: {domain}\n"
-            f"Current translator instruction:\n{current.get('instruction', '')}\n"
+            f"Language pair: {src}->{tgt}\n"
+            f"Current translator instruction:\n{current.get('instruction') or _DEFAULT_INSTRUCTION}\n"
             f"Current few-shot examples:\n"
-            + "\n".join(current.get("few_shot", []))
+            + "\n".join(current.get("few_shot") or [])
             + "\n\nRecent chunk samples with critic scores:\n"
             + samples
             + "\n\nPropose an improved instruction (max 4 sentences) and up to 3 "
@@ -99,17 +97,17 @@ class SkillOptimizer:
         }
 
     # ------------------------------------------------------------------
-    def maybe_promote(self, src: str, tgt: str, domain: str) -> dict[str, Any] | None:
+    def maybe_promote(self, src: str, tgt: str) -> dict[str, Any] | None:
         """Promote the buffered gradient skill if recent mean beat the old one.
 
         Returns the promoted skill dict, or None when not promoted.
         """
-        gradient = self.propose_gradient(src, tgt, domain)
+        gradient = self.propose_gradient(src, tgt)
         if gradient is None or not gradient["instruction"]:
             return None
 
-        current = self.store.load(src, tgt, domain)
-        new_mean = self.store.mean_recent(src, tgt, domain, WINDOW)
+        current = self.store.load(src, tgt)
+        new_mean = self.store.mean_recent(src, tgt, WINDOW)
         old_mean = float(current.get("mean_score", 0.0)) if current else 0.0
 
         # Promotion rule (spec): the mean critic score of the last 20 chunks
@@ -129,27 +127,28 @@ class SkillOptimizer:
             "rationale": gradient["rationale"],
             "mean_score": round(new_mean, 3),
             "promoted_at": time.time(),
-            "domain": domain,
             "src_lang": src,
             "tgt_lang": tgt,
         }
-        self.store.save(src, tgt, domain, skill)
+        self.store.save(
+            src,
+            tgt,
+            instruction=gradient["instruction"],
+            few_shot=gradient["few_shot"],
+            rationale=gradient["rationale"],
+            mean_score=round(new_mean, 3),
+        )
         self._buffer = [
-            b
-            for b in self._buffer
-            if not (b["src"] == src and b["tgt"] == tgt and b["domain"] == domain)
+            b for b in self._buffer if not (b["src"] == src and b["tgt"] == tgt)
         ]
         logger.info(
-            "SkillOpt promoted new skill for {}/{} ({:.2f} > {:.2f})",
+            "SkillOpt promoted new skill for {} ({} > {})",
             f"{src}-{tgt}",
-            domain,
             new_mean,
             old_mean,
         )
         return skill
 
     # ------------------------------------------------------------------
-    def _recent_observations(self, src: str, tgt: str, domain: str) -> list[dict[str, Any]]:
-        return [
-            b for b in self._buffer if b["src"] == src and b["tgt"] == tgt and b["domain"] == domain
-        ]
+    def _recent_observations(self, src: str, tgt: str) -> list[dict[str, Any]]:
+        return [b for b in self._buffer if b["src"] == src and b["tgt"] == tgt]

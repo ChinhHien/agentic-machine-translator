@@ -140,10 +140,9 @@ def test_memory_mode_reports_what_the_bank_holds(tmp_path):
         collection.upsert(
             ids=[f"t{index}"],
             embeddings=[[0.1, 0.2, 0.3]],
-            documents=[f"[tech] en->vi: strategy {index}"],
+            documents=[f"en->vi: strategy {index}"],
             metadatas=[
                 {
-                    "domain": "tech",
                     "src_lang": "en",
                     "tgt_lang": "vi",
                     "strategy": f"strategy {index}",
@@ -159,7 +158,7 @@ def test_memory_mode_reports_what_the_bank_holds(tmp_path):
     payload = json.loads(proc.stdout)
     assert payload["total"] == 2 and payload["sampled"] == 2
     (pair,) = payload["pairs"]
-    assert (pair["pair"], pair["domain"]) == ("en-vi", "tech")
+    assert pair["pair"] == "en-vi"
     assert pair["traces"] == 2
     assert pair["mean_score"] == 0.85
     # Newest first, and the whole point of the panel: it shows the strategies.

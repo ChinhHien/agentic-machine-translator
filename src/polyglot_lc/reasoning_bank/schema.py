@@ -15,7 +15,6 @@ class ReasoningTrace(BaseModel):
     """One retrieval-ready reasoning record stored in ChromaDB."""
 
     id: str = Field(default_factory=lambda: uuid.uuid4().hex[:16])
-    domain: str = "general"
     src_lang: str = "auto"
     tgt_lang: str = "vi"
     strategy: str = ""
@@ -27,12 +26,11 @@ class ReasoningTrace(BaseModel):
 
     def document_text(self) -> str:
         """Text used for embedding the trace."""
-        return f"[{self.domain}] {self.src_lang}->{self.tgt_lang}: {self.strategy}"
+        return f"{self.src_lang}->{self.tgt_lang}: {self.strategy}"
 
     def metadata(self) -> dict[str, Any]:
         """Flattened metadata for ChromaDB (lists joined; chroma-safe types)."""
         return {
-            "domain": self.domain,
             "src_lang": self.src_lang,
             "tgt_lang": self.tgt_lang,
             "strategy": self.strategy[:500],
@@ -54,7 +52,6 @@ class ReasoningTrace(BaseModel):
         split = lambda s: [p for p in (s or "").split(" ||| ") if p]
         return cls(
             id=id,
-            domain=metadata.get("domain", "general"),
             src_lang=metadata.get("src_lang", "auto"),
             tgt_lang=metadata.get("tgt_lang", ""),
             strategy=document or metadata.get("strategy", ""),

@@ -1,11 +1,8 @@
 """Tests for token/request optimizations: source-group routing, cacheable
-shared prefix, reduced summary-tree requests, planner-once, verifier scope and
-the CLI token report.
+shared prefix, planner-once, verifier scope and the CLI token report.
 """
 
 from __future__ import annotations
-
-from types import SimpleNamespace
 
 import pytest
 
@@ -133,34 +130,6 @@ def test_read_source_prefix_marks_cache_when_explicit(mock_env, monkeypatch):
     assert block[0]["cache_control"] == {"type": "ephemeral"}
 
 
-# ------------------------- summary tree request count -----------------------
-class _CountingPlanner:
-    def __init__(self) -> None:
-        self.calls = 0
-
-    def chat(self, messages, **kw):
-        self.calls += 1
-        return SimpleNamespace(text="summary")
-
-
-def test_summary_tree_skips_per_chunk_requests(mock_env, sample_doc):
-    from polyglot_lc.segment.chunker import chunk_document
-    from polyglot_lc.segment.summary_tree import build_sections, summarize_with_planner
-
-    chunks = chunk_document(sample_doc, max_tokens=40, overlap_tokens=0)
-    sections = build_sections(chunks)
-
-    lean = _CountingPlanner()
-    summarize_with_planner(chunks, lean, chunk_summaries=False)
-    # one request per section + one for the document; none per chunk
-    assert lean.calls == len(sections) + 1
-
-    full = _CountingPlanner()
-    summarize_with_planner(chunks, full, chunk_summaries=True)
-    assert full.calls == len(chunks) + len(sections) + 1
-    assert full.calls > lean.calls
-
-
 # ------------------------- verifier scope -----------------------------------
 def test_verifier_sees_the_whole_chunk(mock_env):
     """The verifier's scope is one chunk, and it reads all of it.
@@ -197,22 +166,6 @@ def test_document_plan_costs_one_planner_request(mock_env, sample_pdf_file):
     # One Planner request for the document plan; the SkillOpt gradient call and
     # any consistency patch are separate and not counted here.
     assert result.planner_calls == 1
-
-
-def test_legacy_summary_tree_path_is_still_available(mock_env, sample_pdf_file, monkeypatch):
-    """UNIFIED_PLANNER=0 falls back to the old (more expensive) planning flow."""
-    from polyglot_lc.pipeline import TranslationPipeline
-
-    unified = TranslationPipeline(quiet=True).run(sample_pdf_file, src="en", tgt="vi")
-    assert unified.planner_calls == 1
-
-    monkeypatch.setenv("UNIFIED_PLANNER", "0")
-    legacy = TranslationPipeline(quiet=True).run(
-        sample_pdf_file, src="en", tgt="vi", out=str(sample_pdf_file.with_suffix(".legacy.md"))
-    )
-    # summary tree (one request per section + one for the document) + the plan
-    assert legacy.planner_calls > unified.planner_calls
-    assert legacy.output_path
 
 
 # ------------------------- CLI token report ---------------------------------

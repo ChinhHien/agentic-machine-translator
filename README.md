@@ -33,11 +33,11 @@ flowchart TD
     H --> I["Verifier<br/>hard checks + LLM"]
     I -->|"FAIL"| J["Retranslate ≤ 1"]
     J --> I
-    I -->|"PASS"| K["Vá placeholder bị rơi<br/>→ collect → save_trace"]
+    I -->|"PASS"| K["collect (vá placeholder đã làm<br/>ngay sau khi dịch) → save_trace"]
     K --> CP[("Checkpoint<br/>theo từng chunk")]
     K --> F
 
-    F --> L["Consistency pass<br/>vá thuật ngữ lệch, ≤ CONSISTENCY_MAX_PATCHES"]
+    F --> L["Consistency pass<br/>vá thuật ngữ lệch, lệch nhiều vá trước<br/>≤ max(CONSISTENCY_MAX_PATCHES, 30% số chunk lệch)"]
     L --> M["Assemble<br/>đúng thứ tự chunk, khử overlap, phục hồi code<br/>→ Markdown và/hoặc PDF dựng lại"]
     M --> N["SkillOpt<br/>promote nếu điểm trung bình 20 chunk tốt hơn"]
     N --> O["Báo cáo<br/>token / request / route"]
@@ -58,13 +58,14 @@ Sơ đồ dạng text cho terminal:
    │  Translator ─┬─ fast ──────────────────────────────────────────┼─▶ Verifier
    │              └─ full ─▶ Critic ─▶ [Refiner ─▶ Critic] × rounds │
    │  Verifier ──FAIL──▶ Retranslate (≤1) ──▶ Verifier             │
-   │  PASS ─▶ vá placeholder ─▶ collect ─▶ save_trace ─▶ checkpoint │
+   │  Translator: dịch ─▶ vá placeholder ─▶ hard checks ─▶ route     │
+   │  PASS ─▶ collect ─▶ save_trace ─▶ checkpoint                   │
    └───────────────────────────┬───────────────────────────────────┘
                                ▼
-        Consistency pass (vá thuật ngữ, có trần)
+        Consistency pass (vá thuật ngữ, lệch nhiều vá trước, ngân sách theo tỉ lệ)
                                ▼
         Assemble + phục hồi code ─▶ SkillOpt ─▶ báo cáo
-          (skills/<src>-<tgt>/<domain>.json)
+          (skills/<src>-<tgt>/skill.md)
 ```
 
 ### Workflow dự án
@@ -78,7 +79,7 @@ Sơ đồ dạng text cho terminal:
 | 5 | `plan` | `analysis/unified_planner` | **1 request** | `DocumentPlan` |
 | 6 | `analyse_chunks` | `analysis/complexity` | không | điểm phức tạp mỗi chunk |
 | 7 | mỗi chunk | `orchestrator/graph` | 1–5 request | bản dịch + `path` |
-| 8 | `consistency` | `pipeline/consistency` | ≤ trần | bản vá thuật ngữ |
+| 8 | `consistency` | `pipeline/consistency` | ≤ trần (sàn `CONSISTENCY_MAX_PATCHES`, và ≥30% số chunk lệch) | bản vá thuật ngữ |
 | 9 | `assemble_output` | `pipeline/assembler`, `pipeline/pdf_output` | không | tài liệu cuối (Markdown và/hoặc PDF) |
 | 10 | `skillopt_update` | `skillopt/` | 1 request | kỹ năng (có thể) được promote |
 
@@ -110,14 +111,25 @@ lại bản Markdown đã dịch xong.
   phòng `pypdf → pdfplumber` đã bị bỏ: đầu vào là PDF có lớp văn bản, không OCR.
   Mỗi block còn mang **toạ độ trang** nơi nó được đọc ra, nên cùng một bản dịch có
   thể được dựng lại thành PDF đúng bố cục mà không phải trích xuất lần hai.
+  Tên chương và số trang in ở lề bị bỏ bằng **số trang mà chính tài liệu in ra**
+  (đọc độ lệch giữa số in và chỉ số trang của PDF), nên chỉ dòng nào mang đúng số
+  trang của trang đó mới là trang trí: số thứ tự đầu dòng ("1. The administrator
+  …"), số đầu dòng của bảng và số trang cuối mục lục vẫn ở lại làm nội dung.
+  Dòng nào được tài liệu in lại ở cùng dải lề trên một phần năm số trang cũng bị
+  bỏ — kể cả tiêu đề không mang số ("Guideline for Disinfection … (2008)") và
+  chân trang chỉ đổi số của nó — nên phần chữ gửi cho mô hình dịch không còn
+  hàng trăm bản sao của cùng một dòng.
 - **Ba kiểu đầu ra**: `md` (mặc định, như trước), `pdf` — dựng lại trang gốc với
   chữ đã dịch, giữ nguyên khổ trang, ảnh, đồ hoạ vector và đường kẻ bảng — và
   `both`. Bản dịch được in **đúng kiểu chữ của trang nguồn**: cùng họ font, cùng
   độ đậm/nghiêng và cùng màu, dò từ danh sách font đã cài trên máy và chỉ nhận
   font có dấu tiếng Việt (không khớp thì lấy một font cùng loại serif/sans/mono,
-  cuối cùng mới tới font mặc định). Cỡ chữ cũng giữ nguyên: một dòng nguồn ngắn
-  được nới ra hết bề ngang cột nếu chỗ đó còn trống, nên bản dịch dài hơn bản gốc
-  hiếm khi phải thu nhỏ. Dấu đầu dòng của danh sách và dãy chấm dẫn của mục lục
+  cuối cùng mới tới font mặc định). Cỡ chữ cũng giữ nguyên tuyệt đối: một dòng
+  nguồn ngắn được nới ra hết bề ngang cột nếu chỗ đó còn trống, và khối nào bản
+  dịch dài hơn khung thì phần dư nối tiếp ở **đầu trang sau**, cùng cỡ chữ, đẩy
+  chữ của trang đó xuống dưới — không bao giờ bị thu nhỏ, và không bao giờ để lại
+  một trang chỉ còn một dòng lạc; trang nối riêng chỉ còn dùng khi không còn trang
+  nào để nối tiếp, hoặc trang sau bị bảng/ảnh chiếm kín. Dấu đầu dòng của danh sách và dãy chấm dẫn của mục lục
   (kèm số trang canh phải) được **vẽ lại**, vì đó là bố cục chứ không phải chữ.
   Chọn bằng `--format` trên CLI, một lựa chọn ba chiều trong web UI, hay
   `OUTPUT_FORMAT` trong `.env`. Chữ trong **ô bảng** được dịch và in lại vào đúng
@@ -127,32 +139,47 @@ lại bản Markdown đã dịch xong.
   duy nhất **không được dịch** trong PDF.
 - **Chia đoạn theo ngữ cảnh dài**: chunk theo token (tiktoken, ngân sách lấy từ
   `TRANSLATOR_MODEL`) tại ranh giới đoạn/tiêu đề, có overlap và `block_refs` để
-  hợp nhất khử trùng.
+  hợp nhất khử trùng. Overlap là **ngữ cảnh**, không phải nội dung: một block
+  lớn hơn cả cửa sổ overlap không được replay, và phần đuôi replay bị bỏ nếu nó
+  không còn chỗ bên cạnh block kế (trước đây 15/77 chunk của một sách 187 trang
+  vượt ngân sách, 13 trong đó vì đuôi này; chunk lớn nhất 1 588 token so với
+  ngân sách 700). Chunk chỉ bị coi là trùng khi **mọi** block của nó đã có trong
+  chunk trước — hai đoạn cùng chữ nhưng khác block đều được giữ.
 - **Plan tài liệu trong một lần gọi**: toàn bộ giai đoạn planner — tóm tắt tài
   liệu, strategy, few-shot, pitfalls, thuật ngữ *kèm dạng ngôn ngữ đích*, độ
-  phức tạp và ghi chú từng phần — là **một** request. `UNIFIED_PLANNER=0` khôi
-  phục luồng summary-tree cũ. Đo trên tài liệu 20 chunk (LLM_MOCK):
-
-  | | request Planner | tổng request |
-  |---|---|---|
-  | unified (mặc định) | **1** | **61** |
-  | legacy (`UNIFIED_PLANNER=0`) | 22 | 82 |
-
-  Tức 21 request Planner và ~26% tổng request được cắt bỏ trước khi chunk đầu
-  tiên được dịch.
+  phức tạp và ghi chú từng phần — là **một** request. Planner thấy **toàn bộ**
+  tiêu đề mục; phần thân được lấy thành 6 mảnh rải đều khắp tài liệu (tổng 3.000
+  ký tự, `[...]` đánh dấu chỗ bị bỏ) thay vì chỉ đọc những trang đầu — với sách
+  1000 trang thì 3.000 ký tự đầu chỉ là bìa và mục lục. Danh sách mục có trần
+  20.000 ký tự: preview tự co lại khi mục quá nhiều, hết chỗ thì chỉ còn tên, và
+  nếu tên cũng không vừa thì dòng `(+N more sections not shown)` nói rõ đã bỏ bao
+  nhiêu mục. Nhờ vậy prompt planner của tài liệu 1000 trang dày tiêu đề giảm từ
+  37.700 xuống 7.099 token. Nhánh summary-tree cũ (một request mỗi mục, rồi
+  thêm một request plan, không trả về cặp thuật ngữ) đã bị xoá hẳn; đo trên tài
+  liệu 20 chunk (LLM_MOCK) nó tốn 22 request Planner và 82 request tổng, so với
+  **1** và **61** của đường hợp nhất — tức 21 request Planner và ~26% tổng
+  request được cắt bỏ trước khi chunk đầu tiên được dịch.
 - **Pipeline chất lượng thích ứng**: mỗi chunk được chấm cục bộ (cấu trúc, độ
   dài, placeholder, mật độ thuật ngữ) và draft được kiểm bằng đúng những cổng
   tất định mà Verifier dùng. Chunk đơn giản có draft sạch đi **thẳng tới
   Verifier**, bỏ qua Critic và Refiner; chunk đáng ngờ chạy vòng
-  Critic → Refiner đầy đủ. `FAST_PATH_SKIP_LLM_VERIFY=1` bỏ luôn lần gọi
+  Critic → Refiner đầy đủ.  `FAST_PATH_SKIP_LLM_VERIFY=1` bỏ luôn lần gọi
   Verifier trả phí khi các kiểm tra cứng đã qua. Định tuyến tốn **0 token**.
+- **Verifier lỗi không được ghi thành "đã đạt"**: khi Verifier không chạy được,
+  kết quả vẫn mang `ok` để không chặn bản dịch nhưng có thêm cờ `skipped`;
+  decision ghi "no verdict, the draft ships unverified", mỗi chunk như vậy để
+  lại một bản ghi `error` (cause `verify`), và con số lên `run_end`
+  (`verify_skipped`) cùng dòng cuối CLI. Trước đây cả ba nơi đều đọc như
+  "verifier accepted the draft".
 - **Checkpoint chống sập**: mỗi chunk xong được ghi vào
   `<CHECKPOINT_DIR>/<job>/<chunk>.json`; `--resume` bỏ qua các chunk đã xong
   (một lượt resume trọn vẹn tốn 0 request). Checkpoint gắn với đường dẫn, **nội
   dung** file (sha256 — không phải `mtime`: upload lại đúng tài liệu đó không
-  được phép xoá công đã dịch), cặp ngôn ngữ, domain, model Translator và hash
-  của chunk, nên đổi input hay đổi `--max-tokens` không bao giờ dùng lại kết quả
-  cũ.
+  được phép xoá công đã dịch), cặp ngôn ngữ, model Translator, hash
+  của chunk **và nội dung glossary người dùng**, nên đổi input, đổi
+  `--max-tokens` hay thêm một thuật ngữ vào CSV đều không bao giờ dùng lại kết
+  quả cũ — nếu không, `--resume` sẽ phát lại đúng những chunk đã dịch khi chưa
+  có thuật ngữ đó và file ra thiếu hẳn thuật ngữ mới.
   `PARTIAL_OUTPUT=1` còn ghi lại file đầu ra khi từng chunk hoàn thành.
 - **Một chunk lỗi không bao giờ bị bỏ**: cạn các lần thử lại ở tầng request
   (`LLM_MAX_RETRIES`) thì **chunk** được chờ rồi chạy lại nguyên vẹn — 5s, 10s,
@@ -161,6 +188,14 @@ lại bản Markdown đã dịch xong.
   (web UI); trong lúc chờ, lượt chạy in ra, ghi sự kiện `retry_wait` vào log và
   caption dưới thanh tiến độ nói đang chờ chunk nào, hỏng ở bước nào, chờ bao
   lâu — một lượt chờ vài phút không được trông như treo.
+  **Trừ khi không còn gì để thử**: agent đã cạn lượt thử lại mà không có endpoint
+  dự phòng, hoặc lỗi mà không lần retry nào chữa được (401/400) — lúc đó chunk
+  được hỏi **một lần** rồi lượt chạy dừng, báo lý do, thay vì quay vòng mãi.
+  **Và trừ khi provider trả lời rỗng**: một reply rỗng (từ chối, content filter,
+  model trả về toàn khoảng trắng) không phải sự cố chờ được — hỏi lại 2 lần,
+  rồi tách đôi chunk, rồi để chunk ở dạng `<!-- chunk-NNN: untranslated -->`
+  trong file và **không** ghi checkpoint, thay vì giữ cả lượt chạy đứng ở thanh
+  tiến độ (trước đây vòng chờ rỗng không có trần).
   Bản dịch đã sinh ra **được giữ lại**: hỏng ở Critic/Verifier thì lần chạy sau
   vào thẳng bước đó, không gọi lại Translator cho cùng một câu (đây cũng là chỗ
   từng đốt ~14 phút mỗi lần bấm Tiếp tục). Vì vậy file kết quả của một lượt đã
@@ -173,21 +208,50 @@ lại bản Markdown đã dịch xong.
 - **Nhất quán xuyên chunk**: sau khi dịch, glossary đã lên kế hoạch được áp lên
   toàn tài liệu. Chunk đi lệch được **vá** (giới hạn bởi `CONSISTENCY_MAX_PATCHES`,
   mặc định 5) thay vì dịch lại, và bản vá chỉ được giữ nếu nó thật sự đưa đúng
-  thuật ngữ đã định vào. Một "lệch đồng loạt" (không chunk nào dùng thuật ngữ dự
+  thuật ngữ đã định vào **và** vượt qua đúng các hard check của một bản dịch:
+  marker `⟦CODE_n⟧` bị rơi được chèn lại, cấu trúc heading phải giữ nguyên —
+  lúc lắp ráp code chỉ được phục hồi bằng `str.replace`, nên một bản vá làm rơi
+  marker là xoá hẳn khối code mà không để lại dấu vết. Một "lệch đồng loạt" (không chunk nào dùng thuật ngữ dự
   kiến) được báo cáo chứ không vá, vì không có gì để các chunk thống nhất *theo*.
+  Ngân sách vá là `max(CONSISTENCY_MAX_PATCHES, 30% số chunk lệch)`, và mỗi bản
+  vá là **một request** gửi cả bản dịch của chunk kèm glossary rồi nhận lại cả
+  bản dịch — nên trần đó lên `run_end` (`consistency_patch_budget`) và dòng CLI
+  (`consistency patch budget: N request(s), M used`) thay vì chỉ nằm trong log.
+  Hai bản vá liền bị từ chối (editor rơi thuật ngữ, mất bản dịch, hoặc phá cấu
+  trúc) là dấu hiệu model đang phớt lờ chỉ dẫn: pass **dừng** thay vì đốt hết
+  ngân sách vào cùng một câu trả lời, và số chunk còn lệch vẫn được đếm là bỏ
+  sót (`consistency_skipped`), cùng cờ `stopped_early` trong báo cáo của pass.
+  Pass còn so cả **nhãn** (`Preconditions:`, `Bước 3`, `Hình 2.1`) và **cụm lặp
+  lại** ở đầu đoạn — những thứ không có trong glossary. Không có dạng đích nào
+  được biết trước, nên chính tài liệu bầu: dạng mà **đa số** chunk dùng thành
+  chuẩn, chunk lệch bị vá; hoà 1–1 thì không kết luận gì. Vị trí là căn chỉnh duy
+  nhất — đoạn thứ i của bản dịch ứng với đoạn thứ i của nguồn, chunk nào lệch số
+  đoạn thì bỏ qua. Số nhãn đã so và số nhãn lệch lên `run_end`
+  (`consistency_labels`, `consistency_label_drift`) và dòng cuối của CLI. Cùng
+  với đó là `consistency_checked_terms` (số thuật ngữ **thật sự** được so) và
+  `consistency_no_pairs`: "0 lệch" trên 0 thuật ngữ không đọc giống "0 lệch"
+  trên 175 — khi không có cặp nào để so (planner fallback, không có CSV), CLI
+  nói thẳng là chỉ so nhãn. `glossary_terms` cũng đếm số mục thật trong khối
+  glossary gửi cho prompt, thay vì chỉ đếm cặp của Planner.
 - **Sửa placeholder tất định**: code không bao giờ tới model — nó được che thành
   `⟦CODE_n⟧` và hoàn trả nguyên văn khi hợp nhất. Vì `restore_code` chỉ là
   `str.replace`, một marker bị model làm rơi sẽ **âm thầm** xoá cả khối code;
   `pipeline/placeholders.py` chèn lại marker vào đúng vị trí đoạn của nó trước
   khi chunk được checkpoint.
 - **Glossary**: acronym, cụm viết hoa, thuật ngữ lặp ≥ 2 lần, cộng CSV người
-  dùng. Planner bổ sung dạng ngôn ngữ đích; CSV của người dùng luôn thắng.
+  dùng. Planner bổ sung dạng ngôn ngữ đích; CSV của người dùng luôn thắng. Ngân
+  sách thuật ngữ lớn dần theo tài liệu — `40 + ký_tự/8000`, kẹp trong `[40, 200]`
+  ([glossary.py](src/polyglot_lc/segment/glossary.py)) — nên sách 1000 trang được
+  ~175 mục thay vì dừng ở 40, còn bản ghi nhớ vẫn giữ nguyên 40. Trần 200 bằng
+  trần CSV, và mục do người dùng nhập **không bao giờ** bị ngân sách cắt.
 - **Reasoning Bank** (ChromaDB): trace bền vững `{strategy, few_shot, pitfalls,
   score, ts…}`, chỉ upsert khi score ≥ 0.75. Tự reset collection khi số chiều
   embedding đổi (đổi `EMBED_MODEL`, vào/ra mock).
 - **SkillOpt**: thu thập (prompt, output, điểm) theo từng chunk; Planner đề xuất
   textual gradient; kỹ năng chỉ được promote khi điểm trung bình 20 chunk gần
-  nhất **thắng** kỹ năng đang dùng.
+  nhất **thắng** kỹ năng đang dùng. Skill được lưu thành
+  `skills/<src>-<tgt>/skill.md` và được đọc lại vào prompt Translator ở lượt
+  kế tiếp.
 - **Hàng đợi theo từng provider**: tối đa  `LLM_PROVIDER_CONCURRENCY` (mặc định
   **1**) request đang bay cho mỗi `base_url`, để gói miễn phí chỉ phục vụ một
   request không bị pool chunk giẫm lên. Đây là **hàng đợi**, không phải van: các
@@ -209,6 +273,17 @@ lại bản Markdown đã dịch xong.
   chính request đang chạy phía server; jitter được **cộng lên trên** sàn đó chứ
   không trừ xuống. Lỗi ngữ nghĩa (Verifier FAIL) dùng một nhánh retranslate
   riêng, có giới hạn.
+- **Endpoint dự phòng cho mọi agent, trừ embedding**: khi endpoint chính đã
+  cạn lượt thử lại, lời gọi chuyển sang endpoint dự phòng (Planner, Translator,
+  Critic, Refiner, Verifier). Một endpoint dự phòng cho cả pipeline, đặt bằng
+  `LLM_BACKUP_BASE_URL` + `LLM_BACKUP_MODEL` (+ `LLM_BACKUP_API_KEY`). Embedding
+  không có dự phòng: Reasoning Bank là phần best-effort.
+- **Không có dự phòng thì lượt chạy dừng, không quay vòng vô hạn**: khi agent đã
+  hết lượt thử lại mà không có nơi để chuyển sang, chunk đó được hỏi **một lần**
+  rồi lượt chạy kết thúc với lý do rõ ràng (mã thoát 1, ghi trong log và ở bảng
+  Errors của web UI) — thay vì ngồi ở "0/38" chờ một endpoint đã từ chối trả
+  lời. Có dự phòng thì vòng lặp cấp chunk vẫn chạy: mỗi vòng thử lại chính rồi
+  dự phòng.
 - **Cổng thích ứng cho Refiner**: `REFINE_MIN_SCORE` bỏ qua Refiner với draft đã
   đủ điểm (mặc định bằng `CRITIC_THRESHOLD`, nên hành vi không đổi trừ khi nâng
   lên).
@@ -290,7 +365,7 @@ không tới được.
 ```bash
 polyglot translate --file input/handbook.pdf --src en --tgt vi
 # Dựng lại PDF đúng bố cục, và ghi thêm bản Markdown cạnh nó:
-polyglot translate --file report.pdf --src auto --tgt en --domain legal \
+polyglot translate --file report.pdf --src auto --tgt en \
     --glossary glossary.csv --out report.en.md --format both --max-tokens 512
 ```
 
@@ -299,7 +374,6 @@ polyglot translate --file report.pdf --src auto --tgt en --domain legal \
 | `--file / -f` | **File PDF đầu vào** (phải có lớp văn bản; không OCR) |
 | `--src / -s` | Ngôn ngữ nguồn, `auto` = langdetect |
 | `--tgt / -t` | Mã ngôn ngữ đích |
-| `--domain / -d` | Gợi ý domain (tech, legal…) dùng cho Planner/RB/SkillOpt |
 | `--glossary / -g` | CSV glossary `src,tgt` mỗi dòng |
 | `--out / -o` | Đường dẫn gốc của đầu ra: `<gốc>.md` và/hoặc `<gốc>.pdf` (mặc định `<stem>.<tgt>.md`) |
 | `--format / -F` | `md` (mặc định) \| `pdf` (dựng lại PDF giữ định dạng) \| `both` (env: `OUTPUT_FORMAT`) |
@@ -310,11 +384,13 @@ polyglot translate --file report.pdf --src auto --tgt en --domain legal \
 | `--run-id` | Tên của lượt chạy này (mặc định: `RUN_ID` từ môi trường, không thì tự sinh) |
 
 Báo cáo cuối in ra: số chunk, điểm critic trung bình (đánh dấu *est.* khi không
-có Critic nào chạy), số lần retry, số trace đã lưu, việc promote kỹ năng, số
-chunk đã đi mỗi đường **fast / standard / deep** (kèm lý do khi fast path bị từ
-chối), số request Planner, số thuật ngữ glossary, số chunk resume, số bản vá
-nhất quán, file đầu ra, file PDF (kèm số block đã dựng lại), đường dẫn log JSONL
-và bảng token/request.
+có Critic nào chạy), số lần retry (**gồm cả retry cấp chunk**, không chỉ retry
+request — con số trước đây thấp hơn thực tế), số trace đã lưu, việc promote kỹ
+năng, số chunk đã đi mỗi đường **fast / standard / deep** (kèm lý do khi fast
+path bị từ chối), số request Planner, số thuật ngữ glossary, số chunk resume, số
+bản vá nhất quán **kèm ngân sách request của pass, số chunk còn lệch vì hết
+ngân sách và số bản vá bị từ chối**, file đầu ra, file PDF (kèm số block đã
+dựng lại), đường dẫn log JSONL và bảng token/request.
 
 ### Đọc lại một lượt chạy
 
@@ -415,7 +491,7 @@ python -m ruff check .         # lint
 python -m ruff format --check .  # định dạng (ruff format . để sửa)
 ```
 
-461 test, bao phủ: ingest (registry chỉ nhận PDF, che code, NFC, kiểu chữ →
+710 test, bao phủ: ingest (registry chỉ nhận PDF, che code, NFC, kiểu chữ →
 Markdown, gán toạ độ trang *và kiểu chữ* cho từng block), dựng lại PDF (map chunk
 → block, cắt overlap, chọn font theo họ nguồn, **nới khung một dòng ra hết cột**,
 **vẽ lại đầu dòng và chấm dẫn mục lục**, rebuild thật rồi đọc lại văn bản), ngân
@@ -427,7 +503,7 @@ deadline wall-clock, hàng đợi theo provider, Reasoning Bank
 định tuyến thích ứng, checkpoint/resume (kể cả vô hiệu hoá và ghi từng phần), sửa
 placeholder, và nhất quán xuyên chunk.
 
-Trong đó 114 test thuộc `tests/test_webui_*.py`: phân giải đường dẫn an toàn, vòng
+Trong đó 164 test thuộc `tests/test_webui_*.py`: phân giải đường dẫn an toàn, vòng
 đời lượt chạy (kể cả dừng theo cây tiến trình, và ghi chú "chưa có log" được rút
 lại khi log xuất hiện), HTTP API và an toàn (Origin, traversal, che credential,
 nhận dạng upload), cộng một nhóm đọc **chính trang đã phát hành**: mọi id script
@@ -446,7 +522,7 @@ src/polyglot_lc/
 ├── pipeline/              # coordinator, assembler, pdf_output (dựng lại PDF), checkpoint,
 │                          #   consistency, placeholders
 ├── ingest/                # registry (chỉ PDF), pdf, pdf_layout (kiểu chữ → Markdown + toạ độ)
-├── segment/               # chunker, summary_tree (đường cũ), glossary
+├── segment/               # chunker, summary_tree (chia mục + preview), glossary
 ├── agents/                # base, context, planner, translator, critic, refiner, verifier, consistency
 ├── orchestrator/          # LangGraph state, router, graph (cạnh thích ứng)
 ├── reasoning_bank/        # store ChromaDB, embedder, schema trace

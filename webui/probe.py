@@ -42,7 +42,6 @@ EDITABLE_FIELDS: dict[str, str] = {
     "REFINE_ROUNDS": "refine_rounds",
     "REFINE_MIN_SCORE": "refine_min_score",
     "RB_TOP_K": "rb_top_k",
-    "UNIFIED_PLANNER": "unified_planner",
     "ADAPTIVE_QUALITY": "adaptive_quality",
     "FAST_PATH_MAX_COMPLEXITY": "fast_path_max_complexity",
     "FAST_PATH_MIN_SCORE": "fast_path_min_score",
@@ -276,16 +275,14 @@ def memory_summary(sample: int = MEMORY_SAMPLE) -> dict[str, Any]:
     metas = got.get("metadatas") or []
     docs = got.get("documents") or []
 
-    buckets: dict[tuple[str, str], dict[str, Any]] = {}
+    buckets: dict[str, dict[str, Any]] = {}
     for index in range(len(ids)):
         meta = metas[index] if index < len(metas) and metas[index] else {}
         pair = f"{meta.get('src_lang', '?')}-{meta.get('tgt_lang', '?')}"
-        domain = str(meta.get("domain") or "general")
         bucket = buckets.setdefault(
-            (pair, domain),
+            pair,
             {
                 "pair": pair,
-                "domain": domain,
                 "traces": 0,
                 "score_total": 0.0,
                 "recent": [],
@@ -309,13 +306,12 @@ def memory_summary(sample: int = MEMORY_SAMPLE) -> dict[str, Any]:
         pairs.append(
             {
                 "pair": bucket["pair"],
-                "domain": bucket["domain"],
                 "traces": bucket["traces"],
                 "mean_score": round(bucket["score_total"] / bucket["traces"], 3),
                 "recent": bucket["recent"][:5],
             }
         )
-    pairs.sort(key=lambda row: (-row["traces"], row["pair"], row["domain"]))
+    pairs.sort(key=lambda row: (-row["traces"], row["pair"]))
     return {"path": str(path), "total": total, "sampled": len(ids), "pairs": pairs}
 
 

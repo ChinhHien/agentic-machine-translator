@@ -1,0 +1,45 @@
+%% Hình 1. Kiến trúc tổng quan của quy trình dịch đa tác tử.
+flowchart TD
+    PDF["PDF nguồn có lớp văn bản<br/>(không OCR)"]
+    EXT["Trích xuất bố cục:<br/>chữ, kiểu chữ, toạ độ trang"]
+    CHUNK["Chia đoạn theo token<br/>tại ranh giới cấu trúc"]
+    TERM["Thuật ngữ và ghi chú<br/>theo từng phần"]
+
+    PLAN["Lập kế hoạch tài liệu — một lần gọi cho cả tài liệu:<br/>tóm tắt, chiến lược, ví dụ, cạm bẫy, thuật ngữ đích"]
+    GROUP["Nhóm tác tử xử lý song song từng đoạn<br/>(có trần số worker)"]
+    T["Tác tử<br/>Dịch"]
+    C["Tác tử<br/>Phản biện"]
+    R["Tác tử<br/>Hiệu chỉnh"]
+    V["Tác tử<br/>Kiểm chứng"]
+
+    CONS["Rà soát nhất quán thuật ngữ<br/>toàn tài liệu"]
+    MERGE["Hợp nhất theo thứ tự gốc,<br/>phục hồi mã đã che"]
+    MD["Bản dịch Markdown"]
+    PDFOUT["Bản dịch PDF giữ bố cục"]
+
+    MEM["Bộ nhớ lập luận (ChromaDB):<br/>truy hồi ví dụ tốt khi lập kế hoạch,<br/>lưu trace đạt ngưỡng"]
+    SKILL["Kho kỹ năng dịch: đọc vào prompt<br/>khi dịch, chỉ ghi khi kỹ năng<br/>mới thắng"]
+    CKPT["Checkpoint theo đoạn: ghi sau<br/>mỗi đoạn xong, chạy lại<br/>không mất việc"]
+
+    PDF --> EXT
+    PDF --> CHUNK
+    PDF --> TERM
+    EXT --> PLAN
+    CHUNK --> PLAN
+    TERM --> PLAN
+
+    PLAN --> GROUP
+    GROUP --> T
+    GROUP --> C
+    GROUP --> R
+    GROUP --> V
+
+    GROUP --> CONS
+    GROUP --> MERGE
+    CONS --> MD
+    CONS --> MERGE
+    MERGE --> PDFOUT
+
+    MEM <-.-> PLAN
+    SKILL <-.-> GROUP
+    CKPT <-.-> GROUP
