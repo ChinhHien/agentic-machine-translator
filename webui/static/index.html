@@ -12,16 +12,17 @@
 </head>
 <body>
 
-<!-- The first paint, before any of the page exists: the mark alone. A scan line
-     sweeps the dark stage, the mark settles in, and the script hands the whole
-     thing over once the first list has arrived — or the stylesheet's deadline
-     takes it away on its own if the script never got that far. -->
+<!-- The first paint, before any of the page exists: the mark, a hairline that
+     draws under it, and the one line that says what is being opened. The mark
+     and the hairline run on the sheet's own clock; the script only decides when
+     the stage may go — or the stylesheet's deadline takes it away on its own if
+     the script never got that far. -->
 <div id="preloader" class="preloader" role="status" aria-label="Đang mở bảng điều khiển">
-  <div class="preloader-scan-overlay" id="preloader-scan-overlay"></div>
-  <div class="preloader-scan-line" id="preloader-scan-line"></div>
-  <div class="preloader-logo" id="preloader-logo">
-    <img class="preloader-logo-img" src="/static/logo.png" alt="">
+  <div class="preloader-mark">
+    <img class="preloader-mark-img" src="/static/logo-transparent.png" alt="">
   </div>
+  <div class="preloader-rule" aria-hidden="true"></div>
+  <p class="preloader-caption">Đang mở bảng điều khiển</p>
 </div>
 
 <!-- The document header: which document is open, what it is, and the one

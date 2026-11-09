@@ -1228,14 +1228,18 @@ def test_the_page_opens_under_the_mark_and_hands_it_over():
     import re
     from pathlib import Path
 
-    r = call(repo_api(), "GET", "/static/logo.png")
+    r = call(repo_api(), "GET", "/static/logo-transparent.png")
     assert r.status == 200 and r.content_type == "image/png"
     assert r.body.startswith(b"\x89PNG\r\n\x1a\n"), "the mark has to be a real PNG"
+    # PNG colour type 6 is RGBA. The splash supplies its own surface, so the
+    # mark must not bring a baked-in ground of its own: an opaque logo would
+    # flash a dark rectangle on a reader whose system asks for a light page.
+    assert r.body[25] == 6, "the splash mark has to carry an alpha channel"
 
     html = call(repo_api(), "GET", "/").body.decode("utf-8")
     splash = re.search(r'<div id="preloader"[^>]*>(.*?)\n</div>', html, re.DOTALL)
     assert splash, "the splash belongs in the markup, before anything runs"
-    assert "/static/logo.png" in splash.group(1)
+    assert "/static/logo-transparent.png" in splash.group(1)
     assert "<noscript><style>#preloader { display: none; }</style></noscript>" in html, (
         "with no script there is nothing to hand the splash over"
     )
@@ -1245,32 +1249,42 @@ def test_the_page_opens_under_the_mark_and_hands_it_over():
     assert ".preloader--leaving { opacity: 0; }" in css
     assert "preloader-timeout" in css, "the sheet must be able to take it away alone"
 
-    # The mark goes with the light, not on a timer beside it: the light's own
-    # duration and easing are what the dissolve runs on, so the mark holds while
-    # the light is above it, decays as the light crosses it, and is gone by the
-    # time the light is under it — in a window of any height.
-    assert "preloader-scan 1.6s cubic-bezier(0.4, 0, 0.2, 1)" in css
-    assert re.search(r"\.preloader-logo\.scanning \{[^}]*preloader-mark-swept", css)
-    assert "preloader-mark-swept 1.6s cubic-bezier(0.4, 0, 0.2, 1)" in css
-    swept = css[css.index("@keyframes preloader-mark-swept {") : css.index(".preloader-logo-img")]
-    # Centred on the crossing: the mark's own middle is the stage's middle, and
-    # the sweep's easing has the light there at 35% of the sweep.
-    assert "0%, 20% { opacity: 1; }" in swept
-    assert "50%, 100% { opacity: 0; }" in swept
-    # What this replaced: a fade over the whole sweep, which had the mark half
-    # gone while the light was still over empty stage.
-    assert "transition: opacity 1.6s linear" not in css
+    # The stage is the app's own surface, not a colour chosen to hide the
+    # mark's rectangle: with the transparent lockup the splash follows the
+    # scheme, so a light page never opens on a flash of dark.
+    assert re.search(r"\.preloader \{[^}]*background: var\(--bg\)", css)
+
+    # One gesture, on the sheet's own clock: the mark settles, then a hairline
+    # draws out from its middle. The scanline texture and the travelling glow
+    # are gone — the rule is this page's own device, borrowed for the wait.
+    assert re.search(r"\.preloader-mark \{[^}]*preloader-mark-in", css)
+    assert (
+        "animation: preloader-mark-in var(--dur-4) var(--ease) var(--delay-1) both;" in css
+    ), "the mark takes the sheet's longest step, not one of its own"
+    assert re.search(r"\.preloader-rule \{[^}]*preloader-rule-draw", css)
+    assert (
+        "animation: preloader-rule-draw var(--dur-3) var(--ease) var(--delay-2) both;" in css
+    )
+    assert "repeating-linear-gradient" not in css, "the splash is not a CRT"
+    assert "preloader-scan" not in css
+    # The rested state is the visible one, so the reduced-motion rule at the foot
+    # of the sheet (which drops every animation) still leaves the mark and the
+    # rule on the stage.
+    assert "from { opacity: 0; transform: translateY(10px); }" in css
+    assert "from { opacity: 0; transform: scaleX(0); }" in css
 
     js = (Path(__file__).resolve().parents[1] / "webui" / "static" / "app.js").read_text(
         encoding="utf-8"
     )
-    # The mark and the light start on the same step, or the two share nothing.
-    assert re.search(
-        r'line\.classList\.add\("active"\)[\s\S]*?logo\.classList\.add\("scanning"\)', js
-    ), "the mark's dissolve has to start with the sweep"
-    assert re.search(r"function hideSplash", js) and "SPLASH_HOLD_MS" in js
-    assert re.search(r"wait\(SPLASH_HOLD_MS\)", js), (
-        "the mark must hold on the stage's own clock before the fade"
+    # The script owns the hand-off only, and it waits for both: the first list,
+    # and a floor long enough for the mark and the rule to land. A fixed
+    # multi-second show made a fast local page feel slower than it was.
+    assert re.search(r"function hideSplash", js)
+    assert re.search(r"Promise\.all\(\[loadRuns\(\), wait\(SPLASH_MIN_MS\)\]\)", js), (
+        "the page opens when the list is in, not on a fixed show"
+    )
+    assert "SPLASH_HOLD_MS" not in js and "SPLASH_SCAN_MS" not in js, (
+        "the splash no longer runs a fixed multi-second show"
     )
     assert re.search(r"loadRuns\(\)", js), (
         "the first list must still load under the splash"
@@ -1288,6 +1302,61 @@ def test_the_three_type_roles_reduced_motion_and_dark_scheme_are_declared():
     assert "font-variant-numeric: tabular-nums" in css
     assert "prefers-reduced-motion" in css
     assert "prefers-color-scheme: dark" in css
+
+
+def test_motion_is_one_scale_and_reduced_motion_turns_it_off():
+    """One rhythm for the whole sheet, and one switch for a reader who asks for
+    less of it.
+
+    Durations used to be a scatter of 120/150/160/180/220/240/300/350/400/500/
+    520/620ms, each with a curve of its own. They now come from four lengths and
+    two curves declared once on ``:root``; nothing below re-invents them.
+    """
+    import re
+    from pathlib import Path
+
+    css = call(repo_api(), "GET", "/static/app.css").body.decode("utf-8")
+    for token, value in (
+        ("--dur-1", "120ms"),
+        ("--dur-2", "240ms"),
+        ("--dur-3", "360ms"),
+        ("--dur-4", "480ms"),
+    ):
+        assert f"{token}: {value}" in css, token
+    assert "--ease: cubic-bezier(0.2, 0, 0, 1)" in css
+    assert "--ease-loop: cubic-bezier(0.45, 0, 0.55, 1)" in css
+
+    # Nothing animates `all` — a transition names the properties it moves — and
+    # no rule brings back the ad-hoc curves the scale replaced.
+    assert "transition: all" not in css
+    for retired in ("0.35, 0.1, 0.25, 1", "0.16, 1, 0.3, 1", "0.4, 0, 0.2, 1"):
+        assert retired not in css, retired
+
+    # The three places a reader feels it most: a control answering the pointer,
+    # the library folding, and the page arriving.
+    assert re.search(r"\.icon-btn \{[^}]*var\(--dur-1\) var\(--ease\)", css)
+    assert re.search(
+        r"\.layout \{[^}]*grid-template-columns var\(--dur-2\) var\(--ease\)", css
+    )
+    assert re.search(r"\.preloader \{[^}]*var\(--dur-3\) var\(--ease\)", css)
+
+    # The one switch: every animation and transition stops. No element below
+    # needs one to reach its state, so this is a complete answer to the
+    # preference — the splash's deadline is a fallback, not motion, and stays.
+    assert "@media (prefers-reduced-motion: reduce) {" in css
+    assert "* { animation: none !important; transition: none !important; }" in css
+    assert re.search(
+        r"\.preloader \{ animation: preloader-timeout 0\.01s linear 8s forwards !important; \}",
+        css,
+    )
+
+    # The two script waits that cover a CSS transition use the same two steps,
+    # so an element is never hidden before its fade has finished.
+    js = (Path(__file__).resolve().parents[1] / "webui" / "static" / "app.js").read_text(
+        encoding="utf-8"
+    )
+    assert "const BANNER_FADE_MS = 240;" in js
+    assert "const SPLASH_FADE_MS = 360;" in js
 
 
 def test_every_control_has_a_label_and_live_regions_are_marked():
@@ -1661,7 +1730,7 @@ def test_folding_the_library_slides():
 def test_folding_the_library_is_a_cross_fade_and_not_a_swap():
     """The fold used to swap one shape for another inside a single frame:
     the words, the filters and the heading were `display: none`d and the letter
-    tiles appeared already in place, so a column that took 220ms to travel
+    tiles appeared already in place, so a column that took a step to travel
     changed everything it held in an instant. Both shapes are now drawn at once
     and only the opacity between them changes, and what cannot fade — where a
     word sits, how wide an entry is, the height its last line needs — travels
@@ -1698,16 +1767,16 @@ def test_folding_the_library_is_a_cross_fade_and_not_a_swap():
     # the rows under them are not left jumping up by their height.
     head = block(".rail-head {")
     assert "max-height: 32px" in head and "overflow: hidden" in head
-    assert "max-height 220ms" in head and "margin-bottom 220ms" in head
+    assert "max-height var(--dur-2)" in head and "margin-bottom var(--dur-2)" in head
     assert "max-height: 64px" in block(".rail .chips {")
 
     # What the fold can travel, it travels: the row's own floor, its inset and
     # the state's edge, and the width of the entry itself.
     row = block(".job-row {")
     assert "min-height: 52px" in row and "overflow: hidden" in row
-    assert "min-height 220ms" in row and "padding 220ms" in row
+    assert "min-height var(--dur-2)" in row and "padding var(--dur-2)" in row
     item = block(".job-item {")
-    assert "width: 100%" in item and "width 220ms" in item
+    assert "width: 100%" in item and "width var(--dur-2)" in item
     # Centred rather than stretched, so an entry shrinks around its own middle
     # instead of being moved to the middle of the column in one frame.
     assert "align-items: center" in block(".jobs {")

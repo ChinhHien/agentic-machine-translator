@@ -427,11 +427,12 @@ function sendFile(path, file, onProgress) {
    at once, so a long error can still be read — or dismissed. */
 const BANNER_MS = { error: 10000, warn: 6000, ok: 5000 };
 
-/* How long the opacity transition takes. The bar is only made `hidden` (which
-   is `display:none`, and cannot animate) after that, so it fades rather than
-   blinking out. Reduced motion is handled by the stylesheet, which drops the
-   transition and so makes the same wait invisible. */
-const BANNER_FADE_MS = 400;
+/* How long the opacity transition takes — the stylesheet's `--dur-2`, kept in
+   step by hand because the script cannot read a custom property. The bar is
+   only made `hidden` (which is `display:none`, and cannot animate) after that,
+   so it fades rather than blinking out. Reduced motion is handled by the
+   stylesheet, which drops the transition and so makes the same wait invisible. */
+const BANNER_FADE_MS = 240;
 
 function clearBannerTimers() {
   clearTimeout(state.bannerTimer);
@@ -3062,79 +3063,27 @@ function wire() {
 /* ------------------------------------------------------------- first paint */
 
 /* The document arrives under the splash, and hands it over here: what a reader
-   is waiting for is the first list of runs, not the files. So the mark stays up
-   until that list has landed — and at least long enough to be seen, because a
-   mark that appears and leaves inside one frame reads as a flicker, not as a
-   start. Neither wait is a progress report: the fetch reports its own failures
-   in the banner, and the splash leaves either way. */
-const SPLASH_FADE_MS = 400;
+   is waiting for is the first list of runs, not the files. The mark and the
+   hairline run on the sheet's own clock; the script owns only the hand-off, and
+   a floor under how long the mark is shown — a mark that appears and leaves
+   inside one frame reads as a flicker, not as a start. Neither wait is a
+   progress report: the fetch reports its own failures in the banner, and the
+   splash leaves either way. */
+const SPLASH_FADE_MS = 360; // the stylesheet's --dur-3, kept in step by hand
 
-/* The stage runs on its own clock: the mark settles in first, then the scan
-   sweep runs, then the fade begins. The splash stays up for a full cycle even
-   when the first list lands quickly, so the effect is never skipped. */
-const SPLASH_LOGO_MS = 300; // the mark settles in
-const SPLASH_SCAN_MS = 1500; // the sweep runs after the mark is up
-const SPLASH_HOLD_MS = 400; // the mark holds before the fade begins
+/* Long enough for the mark to settle and the rule to draw (80 + 480ms, 280 +
+   360ms on the sheet's own tokens), so the gesture is never cut in half by a
+   fast local API. */
+const SPLASH_MIN_MS = 900;
 
 function wait(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
-/* The stage's own timeline: the sweep runs, then the mark settles. A splash
-   that is already leaving is not redrawn. */
-function startSplash() {
-  const stage = byId("preloader");
-  if (!stage || stage.classList.contains("preloader--leaving")) {
-    return;
-  }
-  const overlay = byId("preloader-scan-overlay");
-  const line = byId("preloader-scan-line");
-  const logo = byId("preloader-logo");
-  /* The mark settles in first. */
-  setTimeout(() => {
-    if (stage.classList.contains("preloader--leaving")) {
-      return;
-    }
-    if (logo) {
-      logo.classList.add("show");
-    }
-  }, SPLASH_LOGO_MS);
-  /* Then the sweep runs. */
-  setTimeout(() => {
-    if (stage.classList.contains("preloader--leaving")) {
-      return;
-    }
-    if (overlay) {
-      overlay.classList.add("active");
-    }
-    if (line) {
-      line.classList.add("active");
-    }
-    /* The mark leaves with the light rather than with the overlay's class: the
-       sweep clears itself away, and a fade tied to that would run backwards. */
-    if (logo) {
-      logo.classList.add("scanning");
-    }
-    /* After the sweep, hold for a beat, then fade. */
-    setTimeout(() => {
-      if (stage.classList.contains("preloader--leaving")) {
-        return;
-      }
-      if (overlay) {
-        overlay.classList.remove("active");
-      }
-      wait(SPLASH_HOLD_MS).then(() => {
-        if (!stage.classList.contains("preloader--leaving")) {
-          hideSplash();
-        }
-      });
-    }, 1600); // the sweep's own duration
-  }, SPLASH_SCAN_MS);
-}
-
 function hideSplash() {
   const stage = byId("preloader");
-  if (!stage || stage.hidden) {
+  /* Already on its way out: a second fade would only restart the timer. */
+  if (!stage || stage.hidden || state.splashFade) {
     return;
   }
   stage.classList.add("preloader--leaving");
@@ -3146,17 +3095,22 @@ function hideSplash() {
 }
 
 async function boot() {
-  startSplash();
   wire();
   renderRail();
   renderEmptyJob();
   renderFilters();
   renderView();
   renderTabs();
-  /* The splash leaves on its own clock (see startSplash): the mark has to be
-     seen. Fetching the first list runs in the background; when it is ready
-     while the splash still holds, it is re-rendered the moment the splash goes. */
-  loadRuns();
+  /* The first list loads under the splash, and the mark holds for one breath
+     even when that list is already there: whichever finishes last opens the
+     page. The fetch reports its own failure in the banner; the `finally` is
+     there so a rendering error can never leave the stage standing over a page
+     nobody can use, with only the sheet's 8s deadline to take it away. */
+  try {
+    await Promise.all([loadRuns(), wait(SPLASH_MIN_MS)]);
+  } finally {
+    hideSplash();
+  }
 }
 
 if (document.readyState === "loading") {
