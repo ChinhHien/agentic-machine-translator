@@ -25,6 +25,10 @@ class ChunkState(TypedDict, total=False):
     few_shot: list[str]
     pitfalls: list[str]
     glossary_md: str
+    #: Planned source -> target pairs for deterministic terminology checks and
+    #: targeted repairs. Carried per chunk because LangGraph drops keys it does
+    #: not know.
+    glossary_pairs: dict[str, str]
     #: Promoted SkillOpt skill for this pair (dict) or None. Document-level,
     #: copied into every chunk: LangGraph drops keys this state does not carry.
     skill: dict[str, Any] | None
@@ -51,6 +55,10 @@ class ChunkState(TypedDict, total=False):
     refine_round: int
     verify_result: Any  # VerifyResult | None
     retranslate_count: int  # semantic retranslate retries (bounded)
+    repair_used: bool  # the last retry was a targeted terminology repair
+    #: A translation that was kept for the reader but did not pass verification.
+    quality_rejected: bool
+    rejection_reason: str
 
     # Outputs
     translated: str  # final draft for this chunk

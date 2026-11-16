@@ -130,7 +130,13 @@ def test_step_end_carries_duration_and_the_token_delta_for_that_step(tmp_path):
     assert line["status"] == "ok"
     assert line["type"] == "step_end"
     assert line["duration_ms"] >= 0
-    assert line["tokens"] == {"sent": 120, "received": 40, "cached": 0}
+    assert line["tokens"] == {
+        "sent": 120,
+        "received": 40,
+        "cached": 0,
+        "thinking": 0,
+        "answer": 40,
+    }
 
 
 def test_a_failing_step_records_a_cause_from_the_closed_set(tmp_path):

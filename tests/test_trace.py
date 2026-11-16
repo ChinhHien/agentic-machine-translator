@@ -9,7 +9,12 @@ from pathlib import Path
 import pytest
 
 from polyglot_lc.config import ConfigError
-from polyglot_lc.llm.resilience import PermanentError, RateLimitError, TransientError
+from polyglot_lc.llm.resilience import (
+    PermanentError,
+    RateLimitError,
+    TransientError,
+    TruncatedError,
+)
 from polyglot_lc.segment.chunker import Chunk
 from polyglot_lc.ui.trace import (
     CAUSES,
@@ -45,12 +50,42 @@ def test_every_cause_comes_from_the_closed_set():
         ConfigError("c"),
         ValueError("v"),
         TimeoutError("t"),
+        TruncatedError("cut at 4096", completion_tokens=4096),
     ):
         assert cause_for(exc) in CAUSES
     # A closed set, and this number is part of what closing it means: it moved
     # from 11 to 12 because `emphasis` is a real cause a writer records (a chunk
-    # whose sentinel pairs do not match the source is printed plain).
-    assert len(CAUSES) == 12
+    # whose sentinel pairs do not match the source is printed plain), and from
+    # 12 to 13 because a reply cut at the output-token limit is its own cause —
+    # it used to fall through to `unknown`, which the History tab renders as
+    # "chưa rõ" for a failure the code had already diagnosed precisely.
+    assert len(CAUSES) == 13
+
+
+def test_a_reply_cut_at_the_output_limit_is_a_truncated_cause():
+    """The budget ran out; that is not an unclassifiable failure."""
+    err = TruncatedError(
+        "stopped at the output-token limit", completion_tokens=4096, answer_tokens=645
+    )
+    assert cause_for(err) == "truncated"
+    assert cause_for(err, step="translate") == "truncated"
+
+
+def test_the_history_tab_has_a_word_for_every_cause():
+    """A cause with no label shows as its raw English name in a Vietnamese UI.
+
+    The badge map lives in JavaScript and the closed set lives in Python, so
+    nothing but this test keeps them agreeing.
+    """
+    js = (Path(__file__).resolve().parents[1] / "webui" / "static" / "app.js").read_text(
+        encoding="utf-8"
+    )
+    block = re.search(r"const CAUSE_WORDS = \{(.*?)\}", js, re.DOTALL)
+    assert block, "CAUSE_WORDS moved or changed shape; this test needs updating"
+    labelled = set(re.findall(r"^\s*([a-z_]+):", block.group(1), re.MULTILINE))
+    assert labelled == set(CAUSES), (
+        f"missing={sorted(CAUSES - labelled)} extra={sorted(labelled - CAUSES)}"
+    )
 
 
 def test_ingest_step_unclassified_failure_is_an_input_cause():

@@ -134,6 +134,8 @@ class TokenUsage:
     _sent: int = 0
     _received: int = 0
     _cached: int = 0
+    _thinking: int = 0
+    _answer: int = 0
     _calls: int = 0
     _estimated_calls: int = 0
     _cache_hits: int = 0
@@ -153,15 +155,23 @@ class TokenUsage:
         provider: str = "",
         estimated: bool = False,
         cache_status: str = "UNKNOWN",
+        reasoning_tokens: int = 0,
     ) -> None:
         prompt = max(0, prompt_tokens)
         completion = max(0, completion_tokens)
         cached = max(0, min(cached_tokens, prompt))
+        # ``completion`` is what the provider charged; the thinking share of it
+        # is recorded beside the answer so a verifier that spends its whole
+        # output budget reasoning is visible in the totals, per agent and model.
+        thinking = max(0, min(reasoning_tokens, completion))
+        answer = max(0, completion - thinking)
         status = cache_status if cache_status in {"HIT", "MISS"} else "UNKNOWN"
         with cls._lock:
             cls._sent += prompt
             cls._received += completion
             cls._cached += cached
+            cls._thinking += thinking
+            cls._answer += answer
             cls._calls += 1
             if estimated:
                 cls._estimated_calls += 1
@@ -177,10 +187,22 @@ class TokenUsage:
             ):
                 if not key:
                     continue
-                bucket = table.setdefault(key, {"sent": 0, "received": 0, "cached": 0, "calls": 0})
+                bucket = table.setdefault(
+                    key,
+                    {
+                        "sent": 0,
+                        "received": 0,
+                        "cached": 0,
+                        "thinking": 0,
+                        "answer": 0,
+                        "calls": 0,
+                    },
+                )
                 bucket["sent"] += prompt
                 bucket["received"] += completion
                 bucket["cached"] += cached
+                bucket["thinking"] += thinking
+                bucket["answer"] += answer
                 bucket["calls"] += 1
 
     @classmethod
@@ -190,6 +212,8 @@ class TokenUsage:
                 "sent": cls._sent,
                 "received": cls._received,
                 "cached": cls._cached,
+                "thinking": cls._thinking,
+                "answer": cls._answer,
                 "calls": cls._calls,
                 "estimated_calls": cls._estimated_calls,
                 "cache_hits": cls._cache_hits,
@@ -215,6 +239,8 @@ class TokenUsage:
             cls._sent = 0
             cls._received = 0
             cls._cached = 0
+            cls._thinking = 0
+            cls._answer = 0
             cls._calls = 0
             cls._estimated_calls = 0
             cls._cache_hits = 0
@@ -233,6 +259,15 @@ class LLMResponse:
     prompt_tokens: int = 0
     completion_tokens: int = 0
     cached_tokens: int = 0
+    #: The model's thinking, when the endpoint reports it apart from the answer
+    #: (``reasoning_content`` and friends); empty when it does not.
+    reasoning_text: str = ""
+    #: The thinking share of ``completion_tokens``. A reasoning model spends the
+    #: same output budget on it, which is why a verifier can be cut at its cap
+    #: with an empty answer.
+    reasoning_tokens: int = 0
+    #: ``completion_tokens - reasoning_tokens``, floored at zero.
+    answer_tokens: int = 0
     latency_ms: int = 0
     via_backup: bool = False
     provider: str = ""
@@ -254,6 +289,8 @@ class LLMResponse:
             "prompt_tokens": self.prompt_tokens,
             "completion_tokens": self.completion_tokens,
             "cached_tokens": self.cached_tokens,
+            "reasoning_tokens": self.reasoning_tokens,
+            "answer_tokens": self.answer_tokens,
             "cache_status": self.cache_status,
             "latency_ms": self.latency_ms,
             "via_backup": self.via_backup,
@@ -369,11 +406,13 @@ class LLMClient:
                 return reply
         if json_mode or "Reply ONLY with JSON" in prompt:
             return _mock_json_reply(prompt)
+        from polyglot_lc.agents.context import extract_source
+
         role = prompt[:1].upper() or "X"
-        # Deterministic pseudo-translation: prefix each line.
         lines = [ln for ln in prompt.splitlines() if ln.strip()]
         payload = lines[-1] if lines else prompt
-        return f"[{role}->{payload[:80]}]"
+        headings = re.findall(r"^#{1,6} .+$", extract_source(messages), re.MULTILINE)
+        return "\n\n".join([*headings, f"[{role}->{payload[:80]}]"])
 
     def _mock_embed(self, inputs: list[str]) -> list[list[float]]:
         return [mock_hash_embedding(t) for t in inputs]
@@ -459,19 +498,50 @@ class LLMClient:
             raise normalize_provider_error(exc) from exc
         latency = int((time.monotonic() - start) * 1000)
         choice = resp.choices[0] if resp.choices else None
-        text = (choice.message.content if choice and choice.message else "") or ""
+        message = choice.message if choice and choice.message else None
+        text = (message.content if message else "") or ""
+        reasoning_text = _reasoning_text(message)
         finish_reason = str(getattr(choice, "finish_reason", "") or "") if choice else ""
         usage = getattr(resp, "usage", None)
-        prompt_tokens, completion_tokens, cached_tokens, cache_reported = _parse_usage(usage)
+        (
+            prompt_tokens,
+            completion_tokens,
+            cached_tokens,
+            cache_reported,
+            reported_reasoning,
+        ) = _parse_usage(usage)
+        reasoning_tokens, answer_tokens = _split_reasoning(
+            completion_tokens, reported_reasoning, reasoning_text
+        )
+        # One line per call, naming the agent and the model that actually
+        # answered: a reasoning model's thinking is charged to the same output
+        # budget as the answer, and this is the only place that says how much.
+        logger.info(
+            "LLM usage | agent={} provider={} model={} answer={} thinking={} total={}",
+            getattr(self.config, "name", "") or "?",
+            self.config.base_url,
+            self.config.model,
+            answer_tokens,
+            reasoning_tokens,
+            completion_tokens,
+        )
         if finish_reason == "length":
             # The model hit the output-token limit: the draft's tail was never
             # written. Let the caller re-run this chunk with a bigger budget
-            # rather than ship an untranslated tail silently.
+            # rather than ship an untranslated tail silently. The split and the
+            # partial text travel with the error: the budget may have gone to
+            # thinking, and the part that did arrive may already be usable.
             raise TruncatedError(
                 f"{self.config.model} stopped at the output-token limit "
-                f"({completion_tokens} completion tokens); the reply is a "
-                "prefix of the chunk, not the whole chunk",
+                f"({completion_tokens} completion tokens: answer={answer_tokens}, "
+                f"thinking={reasoning_tokens}); the reply is a prefix of the "
+                "chunk, not the whole chunk",
                 completion_tokens=completion_tokens,
+                provider=self.config.base_url,
+                model=self.config.model,
+                partial_text=text,
+                reasoning_tokens=reasoning_tokens,
+                answer_tokens=answer_tokens,
             )
         estimated = False
         # Estimated usage when the endpoint omits it (some Ollama/vLLM builds).
@@ -495,6 +565,9 @@ class LLMClient:
             prompt_tokens=prompt_tokens,
             completion_tokens=completion_tokens,
             cached_tokens=cached_tokens,
+            reasoning_text=reasoning_text,
+            reasoning_tokens=reasoning_tokens,
+            answer_tokens=answer_tokens,
             latency_ms=latency,
             provider=self.config.base_url,
             usage_estimated=estimated,
@@ -581,22 +654,29 @@ class LLMClient:
         resp.via_backup = used_backup
         if VERBOSE_LLM:
             logger.debug(
-                "LLM call completed | model={} via_backup={} prompt={} completion={} cached={}",
-                self.config.model,
+                "LLM call completed | model={} via_backup={} prompt={} completion={} "
+                "answer={} thinking={} cached={}",
+                resp.model or model,
                 used_backup,
                 resp.prompt_tokens,
                 resp.completion_tokens,
+                resp.answer_tokens,
+                resp.reasoning_tokens,
                 resp.cached_tokens,
             )
+        # The response names the endpoint that served it: a fallback has its own
+        # base_url and model, and charging its tokens to the primary's name is
+        # how per-model usage used to lie after a fallback.
         TokenUsage.add(
             resp.prompt_tokens,
             resp.completion_tokens,
             agent=agent,
             cached_tokens=resp.cached_tokens,
-            model=model,
-            provider=provider,
+            model=resp.model or model,
+            provider=resp.provider or provider,
             estimated=resp.usage_estimated,
             cache_status=resp.cache_status,
+            reasoning_tokens=resp.reasoning_tokens,
         )
         return resp
 
@@ -655,6 +735,38 @@ def _estimate_tokens(text: str) -> int:
     return max(1, (len(text) + 3) // 4)
 
 
+def _reasoning_text(message: Any) -> str:
+    """The model's thinking, when the endpoint returns it beside the answer.
+
+    DeepSeek-compatible gateways put it in ``reasoning_content``; others use
+    ``reasoning`` or ``thinking``. Nothing is invented: an endpoint that returns
+    only the answer gives an empty string.
+    """
+    for name in ("reasoning_content", "reasoning", "thinking"):
+        value = _get_field(message, name)
+        if isinstance(value, str) and value.strip():
+            return value
+    return ""
+
+
+def _split_reasoning(
+    completion_tokens: int, reported: int | None, reasoning_text: str
+) -> tuple[int, int]:
+    """``(thinking, answer)`` tokens out of the one completion budget.
+
+    The provider's own ``reasoning_tokens`` is authoritative when reported;
+    otherwise the thinking is estimated from the text it returned, and the
+    answer is whatever is left. Both are bounded by the completion total, so a
+    verbose reasoning_text can never make the answer negative.
+    """
+    thinking = max(0, reported) if reported is not None else 0
+    if reported is None and reasoning_text:
+        thinking = _estimate_tokens(reasoning_text)
+    if completion_tokens > 0:
+        thinking = min(thinking, completion_tokens)
+    return thinking, max(0, completion_tokens - thinking)
+
+
 def _apply_cache_prefix(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
     """Mark the first (stable) message as an explicit cache breakpoint.
 
@@ -694,15 +806,18 @@ def _get_field(obj: Any, name: str) -> Any:
     return getattr(obj, name, None)
 
 
-def _parse_usage(usage: Any) -> tuple[int, int, int, bool]:
-    """Extract (prompt, completion, cached, cache_reported) across formats.
+def _parse_usage(usage: Any) -> tuple[int, int, int, bool, int | None]:
+    """Extract (prompt, completion, cached, cache_reported, reasoning) tokens.
 
-    Handles OpenAI (``prompt_tokens`` + ``prompt_tokens_details.cached_tokens``),
-    DeepSeek (``prompt_cache_hit_tokens``) and Anthropic-compatible responses
+    Handles OpenAI (``prompt_tokens`` + ``prompt_tokens_details.cached_tokens``,
+    ``completion_tokens_details.reasoning_tokens``), DeepSeek
+    (``prompt_cache_hit_tokens``) and Anthropic-compatible responses
     (``input_tokens`` + ``cache_read_input_tokens`` + ``cache_creation_input_tokens``).
     Never fabricates values: missing fields stay 0. ``cache_reported`` is True
     only when the provider actually returned cache metadata, so a zero cached
-    count is a real MISS rather than an UNKNOWN.
+    count is a real MISS rather than an UNKNOWN. ``reasoning`` is ``None`` when
+    the provider did not report the thinking share at all, which is different
+    from a reported zero.
     """
     prompt = _as_int(_get_field(usage, "prompt_tokens"))
     completion = _as_int(_get_field(usage, "completion_tokens"))
@@ -733,7 +848,12 @@ def _parse_usage(usage: Any) -> tuple[int, int, int, bool]:
         prompt = 0
     if completion is None:
         completion = 0
-    return prompt, completion, min(cached, prompt), cache_reported
+    completion_details = _get_field(usage, "completion_tokens_details")
+    reasoning = _as_int(_get_field(completion_details, "reasoning_tokens"))
+    if reasoning is None:
+        # Some gateways flatten it onto usage itself.
+        reasoning = _as_int(_get_field(usage, "reasoning_tokens"))
+    return prompt, completion, min(cached, prompt), cache_reported, reasoning
 
 
 def _cache_status(reported: bool, cached: int) -> str:

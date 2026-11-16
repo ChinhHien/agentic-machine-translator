@@ -19,6 +19,23 @@ def test_chunk_ids_sequential(mock_env, sample_doc):
     assert [c.id for c in chunks] == [f"chunk-{i:03d}" for i in range(len(chunks))]
 
 
+def test_a_references_section_is_tagged_for_profile_aware_verification(mock_env):
+    from polyglot_lc.ingest.model import Block, Document
+
+    doc = Document(
+        blocks=[
+            Block(kind="heading", text="References", level=2),
+            Block(
+                kind="list",
+                text="Smith J. A study of disinfection. J. Hosp. Infect. 2001;47:1-8.",
+                meta={"items": ["Smith J. A study of disinfection. J. Hosp. Infect. 2001;47:1-8."]},
+            ),
+        ]
+    )
+    chunks = chunk_document(doc, max_tokens=500, overlap_tokens=0)
+    assert chunks[0].profile == "references"
+
+
 def test_overlap_produces_shared_text(mock_env):
 
     from polyglot_lc.ingest.model import Block, Document

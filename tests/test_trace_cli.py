@@ -87,7 +87,7 @@ def test_every_routing_decision_carries_the_numbers_that_made_it(finished_run):
         assert "complexity" in decision["numbers"]
         assert isinstance(decision["numbers"]["draft_score"], (int, float))
     for kind in {d["kind"] for d in decisions}:
-        assert kind in {"fast_path", "refine_gate", "retranslate", "verify_mode"}
+        assert kind in {"fast_path", "refine_gate", "retranslate", "verify_mode", "verify_verdict"}
 
 
 def test_the_run_id_given_on_the_command_line_names_the_trace(mock_env, tmp_path):

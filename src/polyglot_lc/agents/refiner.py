@@ -42,8 +42,8 @@ class RefinerAgent(Agent):
                 "role": "user",
                 "content": (
                     f"You are a translation refiner for {src_lang}->{tgt_lang}.\n"
-                    f"Current draft:\n{draft[:2000]}\n\n"
-                    f"Critic feedback:\n{critique_text[:1500]}\n\n"
+                    f"Current draft:\n{draft}\n\n"
+                    f"Critic feedback:\n{critique_text}\n\n"
                     "Rewrite the draft fixing every issue, referring to the "
                     "source text above. Keep the structure intact: headings, "
                     "lists, placeholders and Markdown table rows stay as they "

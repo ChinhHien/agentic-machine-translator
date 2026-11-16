@@ -96,7 +96,7 @@ def test_the_cli_says_how_much_drift_the_pass_left(mock_env, tmp_path, monkeypat
     assert "patch rejected: 1" in result.output
     assert "3 label(s) drifted out of 9 compared" in result.output
     # The pass's cost ceiling is stated, not left to be inferred from the log.
-    assert "consistency patch budget: 3 request(s), 2 used" in result.output
+    assert "consistency patch budget: 3 attempt(s), 2 applied" in result.output
     assert "stopped after two patches in a row were refused" in result.output
 
 
@@ -179,9 +179,10 @@ def test_the_cli_says_when_the_verifier_could_not_run(mock_env, tmp_path, monkey
         ["translate", "--file", str(_doc(tmp_path)), "--out", str(tmp_path / "v.md")],
     )
 
-    assert result.exit_code == 0, result.output
-    assert "verifier unavailable for" in result.output
-    assert "shipped without a verdict" in result.output
+    assert result.exit_code == 1, result.output
+    assert "Run failed: VerificationError" in result.output
+    assert "verification unavailable" in result.output
+    assert not (tmp_path / "v.md").exists()
 
 
 def test_the_command_says_failed_when_a_chunk_has_no_translation(mock_env, tmp_path, monkeypatch):
@@ -200,4 +201,6 @@ def test_the_command_says_failed_when_a_chunk_has_no_translation(mock_env, tmp_p
 
     verdict = next(line for line in result.stdout.splitlines() if line.strip())
     assert verdict == "Failed."
+    assert result.exit_code == 1
+    assert "incomplete: 1/3 chunk(s) missing" in result.stdout
     assert "chunk-001: RateLimitError: 429" in result.stdout

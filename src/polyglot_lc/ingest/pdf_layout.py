@@ -166,7 +166,7 @@ _LABEL_WIDTH_SHARE = 0.45
 #: Bullet glyphs: unmapped PDF bullets plus real bullet characters.  A dash or
 #: asterisk only counts when a space follows it, so a wrapped line is not
 #: mistaken for a list item.
-_BULLETS = ("(cid:136)", "(cid:127)", "(cid:149)", "•", "●", "◦")
+_BULLETS = ("(cid:136)", "(cid:127)", "(cid:149)", "•", "●", "◦", "·")
 _BULLET_CHARS = "-*"
 
 #: Leading CMTT advance is 0.525 em; code indentation is restored from x-offset.
@@ -176,6 +176,26 @@ _MONO_ADVANCE = 0.525
 _LIGATURES = {"ﬀ": "ff", "ﬁ": "fi", "ﬂ": "fl", "ﬃ": "ffi", "ﬄ": "ffl"}
 #: This PDF doubles the ligature glyph ("eﬀﬀect", "Proﬁﬁling"); collapse it.
 _DOUBLED_LIGATURE_RE = re.compile("([ﬀﬁﬂﬃﬄ])\\1+")
+#: UTF-8 bytes the text layer misread as cp1252/latin-1. None of these exact
+#: sequences is legitimate English or Vietnamese, so replacing them cannot
+#: damage real text — while a corrupt bullet that survives ingest becomes
+#: structure the translator is told to preserve and normalises away, which the
+#: verifier then reads as a defect on every run.
+_MOJIBAKE = {
+    "â€™": "'",
+    "â€˜": "'",
+    "â€œ": '"',
+    "â€\x9d": '"',
+    "â€“": "–",
+    "â€”": "—",
+    "â€¦": "…",
+    "â€¢": "•",
+    "â€": '"',
+    "Â·": "·",
+    "Â\xad": "",
+    "Â\xa0": " ",
+    "Ã©": "é",
+}
 #: A page-number token at the end of a contents entry. Front matter is numbered
 #: in roman numerals and the body in arabic, and one contents page carries both.
 _TOC_PAGE_RE = r"(?:\d{1,4}|[IVXLCDM]{1,7})"
@@ -219,7 +239,7 @@ def normalize_toc_lines(markdown: str) -> str:
 
 
 def normalize_glyphs(text: str) -> str:
-    """Fix ligature artifacts: doubled ligature glyphs and the glyphs themselves.
+    """Fix text-layer artifacts: ligature glyphs and UTF-8 mojibake.
 
     The PDF text layer repeats a ligature glyph where the font maps one glyph
     to a two-letter sequence, so ``effect`` arrives as ``e`` + ``ﬀ`` + ``ﬀ`` +
@@ -229,6 +249,9 @@ def normalize_glyphs(text: str) -> str:
     text = _DOUBLED_LIGATURE_RE.sub(r"\1", text)
     for glyph, letters in _LIGATURES.items():
         text = text.replace(glyph, letters)
+    # Longest first: "â€™" must not be clipped to "â€" + a stray quote.
+    for bad, good in sorted(_MOJIBAKE.items(), key=lambda item: -len(item[0])):
+        text = text.replace(bad, good)
     return text
 
 
@@ -348,6 +371,22 @@ def _baseline(chars: list[dict[str, Any]]) -> tuple[float, float | None]:
         if "bottom" in ch and abs(float(ch["size"]) - size) < 0.05
     ]
     return size, (max(bottoms) if bottoms else None)
+
+
+def _dominant_char_size(chars: list[dict[str, Any]]) -> float:
+    """The size most of a line's glyphs are set in.
+
+    A line's *largest* glyph is not its typographic size: a footnote marker,
+    a stray superscript or one malformed glyph can be larger than the body
+    text and turn a prose line into a heading. That is exactly what happened
+    to ``coⁿtamiⁿated products...`` on page 32 of CDC 134910: one 12 pt glyph
+    in an otherwise 9.96 pt line crossed the 11.96 pt heading threshold. The
+    dominant (modal) size is the line's real size; an outlier cannot move it.
+    """
+    sizes = Counter(round(float(c["size"]), 1) for c in chars if c.get("size"))
+    if not sizes:
+        return 0.0
+    return sizes.most_common(1)[0][0]
 
 
 def _superscript(ch: dict[str, Any], size: float, baseline: float | None) -> str | None:
@@ -718,6 +757,11 @@ def _starts_with_bullet(text: str) -> bool:
     )
 
 
+def _furniture_key(text: str) -> str:
+    """Text with changing page numbers blanked, for repeat comparison."""
+    return re.sub(r"\d+", "#", " ".join(text.split()).casefold())
+
+
 def _looks_like_running_head(text: str, *, folio: int | None = None) -> bool:
     """True when a top-of-page line is a running head rather than content.
 
@@ -760,6 +804,7 @@ def _classify(
     heading_min: float = _HEADING_SIZE,
     h1_min: float = _H1_SIZE,
     folio: int | None = None,
+    repeated_furniture: frozenset[str] = frozenset(),
 ) -> _RawLine | None:
     """Classify one pdfplumber line; ``None`` when it carries no content."""
     chars = line["chars"]
@@ -768,7 +813,8 @@ def _classify(
     if not text:
         return None
 
-    size = max(float(c["size"]) for c in chars)
+    # The line's real size, not its largest glyph: see _dominant_char_size.
+    size = _dominant_char_size(chars)
     x0 = min(float(c["x0"]) for c in chars)
     x1 = max(float(c["x1"]) for c in chars)
     bottom = float(line.get("bottom") or top)
@@ -788,6 +834,15 @@ def _classify(
         return _RawLine(
             page_no, top, kind, level, text, x0, size, x1, bottom, **face, spans=spans or []
         )
+
+    # A line repeated in the same margin on most pages is furniture even when
+    # it has no page number to prove it (e.g. "A GUIDE TO WRITING" or a
+    # changelog footer whose only variation is the folio). This must run before
+    # the oversized check, or every copy becomes a section heading.
+    if _furniture_key(text) in repeated_furniture and (
+        top < header_band or top >= footer_band
+    ):
+        return raw("header", 0, text, 0.0, 0.0)
 
     # Oversized first: the first line of a page is often a section title, and
     # dropping it as a running head is how a document loses every heading.
@@ -884,7 +939,7 @@ def _font_thresholds(
             chars = line.get("chars") or []
             if not chars:
                 continue
-            sizes[round(max(float(c["size"]) for c in chars), 1)] += 1
+            sizes[_dominant_char_size(chars)] += 1
     if sum(sizes.values()) < _MIN_SIZE_SAMPLE or len(sizes) < 2:
         return _HEADING_SIZE, _H1_SIZE, 0.0
     body = sizes.most_common(1)[0][0]
@@ -1109,6 +1164,7 @@ def _page_lines(
     folio: int | None = None,
     heading_min: float = _HEADING_SIZE,
     h1_min: float = _H1_SIZE,
+    repeated_furniture: frozenset[str] = frozenset(),
 ) -> list[_RawLine]:
     """Classified lines of one page, in reading order, tables included.
 
@@ -1130,6 +1186,7 @@ def _page_lines(
             heading_min=heading_min,
             h1_min=h1_min,
             folio=folio,
+            repeated_furniture=repeated_furniture,
         )
         if classified is not None:
             lines.append(classified)
@@ -1434,6 +1491,36 @@ def _number_marker(text: str) -> str:
     return match.group(1) if match else ""
 
 
+def _repeated_furniture(
+    pages: list[Any], lines_by_page: list[list[dict[str, Any]]]
+) -> frozenset[str]:
+    """Margin lines repeated on at least half the pages (minimum three).
+
+    A running head does not always carry a folio, and a footer may put its
+    page number in the middle of words (``Last update: May 2019 41 of 163``).
+    Repetition in the same margin is the remaining evidence. Two occurrences
+    are not enough: a section title can legitimately appear twice.
+    """
+    if len(pages) < 3:
+        return frozenset()
+    seen: dict[str, set[int]] = {}
+    for page_no, page in enumerate(pages):
+        header = _header_band(page)
+        footer = _footer_band(page)
+        for line in lines_by_page[page_no]:
+            top = float(line.get("top", 0.0))
+            if top >= header and top < footer:
+                continue
+            text = normalize_glyphs(line_text(line.get("chars", []))).strip()
+            if text:
+                seen.setdefault(_furniture_key(text), set()).add(page_no)
+    return frozenset(
+        key
+        for key, page_numbers in seen.items()
+        if len(page_numbers) >= 3 and len(page_numbers) >= len(pages) * 0.5
+    )
+
+
 def _build_units(pages: list[Any]) -> list[_Unit]:
     """Group every page into Markdown units, keeping each unit's geometry.
 
@@ -1445,6 +1532,7 @@ def _build_units(pages: list[Any]) -> list[_Unit]:
     #: document's folio offset and the classification all ask the same list.
     lines_by_page = [_text_lines(page) for page in pages]
     heading_min, h1_min, body_size = _font_thresholds(pages, lines_by_page)
+    repeated_furniture = _repeated_furniture(pages, lines_by_page)
     #: Front matter makes the printed page number differ from the PDF's own page
     #: index; the running-head test needs the number this page actually prints.
     offset = _folio_offset(pages, lines_by_page)
@@ -1458,6 +1546,7 @@ def _build_units(pages: list[Any]) -> list[_Unit]:
             folio=None if offset is None else offset + page_no + 1,
             heading_min=heading_min,
             h1_min=h1_min,
+            repeated_furniture=repeated_furniture,
         )
     ]
     _mark_labels(classified, body_size)
@@ -1583,7 +1672,77 @@ def _build_units(pages: list[Any]) -> list[_Unit]:
 
     flush()
     flush_code()
-    return units
+    return _demote_continuation_headings(units)
+
+
+def _demote_continuation_headings(units: list[_Unit]) -> list[_Unit]:
+    """Turn a heading that is really the rest of a paragraph back into body text.
+
+    Heading detection is typographic, and a PDF can set one glyph in a prose
+    line larger than the rest (a footnote marker, a malformed superscript).
+    When that line reads on from the paragraph above -- lowercase start, no
+    sentence end before it, and no paragraph-sized gap -- it is a continuation,
+    not a title. Keeping it as ``##`` costs the whole chunk: the Verifier's hard
+    check compares heading levels, so every faithful translation "changes the
+    heading structure" and the chunk is rejected.
+
+    The line is folded into the preceding body unit, rectangles included, so the
+    rebuilt PDF still clears exactly the source lines the translation replaces.
+
+    Two more typographic artifacts get the same treatment: a "heading" that
+    opens with a bullet glyph is an oversized list line (titles never start with
+    ``•``), demoted to body text; and a heading that reads on from the previous
+    heading (lowercase start, no sentence end) is the wrapped tail of that
+    title, folded into it.
+    """
+    kept: list[_Unit] = []
+    for unit in units:
+        if unit.kind == "heading" and _starts_with_bullet(
+            unit.text.lstrip("#").strip()
+        ):
+            # An oversized bullet line is a list item, not a title: emit it as
+            # one, marker restored, so the translator and the Verifier both see
+            # a list structure instead of a stray glyph in prose.
+            unit.kind = "list"
+            unit.text = "- " + _bullet_text(unit.text.lstrip("#").strip())
+            kept.append(unit)
+            continue
+        if unit.kind == "heading" and kept:
+            previous = kept[-1]
+            text = unit.text.lstrip("#").strip()
+            reads_prev = (
+                previous.text
+                if previous.kind == "body"
+                else previous.text.lstrip("#").strip()
+            )
+            if (
+                previous.kind in {"body", "heading", "list"}
+                and _reads_on(reads_prev, text)
+                and _line_close(previous, unit)
+            ):
+                previous.text = previous.text.rstrip() + " " + text
+                previous.rects.extend(unit.rects)
+                previous.size = max(previous.size, unit.size)
+                continue
+        kept.append(unit)
+    return kept
+
+
+def _line_close(previous: _Unit, unit: _Unit) -> bool:
+    """Whether *unit* sits line-close under *previous* (a wrapped line, not a
+    new paragraph). Where the geometry cannot answer -- missing rects or a page
+    break -- it stays permissive, and the text evidence decides alone."""
+    if not (previous.rects and unit.rects):
+        return True
+    same_page = previous.rects[-1][0] == unit.rects[0][0]
+    gap = (
+        float(unit.rects[0][2]) - float(previous.rects[-1][4])
+        if same_page
+        else float("inf")
+    )
+    # A paragraph gap means the author started something new; only a
+    # line-spacing gap makes this a wrapped continuation.
+    return same_page and gap <= 14.0
 
 
 def render_markdown(units: list[_Unit]) -> str:

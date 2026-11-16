@@ -32,6 +32,7 @@ import dataclasses
 import hashlib
 import threading
 import time
+import json
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
@@ -50,6 +51,7 @@ from polyglot_lc.agents import (
     TranslatorAgent,
     VerifierAgent,
 )
+from polyglot_lc.agents.verifier import TranslationRejected
 from polyglot_lc.analysis import DocumentPlan, score_chunk
 from polyglot_lc.config import (
     ConfigError,
@@ -57,6 +59,7 @@ from polyglot_lc.config import (
     get_agent_config,
     get_app_config,
     get_embed_config,
+    get_retry_config,
 )
 from polyglot_lc.ingest import load_document
 from polyglot_lc.llm.client import TokenUsage, active_api_calls
@@ -65,6 +68,7 @@ from polyglot_lc.llm.resilience import (
     NoBackupError,
     PermanentError,
     RetryStats,
+    TruncatedError,
     jittered_delay,
 )
 from polyglot_lc.orchestrator.graph import (
@@ -126,6 +130,15 @@ _MAX_COVERAGE_RETRIES = 2
 #: until the reader stopped it.
 _MAX_EMPTY_RETRIES = 2
 
+#: How many times a chunk is re-run after its reply was cut at the provider's
+#: output-token limit, before the halves are tried. The Translator already
+#: escalates its own budget twice inside one ask, so by the time the error
+#: reaches here the ladder is spent: re-running the whole graph asks the same
+#: question with the same ceiling. This had no bound at all, so one chunk whose
+#: budget could never fit held the run at its progress bar — paying for the
+#: identical failed ask every time — for as long as the reader kept the page open.
+_MAX_TRUNCATED_RETRIES = 2
+
 #: How deep a chunk that fails the coverage gate is split and re-asked (see
 #: ``salvage_by_split``): the chunk, then each half once. Two levels take a
 #: reply down to ~a quarter of the chunk's length — short enough that the
@@ -163,6 +176,15 @@ class PipelineResult:
     traces_stored: int = 0
     log_path: str = ""
     errors: list[str] = field(default_factory=list)
+    #: Which SkillOpt skill this run used (empty when none was applied), and
+    #: what its translations actually scored. ``skill_promoted`` says whether
+    #: the run's gradient replaced it at the end.
+    skill_id: str = ""
+    skill_version: int = 0
+    skill_scope: str = ""
+    skill_applied: bool = False
+    skill_mean: float = 0.0
+    skill_samples: int = 0
     skill_promoted: bool = False
     # --- adaptive / planning / durability metrics ---
     planner_calls: int = 0
@@ -191,19 +213,23 @@ class PipelineResult:
     #: "0 inconsistencies" over 175 terms are not the same result.
     consistency_checked_terms: int = 0
     consistency_no_pairs: bool = False
-    #: Requests the pass was allowed to spend on patches (see
-    #: :class:`~polyglot_lc.pipeline.consistency.ConsistencyReport`), so the
-    #: cost of the pass is visible before/with the report rather than inferred.
+    #: Patch attempts allowed; semantic verification uses additional requests.
     consistency_patch_budget: int = 0
     #: True when the pass stopped after two patches in a row were refused — the
     #: rest of its budget was not spent, and the chunks it left are counted as
     #: skipped rather than silently looking consistent.
     consistency_stopped_early: bool = False
-    #: Chunks that shipped without a verdict because the Verifier could not run.
+    #: Unavailable verifications that stopped chunk processing.
     verify_skipped: int = 0
     partial_output: bool = False
     elapsed_s: float = 0.0
     chunks_failed: int = 0
+    chunks_rejected: int = 0
+    #: Per-chunk review notes for best-effort translations that did not pass
+    #: every gate. The records are deliberately structured: a dashboard can
+    #: count causes without parsing prose, and a reviewer can find the exact
+    #: chunk in the output.
+    quality_review: list[dict[str, str]] = field(default_factory=list)
     #: The error that ended the run, when it ended without finishing. Empty for
     #: a run that finished, however many provider failures it had to wait out.
     fatal_error: str = ""
@@ -377,6 +403,11 @@ class TranslationPipeline:
         # It reads as failed only when a chunk has no translation or the run
         # stopped on an error. Its problems are still counted below.
         failed = bool(result.chunks_failed or result.fatal_error)
+        status = (
+            "failed"
+            if failed
+            else ("done_with_warnings" if result.chunks_rejected else "done")
+        )
         artifacts: list[dict[str, Any]] = []
         for kind, path in (("md", result.output_path), ("pdf", result.pdf_path)):
             if not path:
@@ -392,7 +423,7 @@ class TranslationPipeline:
         calls = active_api_calls()
         self.sink.record(
             type="run_end",
-            status="failed" if failed else "done",
+            status=status,
             active_api_calls=calls.get("active"),
             max_active_api_calls=calls.get("peak"),
             exit_code=1 if failed else 0,
@@ -413,12 +444,24 @@ class TranslationPipeline:
             fallbacks=stats.get("fallbacks", 0),
             chunks_done=max(0, result.chunks - result.chunks_failed),
             chunks_failed=result.chunks_failed,
+            chunks_rejected=result.chunks_rejected,
+            fatal_error=result.fatal_error,
             resumed_chunks=result.resumed_chunks,
             # The consistency pass's own tally, on the record a reader opens
             # first: chunk left drifting and patch refused were only ever
             # visible as lines buried in the log.
             **result.consistency_fields(),
             verify_skipped=result.verify_skipped,
+            skill={
+                "id": result.skill_id,
+                "version": result.skill_version,
+                "scope": result.skill_scope,
+                "applied": result.skill_applied,
+                "mean": round(result.skill_mean, 3),
+                "samples": result.skill_samples,
+                "promoted": result.skill_promoted,
+            },
+            quality_review=result.quality_review,
             artifacts=artifacts,
             rebuild={
                 "placed": result.pdf_blocks,
@@ -513,30 +556,7 @@ class TranslationPipeline:
         doc_key: str = "",
         on_chunk_done: Callable[[Any, dict[str, Any]], None] | None = None,
     ) -> list[dict[str, Any]]:
-        """Run each chunk's graph, bounded-parallel across independent chunks.
-
-        Each chunk keeps its internal Translate->[Critic->Refiner]->Verify order;
-        only *different* chunks run concurrently (``MAX_CONCURRENCY``). Results
-        are returned in the original chunk order regardless of completion order.
-
-        **A chunk is never skipped.** Provider failures are waited out and the
-        chunk is run again until it has a translation, so the file a finished
-        run writes holds no placeholder for it. A chunk whose draft survived the
-        failure resumes from that draft — the translator is not asked for the
-        same words twice (:meth:`GraphContext.remember_draft`). The wait is
-        unbounded by design for a *failure* — an outage ends by itself — while a
-        reply that arrives empty is re-asked only ``_MAX_EMPTY_RETRIES`` times
-        before the chunk is given up on, because no amount of waiting turns
-        "nothing" into a translation.
-
-        **Unless there is nothing left to wait for.** A failure that no retry
-        can fix — a spent attempt with no backup endpoint behind it
-        (:class:`NoBackupError`), or one the provider itself calls permanent
-        (:class:`PermanentError`) — ends the run instead of the wait: the
-        chunk is reported as failed, the other chunks stop, and the run's
-        record says why. Waiting on an endpoint that has already said no is
-        how a run used to sit at "0/38" for an hour.
-        """
+        """Run independent chunks, isolating quality rejections but propagating fatal errors."""
         per_chunk_state = per_chunk_state or {}
         self._stop.clear()
         # By the time a failure reaches this loop, the resilience layer has
@@ -593,6 +613,7 @@ class TranslationPipeline:
             attempt = 0
             coverage_retries = 0
             empty_replies = 0
+            truncated_retries = 0
             while True:
                 if self._stop.is_set():
                     # Another chunk hit something no retry can fix, so the run
@@ -612,6 +633,33 @@ class TranslationPipeline:
                         # for as long as the reader keeps the page open.
                         self._stop.set()
                         return {"translated": "", "chunk": chunk, "error": str(exc)}, False, True
+                    if isinstance(exc, TruncatedError):
+                        # The Translator's own budget ladder is spent by the time
+                        # the error reaches here, so re-running the whole graph
+                        # asks the same question with the same ceiling. A shorter
+                        # question IS a different question: try the halves, and if
+                        # they cannot cover the chunk either, leave a visible
+                        # marker instead of asking forever.
+                        if truncated_retries >= _MAX_TRUNCATED_RETRIES:
+                            salvaged = salvage_by_split(chunk, depth)
+                            if salvaged is not None:
+                                return {"translated": salvaged, "chunk": chunk}, False, False
+                            logger.warning(
+                                "chunk={} reply kept being cut at the output-token "
+                                "limit; leaving it untranslated for this run and out "
+                                "of the checkpoint",
+                                chunk.id,
+                            )
+                            ui.add_error(
+                                f"{chunk.id}: reply cut at the output-token limit - "
+                                "left untranslated"
+                            )
+                            return (
+                                {"translated": "", "chunk": chunk, "error": str(exc)},
+                                True,
+                                False,
+                            )
+                        truncated_retries += 1
                     wait_and_retry(chunk, attempt, f"{type(exc).__name__}: {exc}")
                     if self._stop.is_set():
                         return {"translated": "", "chunk": chunk, "error": str(exc)}, False, True
@@ -761,7 +809,22 @@ class TranslationPipeline:
             return joined
 
         def run_one(index: int, chunk: Any) -> dict[str, Any]:
-            out, kept_partial, aborted = settle(chunk, 0)
+            try:
+                out, kept_partial, aborted = settle(chunk, 0)
+            except TranslationRejected as exc:
+                ui.add_error(f"{chunk.id}: {exc}")
+                # Keep the best draft even when the gate refused it. A reader
+                # can review imperfect text; a marker cannot recover words.
+                best = ctx.drafts.get(chunk.id, "") if ctx is not None else ""
+                self._save_rejected(store, doc_key, chunk, best, str(exc))
+                out = {
+                    "translated": best,
+                    "chunk": chunk,
+                    "error": str(exc),
+                    "quality_rejected": True,
+                    "rejection_reason": str(exc),
+                }
+                kept_partial, aborted = True, False
             if aborted:
                 return out
             # A translation — whole or salvaged — is worth keeping: a resume
@@ -776,6 +839,19 @@ class TranslationPipeline:
 
         results: list[Any] = [None] * len(chunks)
         workers = max(1, self.app.max_concurrency)
+        slots = get_retry_config().provider_concurrency
+        if workers > slots:
+            # Both knobs default to 1 and the settings dialog exposes both, so
+            # raising only the worker count buys nothing and says nothing.
+            logger.warning(
+                "MAX_CONCURRENCY={} but LLM_PROVIDER_CONCURRENCY={}: {} chunk workers "
+                "queue on {} provider slot(s), so the run is effectively serialised; "
+                "raise LLM_PROVIDER_CONCURRENCY to the provider's real limit",
+                workers,
+                slots,
+                workers,
+                slots,
+            )
         if workers == 1 or len(chunks) <= 1:
             for i, chunk in enumerate(chunks):
                 results[i] = run_one(i, chunk)
@@ -796,6 +872,40 @@ class TranslationPipeline:
                 self._stop.set()
                 raise
         return results
+
+    @staticmethod
+    def _save_rejected(
+        store: CheckpointStore | None,
+        doc_key: str,
+        chunk: Any,
+        translation: str,
+        reason: str,
+    ) -> None:
+        """Keep a rejected draft on disk for review and later repair.
+
+        The checkpoint intentionally stays empty: ``--resume`` must retry the
+        chunk. This side file is evidence, not a resume shortcut.
+        """
+        if not translation.strip():
+            return
+        try:
+            if store is not None:
+                directory = store.dir_for(doc_key).parent / "rejected" / doc_key
+            else:
+                directory = Path("data") / "rejected" / (doc_key or "unknown")
+            directory.mkdir(parents=True, exist_ok=True)
+            payload = {
+                "chunk_id": chunk.id,
+                "source": chunk.text,
+                "translated": translation,
+                "reason": reason,
+                "ts": time.time(),
+            }
+            (directory / f"{chunk.id}.json").write_text(
+                json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8"
+            )
+        except OSError as exc:  # noqa: BLE001 - evidence is best-effort
+            logger.warning("Could not save rejected draft for {}: {}", chunk.id, exc)
 
     @staticmethod
     def _to_checkpoint(chunk: Any, state: dict[str, Any]) -> ChunkCheckpoint:
@@ -864,6 +974,24 @@ class TranslationPipeline:
         with ui.step("segment"):
             chunks = chunk_document(doc, max_tokens=max_tokens, model=translator_cfg.model)
             ui.set_stats(chunks=len(chunks))
+        result.chunks = len(chunks)
+        result.chunks_failed = len(chunks)
+        result.partial_output = bool(app.partial_output)
+
+        # ---- promoted skill (best-effort: a broken skill.md must not fail the
+        # ---- run) — read before the run's first record, so every event and
+        # ---- the report can name the skill that shaped this translation ----
+        skill_store = SkillStore(app.skills_dir)
+        try:
+            skill = skill_store.load() if app.skill_apply else None
+        except Exception as exc:  # noqa: BLE001 - optimization is best-effort
+            logger.warning("Skill load skipped: {}", exc)
+            skill = None
+        result.skill_applied = skill is not None
+        if skill is not None:
+            result.skill_id = str(skill.get("skill_id", ""))
+            result.skill_version = int(skill.get("version", 0) or 0)
+            result.skill_scope = str(skill.get("scope", ""))
 
         # ---- what this run was asked to do, while it is still true ----
         source_path = Path(file_path)
@@ -883,6 +1011,12 @@ class TranslationPipeline:
                 "resume": bool(resume),
                 "format": fmt,
                 "partial_output": bool(app.partial_output),
+            },
+            skill={
+                "id": result.skill_id,
+                "version": result.skill_version,
+                "scope": result.skill_scope,
+                "applied": result.skill_applied,
             },
             version=__version__,
         )
@@ -910,7 +1044,7 @@ class TranslationPipeline:
         # ---- subsystems ----
         subsystems = self._build_subsystems(ui)
         planner: PlannerAgent = subsystems["planner"]
-        skill_opt = SkillOptimizer(SkillStore(app.skills_dir), planner)
+        skill_opt = SkillOptimizer(skill_store, planner)
         ctx = GraphContext(
             planner=planner,
             translator=subsystems["translator"],
@@ -944,6 +1078,7 @@ class TranslationPipeline:
             model=translator_cfg.model,
             chunk_hashes=[c.hash() for c in chunks],
             glossary=glossary_fingerprint,
+            skip_llm_verify=app.fast_path_skip_llm_verify,
         )
         # The page shows the translation as it arrives, chunk by chunk, out of
         # the chunks' own files on disk. It cannot work out where those live:
@@ -978,6 +1113,7 @@ class TranslationPipeline:
         pending = [c for i, c in enumerate(chunks) if chunk_states[i] is None]
         resumed_all = not pending
         result.resumed_chunks = len(chunks) - len(pending)
+        result.chunks_failed = len(pending)
 
         # One early record the web UI polls on a resumed run: how many chunks
         # it is about to replay from checkpoint, and whether the store had
@@ -1025,13 +1161,8 @@ class TranslationPipeline:
         # heuristic terms (and every user CSV entry) reach the translator too,
         # so a fallback plan used to report "0 terminology" while sending 65.
         result.glossary_terms = _glossary_entry_count(glossary_md)
-        # ---- promoted skill (best-effort: a broken skill.md must not fail the
-        # ---- run) — read once, then carried into every chunk's state ----
-        try:
-            skill = skill_opt.store.load(src, tgt)
-        except Exception as exc:  # noqa: BLE001 - optimization is best-effort
-            logger.warning("Skill load skipped: {}", exc)
-            skill = None
+        # ---- the skill read before the run's first record: carried into every
+        # ---- chunk's state, unchanged for the whole run ----
         base_state: dict[str, Any] = {
             "src_lang": src,
             "tgt_lang": tgt,
@@ -1039,6 +1170,10 @@ class TranslationPipeline:
             "few_shot": _merge_few_shot((skill or {}).get("few_shot") or [], plan.few_shot),
             "pitfalls": plan.pitfalls,
             "glossary_md": glossary_md,
+            "glossary_pairs": {
+                **{p.term: p.translation for p in plan.glossary_pairs},
+                **user_glossary,
+            },
             "skill": skill,
         }
         if store.usable:
@@ -1080,33 +1215,57 @@ class TranslationPipeline:
             if st is not None
         }
 
+        rejected: set[str] = set()
+
         def on_chunk_done(chunk: Any, state: dict[str, Any]) -> None:
             completed[chunk.id] = state.get("translated", "")
+            if state.get("quality_rejected"):
+                rejected.add(chunk.id)
             if not app.partial_output or not want_md:
                 return
             write_atomic(out_path, assemble_partial(chunks, completed, code_map))
 
         t0 = time.monotonic()
-        if pending:
-            pending_states = self._run_chunks(
-                chunk_graph,
-                pending,
-                base_state,
-                ui,
-                ctx=ctx,
-                per_chunk_state=per_chunk_state,
-                store=store,
-                doc_key=doc_key,
-                on_chunk_done=on_chunk_done,
+        try:
+            if pending:
+                pending_states = self._run_chunks(
+                    chunk_graph,
+                    pending,
+                    base_state,
+                    ui,
+                    ctx=ctx,
+                    per_chunk_state=per_chunk_state,
+                    store=store,
+                    doc_key=doc_key,
+                    on_chunk_done=on_chunk_done,
+                )
+                iterator = iter(pending_states)
+                for i, chunk in enumerate(chunks):
+                    if chunk_states[i] is None:
+                        chunk_states[i] = next(iterator)
+        finally:
+            result.elapsed_s = round(time.monotonic() - t0, 1)
+            result.chunks_failed = sum(
+                1 for chunk in chunks if not (completed.get(chunk.id) or "").strip()
             )
-            iterator = iter(pending_states)
-            for i, chunk in enumerate(chunks):
-                if chunk_states[i] is None:
-                    chunk_states[i] = next(iterator)
-        elapsed = time.monotonic() - t0
+            result.chunks_rejected = len(rejected)
+            result.verify_skipped = ctx.verify_skips
+            result.fast_path_rejections = ctx.fast_path_rejections
+            result.fast_path_top_reason = (
+                ctx.fast_path_reasons.most_common(1)[0][0] if ctx.fast_path_reasons else ""
+            )
 
         chunk_states = [st for st in chunk_states if st is not None]
         by_id = {chunk.id: st for chunk, st in zip(chunks, chunk_states, strict=True)}
+        result.quality_review = [
+            {
+                "chunk": chunk.id,
+                "severity": str(getattr(st.get("verify_result"), "severity", "major")),
+                "reason": str(st.get("rejection_reason", "")),
+            }
+            for chunk, st in zip(chunks, chunk_states, strict=True)
+            if st.get("quality_rejected")
+        ]
         translated: dict[str, str] = {
             chunk_id: st.get("translated", "") for chunk_id, st in by_id.items()
         }
@@ -1119,14 +1278,22 @@ class TranslationPipeline:
         if pending and app.consistency_check and chunks:
             checker = ConsistencyChecker(
                 ConsistencyAgent(config=self.agent_configs["REFINER"]),
+                ctx.verifier,
                 max_patches=app.consistency_max_patches,
                 ui=ui,
                 sink=self.sink,
             )
             with ui.step("consistency"):
-                translated, report = checker.run(
-                    chunks,
-                    translated,
+                full_translations = dict(translated)
+                eligible = [chunk for chunk in chunks if chunk.id not in rejected]
+                consistency_translations = {
+                    chunk.id: translated[chunk.id]
+                    for chunk in eligible
+                    if translated.get(chunk.id, "").strip()
+                }
+                patched, report = checker.run(
+                    eligible,
+                    consistency_translations,
                     pairs,
                     context={
                         "src_lang": src,
@@ -1135,6 +1302,8 @@ class TranslationPipeline:
                         "glossary_md": glossary_md,
                     },
                 )
+                translated = full_translations
+                translated.update(patched)
             # One mapping (the report's) fills the result fields, whose names
             # are the run record's keys: no hand-copied list to drift.
             for name, value in report.as_run_fields().items():
@@ -1142,6 +1311,8 @@ class TranslationPipeline:
             # Keep the checkpoints in sync with what was actually written.
             for chunk in chunks:
                 state = by_id.get(chunk.id)
+                if chunk.id in rejected:
+                    continue
                 if state is None or not state.get("translated"):
                     continue
                 if translated.get(chunk.id, "") == state.get("translated"):
@@ -1184,10 +1355,18 @@ class TranslationPipeline:
         # Computed once: the SkillOpt update and the report ask the same
         # question of the same traces, and reading them twice was pure work.
         scores = _collect_scores(final)
+        if scores:
+            result.skill_mean = sum(scores) / len(scores)
+            result.skill_samples = len(scores)
         try:
-            if pending:
+            # SKILL_APPLY=off is the control arm: no skill went into the prompt,
+            # so nothing here can be attributed to one. The run still reports
+            # its own mean, which is what a with-skill run is compared against.
+            if pending and app.skill_apply:
                 with ui.step("skillopt_update"):
                     for chunk, score in zip(chunks, scores, strict=False):
+                        if not translated.get(chunk.id):
+                            continue
                         skill_opt.observe(
                             src,
                             tgt,
@@ -1195,7 +1374,15 @@ class TranslationPipeline:
                             output=translated.get(chunk.id, "")[:200],
                             critic_score=score,
                         )
-                    promoted = skill_opt.maybe_promote(src, tgt)
+                    promoted = skill_opt.maybe_promote(
+                        src,
+                        tgt,
+                        run_id=getattr(self.sink, "run_id", ""),
+                        doc=source_path.name,
+                        verify_fail_rate=(result.verify_skipped / len(chunks)) if chunks else 0.0,
+                        retranslate_rate=(result.chunk_retries / len(chunks)) if chunks else 0.0,
+                        applied=skill,
+                    )
                     result.skill_promoted = promoted is not None
         except Exception as exc:  # noqa: BLE001 - optimization is best-effort
             logger.warning("SkillOpt update skipped: {}", exc)
@@ -1203,24 +1390,13 @@ class TranslationPipeline:
         # ---- report ----
         paths = [str(st.get("path", "standard")) for st in chunk_states]
         result.output_path = str(out_path if want_md else pdf_path)
-        result.chunks = len(chunks)
         result.avg_critic = (sum(scores) / len(scores)) if scores else 0.0
         result.traces_stored = sum(1 for st in chunk_states if st.get("stored"))
         result.fast_path_chunks = paths.count("fast")
         result.standard_path_chunks = paths.count("standard")
         result.deep_path_chunks = paths.count("deep")
-        result.partial_output = bool(app.partial_output)
-        result.elapsed_s = round(elapsed, 1)
-        result.chunks_failed = sum(
-            1 for chunk in chunks if not (translated.get(chunk.id) or "").strip()
-        )
-        result.fast_path_rejections = ctx.fast_path_rejections
-        result.fast_path_top_reason = (
-            ctx.fast_path_reasons.most_common(1)[0][0] if ctx.fast_path_reasons else ""
-        )
-        result.verify_skipped = ctx.verify_skips
         ui.set_stats(
-            elapsed_s=round(elapsed, 1),
+            elapsed_s=result.elapsed_s,
             avg_critic=round(result.avg_critic, 2),
             traces=result.traces_stored,
             fast_path=result.fast_path_chunks,

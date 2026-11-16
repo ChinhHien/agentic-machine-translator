@@ -116,9 +116,10 @@ def test_request_budget_adaptive_fast_path(mock_env, tmp_path, monkeypatch):
     assert _calls(by, "CRITIC") == 0  # fast path skips critic + refiner
     assert _calls(by, "REFINER") == 0
     assert _calls(by, "VERIFIER") == n
-    # one document plan + one SkillOpt gradient call
-    assert _calls(by, "PLANNER") == 2
-    assert snap["calls"] == 2 * n + 2
+    # One document plan. SkillOpt does not ask for a gradient either: a 3-chunk
+    # run is below SKILL_MIN_SAMPLES, so it measures the skill instead.
+    assert _calls(by, "PLANNER") == 1
+    assert snap["calls"] == 2 * n + 1
     assert result.fast_path_chunks == n
     assert result.planner_calls == 1
 
@@ -140,8 +141,8 @@ def test_request_budget_full_quality_path(mock_env, tmp_path, monkeypatch):
     assert _calls(by, "CRITIC") == n
     assert _calls(by, "REFINER") == 0  # default score 8.5 >= threshold
     assert _calls(by, "VERIFIER") == n
-    assert _calls(by, "PLANNER") == 2
-    assert snap["calls"] == 3 * n + 2
+    assert _calls(by, "PLANNER") == 1
+    assert snap["calls"] == 3 * n + 1
     # The old pipeline paid one Planner request per section plus one.
     assert snap["calls"] < 3 * n + len(sections) + 3
     assert result.standard_path_chunks == n
@@ -170,27 +171,27 @@ def test_request_budget_critic_requires_refine(mock_env, tmp_path, monkeypatch):
 def test_request_budget_semantic_retry(mock_env, tmp_path, monkeypatch):
     """A verifier failure retranslates even on the fast path (no critique needed)."""
     path = _write(tmp_path, PLAIN)
-    chunks, _sections = _expected_chunks(path)
 
     replies = {"translation QA verifier": '{"pass": false, "reasons": ["dropped"]}'}
-    _result, _snap, by = _run(mock_env, monkeypatch, path, concurrency=1, replies=replies)
-
-    n = len(chunks)
-    # verifier fails -> retranslate -> verify again (bounded to one retry)
-    assert _calls(by, "TRANSLATOR") == 2 * n
-    assert _calls(by, "VERIFIER") == 2 * n
+    result, _snap, by = _run(mock_env, monkeypatch, path, concurrency=1, replies=replies)
+    # A soft verifier rejection keeps the best draft, so the chunk is reviewable
+    # rather than a hole; the run still reports the rejection.
+    assert result.chunks_failed == 0
+    assert result.chunks_rejected == EXPECTED_CHUNKS
+    assert _calls(by, "TRANSLATOR") == 2 * EXPECTED_CHUNKS
+    assert _calls(by, "VERIFIER") == 2 * EXPECTED_CHUNKS
     assert _calls(by, "CRITIC") == 0
     assert _calls(by, "REFINER") == 0
 
 
 def test_verifier_deterministic_failure_skips_llm(mock_env, tmp_path, monkeypatch):
-    # A heading that the (mock) translation cannot preserve -> hard check fails
-    # before any LLM verifier call.
     path = _write(tmp_path, "# Title\n\nA body paragraph long enough to translate.\n")
-    _result, snap, by = _run(mock_env, monkeypatch, path, concurrency=1)
-
+    replies = {"Output ONLY the translation, no commentary.": "Bản dịch thiếu tiêu đề."}
+    result, _snap, by = _run(mock_env, monkeypatch, path, concurrency=1, replies=replies)
+    assert result.chunks_rejected > 0
+    assert any("heading structure changed" in error for error in result.errors)
     assert _calls(by, "VERIFIER") == 0
-    assert snap["calls"] > 0
+    assert TokenUsage.snapshot()["calls"] > 0
 
 
 # ----------------------------- adaptive refiner -----------------------------
@@ -336,6 +337,35 @@ def test_provider_concurrency_respects_configured_limit(mock_env, monkeypatch):
     assert get_retry_config().provider_concurrency == 1
 
 
+def test_more_chunk_workers_than_provider_slots_is_reported(mock_env, tmp_path, monkeypatch):
+    """MAX_CONCURRENCY without LLM_PROVIDER_CONCURRENCY looks parallel and is not.
+
+    Both knobs default to 1 and the settings dialog exposes both, so raising
+    only the worker count leaves every chunk queueing on one provider slot. The
+    run still succeeds — it is simply serial — and nothing told the reader why
+    the parallel setting bought nothing.
+    """
+    from polyglot_lc.llm.client import reset_provider_gates
+    from polyglot_lc.pipeline import coordinator
+
+    said: list[str] = []
+    monkeypatch.setattr(coordinator.logger, "warning", lambda msg, *a, **k: said.append(str(msg)))
+    path = _write(tmp_path, PLAIN)
+
+    monkeypatch.setenv("LLM_PROVIDER_CONCURRENCY", "1")
+    reset_provider_gates()
+    result, _, _ = _run(mock_env, monkeypatch, path, concurrency=4)
+    assert result.chunks == EXPECTED_CHUNKS
+    assert any("LLM_PROVIDER_CONCURRENCY" in m for m in said), said
+
+    said.clear()
+    monkeypatch.setenv("LLM_PROVIDER_CONCURRENCY", "4")
+    reset_provider_gates()
+    result, _, _ = _run(mock_env, monkeypatch, path, concurrency=4)
+    assert result.chunks == EXPECTED_CHUNKS
+    assert not any("LLM_PROVIDER_CONCURRENCY" in m for m in said), said
+
+
 def test_provider_concurrency_survives_pipeline_run(mock_env, tmp_path, monkeypatch):
     """The queue limit is a config value, not a behaviour gate.
 
@@ -463,13 +493,18 @@ def test_skillopt_failure_does_not_fail_run(mock_env, tmp_path, monkeypatch):
 def test_a_run_promotes_the_skill_to_skill_md(mock_env, tmp_path, monkeypatch):
     """A finished run with good critic scores writes the one skill.md file
     (frontmatter + markdown body), acceptance criterion 1."""
+    monkeypatch.setenv("SKILL_MIN_SAMPLES", "1")
     path = _write(tmp_path, PLAIN)
     result, _snap, _by = _run(mock_env, monkeypatch, path, concurrency=2)
     assert result.skill_promoted is True  # mock critic scores are 8.5
-    skill_file = tmp_path / "skills" / "en-vi" / "skill.md"
+    skill_file = tmp_path / "skills" / "skill.md"
     assert skill_file.exists()
     text = skill_file.read_text(encoding="utf-8")
-    assert text.startswith("---") and "mean_score:" in text
+    # The promoted version has not been translated by yet, so it has a baseline
+    # (measured on the run that proposed it) and no measurement of its own.
+    assert text.startswith("---") and "baseline_mean:" in text
+    assert "mean_score:" not in text
+    assert result.skill_samples > 0
     assert "\nInstruction\n" in text and "\nRationale\n" in text
 
 
@@ -477,7 +512,7 @@ def test_promoted_skill_reaches_every_translator_prompt(mock_env, tmp_path, monk
     """The read loop: a skill.md on disk puts its instruction into every
     Translator prompt of the next run — main site and retranslate site alike
     (the verifier-failure reply forces the retry). Acceptance criterion 2."""
-    skill_dir = tmp_path / "skills" / "en-vi"
+    skill_dir = tmp_path / "skills"
     skill_dir.mkdir(parents=True)
     (skill_dir / "skill.md").write_text(
         "---\nsrc_lang: en\ntgt_lang: vi\nmean_score: 8.42\n---\n"
@@ -498,8 +533,9 @@ def test_promoted_skill_reaches_every_translator_prompt(mock_env, tmp_path, monk
     monkeypatch.setattr(TranslatorAgent, "build_prompt", spy)
     path = _write(tmp_path, PLAIN)
     replies = {"translation QA verifier": '{"pass": false, "reasons": ["dropped"]}'}
-    _run(mock_env, monkeypatch, path, concurrency=1, replies=replies)
-    assert seen, "build_prompt never ran"
+    result, _snap, _by = _run(mock_env, monkeypatch, path, concurrency=1, replies=replies)
+    assert result.chunks_rejected == EXPECTED_CHUNKS
+    assert len(seen) == 2 * EXPECTED_CHUNKS
     assert all(s == "Never invent names." for s in seen), seen
     # The skill's few-shot is merged into every prompt's examples too
     # (acceptance criterion 2, second half).
@@ -508,7 +544,7 @@ def test_promoted_skill_reaches_every_translator_prompt(mock_env, tmp_path, monk
 
 def test_corrupt_skill_md_does_not_fail_the_run(mock_env, tmp_path, monkeypatch):
     """A hand-damaged skill.md reads as no skill; the translation still ends."""
-    skill_dir = tmp_path / "skills" / "en-vi"
+    skill_dir = tmp_path / "skills"
     skill_dir.mkdir(parents=True)
     (skill_dir / "skill.md").write_text("garbage without frontmatter", encoding="utf-8")
     path = _write(tmp_path, PLAIN)

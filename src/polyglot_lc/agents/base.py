@@ -18,22 +18,28 @@ class Agent:
         self.client = LLMClient(self.config)
         self.calls: int = 0
         self.total_tokens: int = 0
+        #: The model that answered the last call. A fallback endpoint can serve a
+        #: different one than ``config.model``, and the status tab reports what
+        #: actually did the work.
+        self.last_model: str = self.config.model
 
     def chat(self, messages: list[dict[str, str]], **kw: Any) -> LLMResponse:
         """One chat call, tracked for metrics."""
         self.calls += 1
         resp = self.client.chat(messages, **kw)
         self.total_tokens += resp.prompt_tokens + resp.completion_tokens
+        self.last_model = resp.model or self.config.model
         return resp
 
     def chat_json(
-        self, messages: list[dict[str, Any]], cache_prefix: bool = False
+        self, messages: list[dict[str, Any]], cache_prefix: bool = False, **kw: Any
     ) -> dict[str, Any]:
         """Chat call expecting a JSON object reply.
 
         ``cache_prefix`` marks the stable leading message as a cache
         breakpoint when the provider requires explicit markers (see
-        :class:`~polyglot_lc.config.CacheConfig`).
+        :class:`~polyglot_lc.config.CacheConfig`). Extra keyword arguments
+        (e.g. ``max_tokens``) travel to the provider call.
         """
-        resp = self.chat(messages, json_mode=True, cache_prefix=cache_prefix)
+        resp = self.chat(messages, json_mode=True, cache_prefix=cache_prefix, **kw)
         return parse_json_reply(resp.text)

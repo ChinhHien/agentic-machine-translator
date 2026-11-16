@@ -51,6 +51,17 @@ def after_verifier(state: dict[str, Any], max_retries: int = 1) -> str:
     """
     vr = state.get("verify_result")
     ok = bool(vr) if vr is not None else True
-    if not ok and state.get("retranslate_count", 0) < max_retries:
-        return "retranslate"
+    if not ok and getattr(vr, "retryable", True):
+        # A glossary/content defect gets one more attempt than a generic
+        # rejection: a missing term often survives the first rewrite. A plain
+        # "fail" with only free-text reasons keeps the old single retry.
+        defects = getattr(vr, "defects", []) or []
+        correctable = any(
+            str(d.get("severity")) in {"major", "fatal"}
+            and str(d.get("type")) in {"terminology", "completeness"}
+            for d in defects
+        )
+        allowed = 2 if correctable else max_retries
+        if state.get("retranslate_count", 0) < allowed:
+            return "retranslate"
     return "next"

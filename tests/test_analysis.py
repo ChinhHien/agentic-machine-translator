@@ -213,6 +213,24 @@ def test_unified_planner_clamps_and_tolerates_bad_values():
     assert plan.section_notes == {}
 
 
+def test_a_multi_form_planner_rendering_collapses_to_one_form():
+    """``"bảo mật / an toàn thông tin"`` is two renderings, not one term.
+
+    The glossary carries the first form; a slash-joined string made the
+    deterministic check demand a phrase no translation ever contains.
+    """
+    chunks = [_chunk("chunk-000", "Security controls.")]
+    planner = _StubPlanner(
+        reply={
+            "glossary_terms": [
+                {"term": "security", "translation": "bảo mật / an toàn thông tin"}
+            ]
+        }
+    )
+    plan = analyze_document(chunks, planner, src_lang="en", tgt_lang="vi")
+    assert plan.glossary_pairs == [GlossaryPair("security", "bảo mật", "planner")]
+
+
 def test_bare_string_few_shot_is_wrapped_not_iterated():
     chunks = [_chunk("chunk-000", "text")]
     planner = _StubPlanner(reply={"few_shot": "Hello => Xin chào"})

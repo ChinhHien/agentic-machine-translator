@@ -36,6 +36,12 @@ class Chunk:
     section_path: str = ""
     index: int = 0
     block_refs: list[int] = field(default_factory=list)
+    #: What kind of prose this chunk carries. The verifier treats a reference
+    #: list differently from body text: article titles and chemical names may
+    #: stay in the source language there, while the same English in a body
+    #: paragraph is a defect. The chunker decides once, from the source blocks,
+    #: and the profile travels with the chunk.
+    profile: str = "body"
 
     def hash(self) -> str:
         return hashlib.sha1(self.text.encode()).hexdigest()[:10]
@@ -53,6 +59,25 @@ def _section_for(blocks: list[tuple[int, Block]], upto: int) -> str:
     """Current heading path for the block at position *upto*."""
     headings = [b.text for _, b in blocks[:upto] if b.kind == "heading"]
     return " > ".join(headings[-2:]) if headings else ""
+
+
+def _chunk_profile(blocks: list[tuple[int, Block, str]], section_path: str) -> str:
+    """Classify a chunk for profile-aware translation and verification."""
+    headings = " ".join(block.text for _, block, _ in blocks if block.kind == "heading")
+    path = (section_path + " " + headings).casefold()
+    if any(
+        word in path
+        for word in ("reference", "bibliograph", "tham khảo", "tài liệu tham khảo")
+    ):
+        return "references"
+    if any(word in path for word in ("glossary", "thuật ngữ", "định nghĩa")):
+        return "glossary"
+    kinds = [block.kind for _, block, _ in blocks]
+    if kinds and kinds.count("code") * 2 >= len(kinds):
+        return "code"
+    if kinds and kinds.count("table") * 2 >= len(kinds):
+        return "table"
+    return "body"
 
 
 def chunk_document(
@@ -101,6 +126,7 @@ def chunk_document(
                 section_path=_section_for(numbered, current[0][0]),
                 index=len(chunks),
                 block_refs=[i for i, _, _ in current],
+                profile=_chunk_profile(current, _section_for(numbered, current[0][0])),
             )
         )
         # Overlap: replay the tail of the finished chunk as the head of the next.

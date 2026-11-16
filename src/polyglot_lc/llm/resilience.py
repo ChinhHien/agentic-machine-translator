@@ -84,6 +84,16 @@ class NoBackupError(LLMError):
         self.status = status
 
 
+#: Starting output-token cap for the Verifier, and the floor its recovery ladder
+#: doubles from. Sized for a plain model's answer, NOT for a reasoning one: a
+#: reasoning model charges its thinking to the same budget, and a real run's
+#: verdicts thought a median of ~4200 tokens — more than this entire cap. The
+#: ladder and the per-endpoint learned cap are what recover those calls. The
+#: Translator sets no cap on its first ask and uses its own larger recovery
+#: budget (see :mod:`polyglot_lc.agents.translator`).
+RAISED_OUTPUT_CAP = 4096
+
+
 class TruncatedError(LLMError):
     """The provider cut the reply short (``finish_reason == "length"``).
 
@@ -94,12 +104,32 @@ class TruncatedError(LLMError):
     rather than shipping an untranslated tail.
 
     ``completion_tokens`` is carried for diagnostics (how close the reply was
-    to the limit that cut it).
+    to the limit that cut it), together with the endpoint that served the call
+    and how that budget was spent: a reasoning model can burn the whole cap on
+    thinking and leave the answer empty, and only the split says so. The partial
+    text travels too, because a reply flagged ``length`` can still hold a
+    complete answer (the cut happened after it) and only the caller knows
+    whether what it holds is usable.
     """
 
-    def __init__(self, message: str, completion_tokens: int | None = None) -> None:
+    def __init__(
+        self,
+        message: str,
+        completion_tokens: int | None = None,
+        *,
+        provider: str = "",
+        model: str = "",
+        partial_text: str = "",
+        reasoning_tokens: int = 0,
+        answer_tokens: int = 0,
+    ) -> None:
         super().__init__(message)
         self.completion_tokens = completion_tokens
+        self.provider = provider
+        self.model = model
+        self.partial_text = partial_text
+        self.reasoning_tokens = reasoning_tokens
+        self.answer_tokens = answer_tokens
 
 
 _STATUS_RE = re.compile(r"\b(?:status[: ]|HTTP )?([1-5]\d{2})\b")
@@ -398,6 +428,11 @@ def call_with_resilience(
                 # way the remaining flow (retry/fallback) handles it below.
                 last = retry_err
                 if not isinstance(retry_err, RateLimitError):
+                    if not isinstance(retry_err, TransientError):
+                        # Not the provider failing: a cut reply is the caller's
+                        # business (it raises the output cap), and wrapping it
+                        # as an outage would hide that from it.
+                        raise retry_err from None
                     break
                 err = retry_err  # refresh the retry-after hint for next wait
         return _fallback_or_raise(
@@ -421,7 +456,10 @@ def call_with_resilience(
             except LLMError as retry_err:
                 last = retry_err
                 if not isinstance(retry_err, TransientError):
-                    break
+                    # A transient blip followed by a cut reply is not an outage:
+                    # the truncation reaches the caller, which raises the cap
+                    # and re-asks, instead of spending the backup endpoint.
+                    raise retry_err from None
         return _fallback_or_raise(
             backup, args, kwargs, last, provider, model, backup_provider, backup_model
         )

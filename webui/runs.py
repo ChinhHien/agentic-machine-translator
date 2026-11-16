@@ -12,6 +12,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 import shutil
 import signal
 import subprocess
@@ -23,6 +24,12 @@ from pathlib import Path
 from typing import Any
 
 from webui.paths import REPO_ROOT, is_within, safe_child
+from webui.settings import (
+    LAUNCH_TEST_TIMEOUT,
+    SettingsStore,
+    child_env,
+    test_endpoint,
+)
 from webui.store import RunRecord, RunsStore
 
 logger = logging.getLogger("webui.runs")
@@ -306,6 +313,8 @@ class RunManager:
         self._popen = popen or subprocess.Popen
         self.store = RunsStore(self.root / LOGS_DIR)
         self.procs: dict[str, Any] = {}
+        #: The settings dialog's endpoint overrides, re-tested at every launch.
+        self.settings = SettingsStore(self.root)
 
     # Layout ------------------------------------------------------------
     def logs_dir(self, run_id: str) -> Path:
@@ -349,14 +358,35 @@ class RunManager:
             env["TRANSLATOR_MODEL"] = record.translator_model
         return env
 
+    # Settings overrides ---------------------------------------------------
+    def _settings_env(self) -> tuple[dict[str, str], list[str]]:
+        """The dialog's endpoint overrides as child env, re-tested right now.
+
+        Every stored override is probed at launch (a short timeout — a start
+        already spends a moment planning, and a resume must not hang on a
+        dead host either). One that answers is injected; one that does not is
+        skipped, and the pipeline falls back to its ``.env`` value untouched.
+        """
+        settings = self.settings.load()
+        ok = {
+            name: test_endpoint(
+                endpoint.base_url,
+                endpoint.model,
+                endpoint.api_key,
+                timeout=LAUNCH_TEST_TIMEOUT,
+            )["ok"]
+            for name, endpoint in settings.agents.items()
+        }
+        return child_env(settings, ok)
+
     # Probing -----------------------------------------------------------
     def probe(self, args: list[str]) -> dict[str, Any]:
         """Run ``probe.py`` with *args* and return the JSON object it prints.
 
         The probe is the only thing that may observe the pipeline's real
-        configuration, so both planning and the settings screen go through
-        here; a failure becomes :class:`RunPlanError` carrying the reason the
-        probe printed, never a traceback.
+        configuration, so planning goes through here; a failure becomes
+        :class:`RunPlanError` carrying the reason the probe printed, never a
+        traceback.
         """
         argv = [self.python, str(_PROBE), *args]
         # The probe prints non-ASCII (filenames, model ids) with
@@ -445,9 +475,7 @@ class RunManager:
             output_path=str(output_path),
             mock=mock,
             pid=None,
-            command=self._argv(
-                source, src, tgt, glossary, max_tokens, output_path, output_format
-            ),
+            command=self._argv(source, src, tgt, glossary, max_tokens, output_path, output_format),
         )
         return self._launch(record)
 
@@ -521,7 +549,13 @@ class RunManager:
         logs_dir, out_dir = self.logs_dir(record.run_id), self.output_dir(record.run_id)
         out_dir.mkdir(parents=True, exist_ok=True)
         logs_dir.mkdir(parents=True, exist_ok=True)
-        env = {**os.environ, **self.env_for(record)}
+        # The dialog's overrides first (each one has just passed its test),
+        # then the run's own env: a resumed run's pinned Translator model must
+        # keep winning, so it is applied after and overwrites the override.
+        additions, removals = self._settings_env()
+        env = {key: value for key, value in os.environ.items() if key not in removals}
+        env.update(additions)
+        env.update(self.env_for(record))
         # Append rather than truncate when continuing a run: the previous
         # attempt's console output is still the best answer to "why did it
         # stop?", and the event log beside it is read the same way.
@@ -648,6 +682,33 @@ class RunManager:
                 return candidate
             return None
         return None
+
+    def chunk_record(self, run_id: str, chunk_id: str) -> dict[str, Any] | None:
+        """One finished chunk's checkpoint entry: its text, score and section.
+
+        Read only for the run's own checkpoint directory, and only for a chunk
+        id shaped like the pipeline's own (``chunk-007``): the id comes from the
+        page, so it may name a file in that directory but never a path of its
+        choosing.
+        """
+        return self._read_chunk_file(self._checkpoint_dir(run_id), chunk_id)
+
+    def chunk_rejected(self, run_id: str, chunk_id: str) -> dict[str, Any] | None:
+        """The draft verification rejected for this chunk, when one was kept."""
+        directory = self._checkpoint_dir(run_id)
+        if directory is None:
+            return None
+        return self._read_chunk_file(directory.parent / "rejected" / directory.name, chunk_id)
+
+    @staticmethod
+    def _read_chunk_file(directory: Path | None, chunk_id: str) -> dict[str, Any] | None:
+        if directory is None or not re.fullmatch(r"[A-Za-z0-9_-]{1,64}", chunk_id):
+            return None
+        try:
+            data = json.loads((directory / f"{chunk_id}.json").read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            return None
+        return data if isinstance(data, dict) else None
 
     def status(self, run_id: str) -> RunRecord:
         """The run's state, reconciled with the child process and the disk.
@@ -814,15 +875,15 @@ class RunManager:
         return int(self.store.last_run_end(record.run_id).get("chunks_failed") or 0)
 
     def _retryable(self, record: RunRecord) -> bool:
-        """Whether this failure reads like one that trying again can fix.
-
-        The evidence is the run's own words — the error records it wrote and what
-        the child printed while dying — and nothing here interprets the pipeline's
-        internals: it matches text a reader could find in the run's log. A failure
-        that reads like neither kind is left alone rather than retried on a guess,
-        which is what keeps a bug from being looped over three times.
-        """
-        text = self._failure_text(record).lower()
+        """Classify the latest failure without treating quality rejection as an outage."""
+        run_end = self.store.last_run_end(record.run_id)
+        fatal_error = str(run_end.get("fatal_error") or "")
+        if fatal_error:
+            text = fatal_error.lower()
+        elif int(run_end.get("chunks_rejected") or 0) > 0:
+            return False
+        else:
+            text = self._failure_text(record).lower()
         if not text:
             return False
         if any(hint in text for hint in PERMANENT_HINTS):

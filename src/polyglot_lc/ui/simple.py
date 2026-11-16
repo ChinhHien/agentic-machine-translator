@@ -34,20 +34,39 @@ def _token_delta(before: dict[str, int], after: dict[str, int]) -> dict[str, int
     """What one step spent, floored at zero (see the module docstring)."""
     return {
         key: max(0, int(after.get(key, 0)) - int(before.get(key, 0)))
-        for key in ("sent", "received", "cached")
+        # ``received`` is the provider's completion total; ``thinking`` is the
+        # share of it spent reasoning, so ``answer`` is what the step really
+        # got back. A verifier cut at its cap with a full thinking budget shows
+        # up here instead of looking like it produced a long answer.
+        for key in ("sent", "received", "cached", "thinking", "answer")
     }
 
 
 class SimpleStep:
     """Context manager that prints a single ``Running ...`` line per step."""
 
-    def __init__(self, ui: SimpleUI, name: str, chunk_id: str, index: int) -> None:
+    def __init__(
+        self, ui: SimpleUI, name: str, chunk_id: str, index: int, agent: Any = None
+    ) -> None:
         self.ui = ui
         self.name = name
         self.chunk_id = chunk_id
         self.index = index
+        #: The agent doing the work, when the caller knows it. Its name and the
+        #: model that actually answered travel with the event, so the status tab
+        #: can name the model per step instead of guessing from the config.
+        self.agent = agent
         self._t0 = 0.0
         self._tokens0: dict[str, int] = {}
+
+    def _agent_fields(self) -> dict[str, str]:
+        """The agent and the model behind this step, when there is one."""
+        if self.agent is None:
+            return {}
+        return {
+            "agent": str(getattr(self.agent, "name", "") or ""),
+            "model": str(getattr(self.agent, "last_model", "") or ""),
+        }
 
     def __enter__(self) -> Self:
         self._t0 = time.monotonic()
@@ -62,6 +81,7 @@ class SimpleStep:
                 type="step_start",
                 active_api_calls=calls.get("active"),
                 max_active_api_calls=calls.get("peak"),
+                **self._agent_fields(),
             )
         )
         return self
@@ -84,6 +104,7 @@ class SimpleStep:
                     type="step_end",
                     duration_ms=round(latency),
                     tokens=tokens,
+                    **self._agent_fields(),
                 )
             )
             return False
@@ -100,6 +121,7 @@ class SimpleStep:
                 duration_ms=round(latency),
                 tokens=tokens,
                 cause=cause_for(exc, step=self.name),
+                **self._agent_fields(),
             )
         )
         return False  # propagate
@@ -182,11 +204,11 @@ class SimpleUI:
     def set_stats(self, **kv: Any) -> None:
         self.stats.update(kv)
 
-    def step(self, name: str, chunk_id: str = "") -> SimpleStep:
+    def step(self, name: str, chunk_id: str = "", agent: Any = None) -> SimpleStep:
         with self._lock:
             self._index += 1
             index = self._index
-        return SimpleStep(self, name, chunk_id, index)
+        return SimpleStep(self, name, chunk_id, index, agent)
 
     # ------------------------------------------------------------------
     def __enter__(self) -> Self:

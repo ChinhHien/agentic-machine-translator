@@ -28,6 +28,20 @@ def test_valid_agent_config(mock_env):
     assert cfg.is_mock is True
 
 
+def test_verifier_defaults_to_zero_temperature(mock_env, monkeypatch):
+    monkeypatch.setenv("LLM_MOCK", "0")
+    monkeypatch.delenv("VERIFIER_TEMPERATURE")
+    assert get_agent_config("VERIFIER").temperature == 0.0
+
+
+def test_verifier_temperature_is_independent_of_the_source_group(mock_env, monkeypatch):
+    monkeypatch.setenv("VERIFIER_TEMPERATURE", "0.0")
+    monkeypatch.setenv("SOURCE_GROUP_TEMPERATURE", "0.7")
+    cfg = get_agent_config("VERIFIER")
+    assert cfg.temperature == 0.0
+    assert get_agent_config("TRANSLATOR").temperature == 0.2
+
+
 def test_unknown_agent_raises(mock_env):
     with pytest.raises(ConfigError, match="Unknown agent"):
         get_agent_config("INTERN")
@@ -147,7 +161,7 @@ def test_app_config_bad_int_raises(monkeypatch, mock_env):
 def test_workflow_defaults(mock_env):
     cfg = get_app_config()
     assert cfg.adaptive_quality is True
-    assert cfg.fast_path_max_complexity == 0.35
+    assert cfg.fast_path_max_complexity == 0.65
     assert cfg.fast_path_min_score == 9.0
     assert cfg.fast_path_skip_llm_verify is False
     assert cfg.resume is False
@@ -233,3 +247,35 @@ def test_a_negative_chunk_retry_wait_is_rejected(mock_env, monkeypatch):
     monkeypatch.setenv("CHUNK_RETRY_BASE_DELAY", "0")
     with pytest.raises(ConfigError, match="CHUNK_RETRY_BASE_DELAY|chunk_retry_base_delay"):
         get_app_config()
+
+
+# ---------------------------- request timeout --------------------------------
+def test_the_default_request_timeout_fits_a_reasoning_models_reply(mock_env):
+    """A non-streaming reasoning call is one long wait, not a trickle of bytes.
+
+    The SDK timeout is a *read* timeout, so with no streaming nothing arrives
+    until the whole reply is generated and it acts as a total generation
+    deadline. On a real run the translate steps had a median of 47s and a
+    maximum of 301s, verify up to 326s: at the old 45s default healthy calls
+    were killed mid-generation, fell back to a second endpoint, and paid for
+    the same chunk twice. The wall-clock deadline in the client still backstops
+    a genuinely wedged request, so a generous read timeout is not a hang risk.
+    """
+    from polyglot_lc.config import DEFAULT_TIMEOUT
+
+    assert DEFAULT_TIMEOUT >= 300
+    for name in AGENT_NAMES:
+        assert get_agent_config(name).timeout == DEFAULT_TIMEOUT
+    assert get_embed_config().timeout == DEFAULT_TIMEOUT
+
+
+def test_the_request_timeout_stays_tunable_globally_and_per_agent(mock_env, monkeypatch):
+    from polyglot_lc.config import DEFAULT_TIMEOUT
+
+    monkeypatch.setenv("LLM_TIMEOUT", "120")
+    assert get_agent_config("TRANSLATOR").timeout == 120.0
+    monkeypatch.setenv("VERIFIER_TIMEOUT", "30")
+    assert get_agent_config("VERIFIER").timeout == 30.0
+    assert get_agent_config("TRANSLATOR").timeout == 120.0
+    monkeypatch.delenv("LLM_TIMEOUT")
+    assert get_agent_config("TRANSLATOR").timeout == DEFAULT_TIMEOUT

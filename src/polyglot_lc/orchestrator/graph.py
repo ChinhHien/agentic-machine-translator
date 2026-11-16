@@ -30,10 +30,17 @@ from polyglot_lc.agents import (
     TranslatorAgent,
     VerifierAgent,
 )
-from polyglot_lc.agents.verifier import VerifyResult, hard_checks
+from polyglot_lc.agents.consistency import ConsistencyAgent
+from polyglot_lc.agents.verifier import (
+    TranslationRejected,
+    VerificationError,
+    VerifyResult,
+    hard_checks,
+    heading_notes,
+)
 from polyglot_lc.analysis.complexity import draft_signals
 from polyglot_lc.analysis.unified_planner import DocumentPlan, analyze_document
-from polyglot_lc.config import get_app_config
+from polyglot_lc.config import get_agent_config, get_app_config
 from polyglot_lc.orchestrator.router import (
     ROUTE_CRITIC,
     ROUTE_VERIFY,
@@ -83,6 +90,13 @@ class GraphContext:
         self.critic = critic
         self.refiner = refiner
         self.verifier = verifier
+        # The terminology editor is the same model as the read-source group,
+        # so a targeted repair shares the cached prefix and costs one request.
+        # Tests and lightweight callers may pass a stand-in refiner without a
+        # config; the repair agent still needs one.
+        self.consistency = ConsistencyAgent(
+            config=getattr(refiner, "config", None) or get_agent_config("REFINER")
+        )
         self.ui = ui
         self.sink = sink
         self.reasoning_bank = reasoning_bank
@@ -95,9 +109,6 @@ class GraphContext:
         self.decision_counts: dict[str, int] = {}
         self.fast_path_rejections = 0
         self.fast_path_reasons: Counter[str] = Counter()
-        #: Chunks that shipped without a verdict because the Verifier could not
-        #: be reached. Counted separately: "verified" and "nobody checked" used
-        #: to look the same in the report.
         self.verify_skips = 0
         # What each chunk has to show for itself if its graph has to be run
         # again: the newest draft it produced, and the step it was last on.
@@ -105,12 +116,16 @@ class GraphContext:
         self.current_steps: dict[str, str] = {}
         self.resume_lock = threading.Lock()
 
-    def step(self, name: str, chunk_id: str = "") -> Any:
-        """UI step context manager (no-op-ish when ui is None)."""
+    def step(self, name: str, chunk_id: str = "", agent: Any = None) -> Any:
+        """UI step context manager (no-op-ish when ui is None).
+
+        *agent* is the object doing the call, so the event can carry the agent's
+        name and the model that actually answered; the UI shows them per step.
+        """
         if chunk_id:
             self.remember_step(chunk_id, name)
         if self.ui is not None:
-            return self.ui.step(name, chunk_id)
+            return self.ui.step(name, chunk_id, agent)
         from contextlib import nullcontext
 
         return nullcontext()
@@ -149,8 +164,19 @@ class GraphContext:
         if self.sink is not None:
             self.sink.record(type="decision", **payload)
 
+    def record_chunk_stats(self, *, chunk_id: str, **fields: Any) -> None:
+        """One record per finished chunk: sizes, path and retry counts.
+
+        Written once the chunk is collected, so the status tab can show what a
+        chunk cost without opening it, and so a resumed run keeps the numbers of
+        the chunks it did not translate again.
+        """
+        if self.sink is None:
+            return
+        self.sink.record(type="chunk_stats", chunk_id=chunk_id, **fields)
+
     def note_verify_skip(self) -> None:
-        """Count one chunk that shipped unverified (thread-safe)."""
+        """Count an unavailable verification (thread-safe)."""
         with self.decision_lock:
             self.verify_skips += 1
 
@@ -199,7 +225,7 @@ def make_document_plan(
     extra_glossary_md: str = "",
 ) -> DocumentPlan:
     """Document-level planning (runs once): RB lookup + ONE Planner request."""
-    with ctx.step("plan"):
+    with ctx.step("plan", agent=ctx.planner):
         traces = retrieve_traces(ctx, (doc_summary or doc_text)[:200])
         return analyze_document(
             chunks,
@@ -301,7 +327,7 @@ def make_chunk_graph(ctx: GraphContext):
         if kept.strip():
             draft = kept
         else:
-            with ctx.step("translate", chunk.id):
+            with ctx.step("translate", chunk.id, agent=ctx.translator):
                 prompt = ctx.translator.build_prompt(
                     chunk_text=chunk.text,
                     src_lang=state["src_lang"],
@@ -313,6 +339,7 @@ def make_chunk_graph(ctx: GraphContext):
                     glossary_md=state.get("glossary_md", ""),
                     extra_critique="",
                     section_note=section_note,
+                    profile=getattr(chunk, "profile", "body"),
                 )
                 draft = ctx.translator.translate(prompt, chunk_id=chunk.id)
         draft, hard_issues = prepare_draft(state, draft, step="translate")
@@ -357,7 +384,7 @@ def make_chunk_graph(ctx: GraphContext):
 
     def critic_node(state: ChunkState) -> dict[str, Any]:
         chunk = state["chunk"]
-        with ctx.step("critic", chunk.id):
+        with ctx.step("critic", chunk.id, agent=ctx.critic):
             critique = ctx.critic.review(
                 source=chunk.text,
                 draft=state["draft"],
@@ -372,7 +399,7 @@ def make_chunk_graph(ctx: GraphContext):
 
     def refiner_node(state: ChunkState) -> dict[str, Any]:
         chunk = state["chunk"]
-        with ctx.step("refine", chunk.id):
+        with ctx.step("refine", chunk.id, agent=ctx.refiner):
             critique = state["critique"]
             refined = ctx.refiner.refine(
                 source=chunk.text,
@@ -385,13 +412,17 @@ def make_chunk_graph(ctx: GraphContext):
                 glossary_md=state.get("glossary_md", ""),
                 section_note=state.get("section_note", ""),
             )
-            # The refinement is the newest draft; it is what a retry resumes from.
+            refined, hard_issues = prepare_draft(state, refined, step="refine")
             ctx.remember_draft(chunk.id, refined)
-            return {"draft": refined, "refine_round": state.get("refine_round", 0) + 1}
+            return {
+                "draft": refined,
+                "draft_hard_issues": hard_issues,
+                "refine_round": state.get("refine_round", 0) + 1,
+            }
 
     def verifier_node(state: ChunkState) -> dict[str, Any]:
         chunk = state["chunk"]
-        with ctx.step("verify", chunk.id):
+        with ctx.step("verify", chunk.id, agent=ctx.verifier):
             # The draft arrives repaired from ``prepare_draft``: the text being
             # verified is the text that ships, and a marker the model lost is
             # deterministically recoverable, so it never costs a retranslate.
@@ -428,21 +459,76 @@ def make_chunk_graph(ctx: GraphContext):
                 reasons=["LLM verifier plus deterministic checks"],
                 numbers={},
             )
-            vr = ctx.verifier.verify(
-                source=chunk.text,
-                translation=draft,
-                src_lang=state["src_lang"],
-                tgt_lang=state["tgt_lang"],
-                glossary_md=state.get("glossary_md", ""),
-                hard_issues=hard_issues,
-            )
+            try:
+                vr = ctx.verifier.verify(
+                    source=chunk.text,
+                    translation=draft,
+                    src_lang=state["src_lang"],
+                    tgt_lang=state["tgt_lang"],
+                    glossary_md=state.get("glossary_md", ""),
+                    hard_issues=hard_issues,
+                    profile=getattr(chunk, "profile", "body"),
+                    glossary_pairs=state.get("glossary_pairs"),
+                    source_warnings=heading_notes(chunk.text, draft),
+                )
+                if vr.skipped:
+                    raise VerificationError("verification unavailable: no verdict")
+                raw = getattr(vr, "raw_verdict", "")
+                if raw:
+                    # The unedited LLM verdict, in the JSONL log: the decisions
+                    # and errors below carry post-processed reasons only.
+                    ctx.record_decision(
+                        chunk_id=chunk.id,
+                        kind="verify_verdict",
+                        chosen=bool(vr),
+                        reasons=[raw[:800]],
+                    )
+            except VerificationError as exc:
+                ctx.note_verify_skip()
+                ctx.record_error(step="verify", chunk_id=chunk.id, cause="verify", message=str(exc))
+                raise
             return {"draft": draft, "verify_result": vr}
 
     def retranslate_node(state: ChunkState) -> dict[str, Any]:
         chunk = state["chunk"]
-        with ctx.step("retranslate", chunk.id):
+        with ctx.step("retranslate", chunk.id, agent=ctx.translator):
             vr = state["verify_result"]
             reasons = "; ".join(getattr(vr, "reasons", [])) or "verification failed"
+            fixes = [
+                (str(d.get("term", "")), str(d.get("expected", "")))
+                for d in getattr(vr, "defects", [])
+                if d.get("type") == "terminology" and d.get("term") and d.get("expected")
+            ]
+            # A missing glossary term is a word-level defect. Patching only the
+            # term preserves the rest of a draft that already passed meaning
+            # and structure checks; a full re-translation can lose both.
+            if fixes and getattr(chunk, "profile", "body") in {"body", "glossary"}:
+                from polyglot_lc.pipeline.consistency import contains_term
+
+                patched = ctx.consistency.patch(
+                    source=chunk.text,
+                    translation=state["draft"],
+                    fixes=fixes,
+                    src_lang=state["src_lang"],
+                    tgt_lang=state["tgt_lang"],
+                    strategy=state.get("strategy", ""),
+                    glossary_md=state.get("glossary_md", ""),
+                    section_note=state.get("section_note", ""),
+                )
+                patched, hard_issues = prepare_draft(state, patched, step="repair")
+                if (
+                    len(patched) >= 0.85 * len(state["draft"])
+                    and not hard_issues
+                    and all(contains_term(patched, expected) for _, expected in fixes)
+                ):
+                    ctx.remember_draft(chunk.id, patched)
+                    return {
+                        "draft": patched,
+                        "draft_hard_issues": hard_issues,
+                        "verify_result": None,
+                        "retranslate_count": state.get("retranslate_count", 0) + 1,
+                        "repair_used": True,
+                    }
             prompt = ctx.translator.build_prompt(
                 chunk_text=chunk.text,
                 src_lang=state["src_lang"],
@@ -454,6 +540,7 @@ def make_chunk_graph(ctx: GraphContext):
                 glossary_md=state.get("glossary_md", ""),
                 extra_critique=reasons,
                 section_note=state.get("section_note", ""),
+                profile=getattr(chunk, "profile", "body"),
             )
             draft = ctx.translator.translate(prompt, chunk_id=chunk.id)
             # The new draft gets its own repair and hard checks; the ones in
@@ -465,6 +552,7 @@ def make_chunk_graph(ctx: GraphContext):
                 "draft_hard_issues": hard_issues,
                 "verify_result": None,
                 "retranslate_count": state.get("retranslate_count", 0) + 1,
+                "repair_used": False,
             }
 
     def collect_node(state: ChunkState) -> dict[str, Any]:
@@ -494,7 +582,29 @@ def make_chunk_graph(ctx: GraphContext):
                 cause="emphasis",
                 message="emphasis tokens dropped: counts do not match the source",
             )
-        return {"translated": translated, "path": path}
+        verdict = state.get("verify_result")
+        rejected = bool(verdict is not None and not bool(verdict))
+        # One record per finished chunk, so the chunk list can show what the
+        # chunk cost (characters, retries, route) without opening it.
+        ctx.record_chunk_stats(
+            chunk_id=state["chunk"].id,
+            source_chars=len(state["chunk"].text or ""),
+            target_chars=len(translated or ""),
+            path=path,
+            retranslates=int(state.get("retranslate_count", 0) or 0),
+            repaired=bool(state.get("repair_used")),
+            verify_ok=verdict is None or bool(verdict),
+            verify_skipped=bool(getattr(verdict, "skipped", False)) if verdict is not None else False,
+            score=round(float(state.get("draft_score", 0.0) or 0.0), 2),
+        )
+        return {
+            "translated": translated,
+            "path": path,
+            "quality_rejected": rejected,
+            "rejection_reason": (
+                "; ".join(getattr(verdict, "reasons", [])) if rejected else ""
+            ),
+        }
 
     def save_trace_node(state: ChunkState) -> dict[str, Any]:
         from polyglot_lc.reasoning_bank.schema import ReasoningTrace
@@ -576,14 +686,11 @@ def make_chunk_graph(ctx: GraphContext):
     def verifier_edge(state: ChunkState) -> str:
         """Route after the Verifier, recording the verdict and any abandonment."""
         route = after_verifier(state, max_retries=1)
-        verdict = state.get("verify_result")
-        ok = bool(verdict) if verdict is not None else True
-        skipped = bool(getattr(verdict, "skipped", False))
-        rejections = [str(r) for r in (getattr(verdict, "reasons", None) or [])]
+        verdict = state["verify_result"]
+        ok = bool(verdict)
+        rejections = verdict.reasons
         if not ok:
             reasons = [f"verifier rejected the draft: {r}" for r in rejections[:3]]
-        elif skipped:
-            reasons = ["verifier unavailable: no verdict, the draft ships unverified"]
         else:
             reasons = ["verifier accepted the draft"]
         ctx.record_decision(
@@ -593,31 +700,24 @@ def make_chunk_graph(ctx: GraphContext):
             reasons=reasons,
             numbers={
                 "ok": ok,
-                "skipped": skipped,
+                "skipped": verdict.skipped,
                 "retranslate_count": int(state.get("retranslate_count", 0) or 0),
             },
         )
-        if skipped:
-            # A chunk nobody checked must not read like a chunk that passed:
-            # the count reaches the run's report and the reason reaches its
-            # problem list, where a reader can act on it.
-            ctx.note_verify_skip()
-            ctx.record_error(
-                step="verify",
-                chunk_id=state["chunk"].id,
-                cause="verify",
-                message="verifier unavailable; the chunk shipped unverified",
-            )
         if not ok and route != "retranslate":
-            # Out of retranslate budget: this chunk ships unverified, and that is
-            # a problem worth a cause rather than a silent pass.
-            ctx.record_error(
-                step="verify",
-                chunk_id=state["chunk"].id,
-                cause="verify",
-                message="; ".join(rejections)
-                or "verification failed and the retranslate budget is used up",
+            message = "verification failed after retranslation: " + (
+                "; ".join(rejections) or "no acceptable translation"
             )
+            ctx.record_error(
+                step="verify", chunk_id=state["chunk"].id, cause="verify", message=message
+            )
+            # A source defect (a heading the extractor got wrong) and a major
+            # terminology defect cannot be fixed by another full translation.
+            # Keep the best draft and mark it for review; only a fatal defect
+            # in the translation itself still aborts the chunk.
+            fatal = getattr(verdict, "severity", "fatal") == "fatal"
+            if fatal and not getattr(verdict, "source_defect", False):
+                raise TranslationRejected(message)
         return route
 
     g.add_conditional_edges(

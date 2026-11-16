@@ -4,6 +4,9 @@ from __future__ import annotations
 
 from types import SimpleNamespace
 
+import pytest
+
+from polyglot_lc.agents.verifier import VerificationError, VerifyResult
 from polyglot_lc.pipeline.consistency import (
     ConsistencyChecker,
     ConsistencyReport,
@@ -39,6 +42,94 @@ class _StubEditor:
         if self.rewrite is None:
             return translation
         return self.rewrite(translation, fixes)
+
+
+class _StubVerifier:
+    def __init__(self, result=None):
+        self.calls = []
+        self.result = VerifyResult(True, []) if result is None else result
+
+    def verify(self, **kwargs):
+        self.calls.append(kwargs)
+        if isinstance(self.result, Exception):
+            raise self.result
+        return self.result
+
+
+@pytest.mark.parametrize("outcome", ["accepted", "wrong meaning", "unavailable", "skipped"])
+def test_patch_requires_a_positive_semantic_verdict(outcome):
+    chunks = [_chunk("chunk-000", "NMT is fast."), _chunk("chunk-001", "NMT is slow.")]
+    original = {"chunk-000": "Dịch máy neural nhanh.", "chunk-001": "NMT chậm."}
+    candidate = "Dịch máy neural " + ("nhanh." if outcome == "wrong meaning" else "chậm.")
+    verdict = (
+        VerificationError("verification unavailable")
+        if outcome == "unavailable"
+        else VerifyResult(outcome != "wrong meaning", [outcome], skipped=outcome == "skipped")
+    )
+    verifier = _StubVerifier(verdict)
+    events = []
+    sink = SimpleNamespace(info=lambda *args: events.append(args))
+    checker = ConsistencyChecker(
+        _StubEditor(lambda translation, fixes: candidate), verifier, sink=sink
+    )
+    translated, report = checker.run(
+        chunks,
+        original,
+        {"NMT": "Dịch máy neural"},
+        context={"src_lang": "en", "tgt_lang": "vi", "glossary_md": "NMT -> Dịch máy neural"},
+    )
+    assert verifier.calls == [
+        {
+            "source": chunks[1].text,
+            "translation": candidate,
+            "src_lang": "en",
+            "tgt_lang": "vi",
+            "glossary_md": "NMT -> Dịch máy neural",
+            "hard_issues": [],
+            "previous_translation": original["chunk-001"],
+        }
+    ]
+    assert translated["chunk-000"] == original["chunk-000"]
+    assert original["chunk-001"] == "NMT chậm."
+    if outcome == "accepted":
+        assert report.patched_chunks == 1
+        assert translated["chunk-001"] == candidate
+    else:
+        assert report.patched_chunks == 0
+        assert report.unresolved == ["chunk-001"]
+        assert translated == original
+        assert any("patch rejected:" in event[-1] for event in events)
+
+
+@pytest.mark.parametrize(
+    "candidate", ["Dịch máy neural", "NMT chậm. " * 10, "# Dịch máy neural chậm. " * 10]
+)
+def test_invalid_patch_does_not_spend_a_semantic_verification(candidate):
+    chunks = [_chunk("c0", "NMT is fast."), _chunk("c1", "NMT is slow.")]
+    original = {"c0": "Dịch máy neural nhanh.", "c1": "NMT chậm. " * 10}
+    verifier = _StubVerifier()
+    translated, report = ConsistencyChecker(
+        _StubEditor(lambda translation, fixes: candidate), verifier
+    ).run(chunks, original, {"NMT": "Dịch máy neural"})
+    assert translated == original
+    assert report.unresolved == ["c1"]
+    assert verifier.calls == []
+
+
+def test_consecutive_semantic_rejections_stop_patching():
+    chunks = [_chunk(f"c{i}", f"NMT is slow in case {i}.") for i in range(6)]
+    original = {c.id: "NMT chậm." for c in chunks}
+    original["c0"] = "Dịch máy neural chậm."
+    verifier = _StubVerifier(VerifyResult(False, ["meaning changed"]))
+    editor = _StubEditor(lambda translation, fixes: "Dịch máy neural nhanh.")
+    translated, report = ConsistencyChecker(editor, verifier).run(
+        chunks, original, {"NMT": "Dịch máy neural"}
+    )
+    assert translated == original
+    assert editor.calls == len(verifier.calls) == 2
+    assert report.unresolved == ["c1", "c2"]
+    assert report.skipped_chunks == 3
+    assert report.stopped_early
 
 
 def test_contains_term_is_case_and_space_insensitive():
@@ -79,7 +170,7 @@ def test_checker_patches_only_the_drifting_chunk():
         return translation.replace("NMT", "Dịch máy neural")
 
     editor = _StubEditor(rewrite)
-    checker = ConsistencyChecker(editor, max_patches=5)
+    checker = ConsistencyChecker(editor, _StubVerifier(), max_patches=5)
     patched, report = checker.run(
         chunks,
         translations,
@@ -98,7 +189,7 @@ def test_a_patch_that_does_not_fix_anything_is_rejected():
     translations = {"chunk-000": "Dịch máy neural rất nhanh.", "chunk-001": "NMT rất chậm."}
     editor = _StubEditor(lambda translation, fixes: "hoàn toàn không liên quan")
 
-    patched, report = ConsistencyChecker(editor, max_patches=5).run(
+    patched, report = ConsistencyChecker(editor, _StubVerifier(), max_patches=5).run(
         chunks, translations, {"NMT": "Dịch máy neural"}
     )
     assert report.patched_chunks == 0
@@ -129,7 +220,7 @@ def test_a_patch_that_loses_the_bulk_of_the_translation_is_rejected():
     fragment = "Dịch máy neural rất nhanh."  # term fixed, but almost everything else lost
     editor = _StubEditor(lambda translation, fixes: fragment)
 
-    patched, report = ConsistencyChecker(editor, max_patches=5).run(
+    patched, report = ConsistencyChecker(editor, _StubVerifier(), max_patches=5).run(
         chunks, translations, {"NMT": "Dịch máy neural"}
     )
     assert editor.calls == 1
@@ -151,7 +242,7 @@ def test_patch_budget_is_enforced():
         "chunk-002": "NMT ở chỗ khác.",
     }
     editor = _StubEditor(lambda translation, fixes: translation.replace("NMT", "Dịch máy neural"))
-    patched, report = ConsistencyChecker(editor, max_patches=1).run(
+    patched, report = ConsistencyChecker(editor, _StubVerifier(), max_patches=1).run(
         chunks, translations, {"NMT": "Dịch máy neural"}
     )
     assert editor.calls == 1
@@ -187,7 +278,7 @@ def test_patch_budget_grows_with_the_number_of_drifting_chunks():
     translations["chunk-000"] = "Dịch máy neural 0."  # proof the term is achievable
     editor = _StubEditor(lambda translation, fixes: translation.replace("NMT", "Dịch máy neural"))
 
-    patched, report = ConsistencyChecker(editor, max_patches=1).run(
+    patched, report = ConsistencyChecker(editor, _StubVerifier(), max_patches=1).run(
         chunks, translations, {"NMT": "Dịch máy neural"}
     )
     assert report.inconsistencies == 1
@@ -214,7 +305,7 @@ def test_the_pass_stops_after_two_patches_in_a_row_are_refused():
     translations["chunk-000"] = "Dịch máy neural 0."  # proof the term is achievable
     editor = _StubEditor(lambda translation, fixes: translation)  # ignoring the fix
 
-    _patched, report = ConsistencyChecker(editor, max_patches=5).run(
+    _patched, report = ConsistencyChecker(editor, _StubVerifier(), max_patches=5).run(
         chunks, translations, {"NMT": "Dịch máy neural"}
     )
 
@@ -244,7 +335,7 @@ def test_the_chunk_with_the_most_drifting_terms_is_patched_first():
         seen.append(translation)
         return translation.replace("NMT", "Dịch máy neural").replace("LLM", "mô hình ngôn ngữ lớn")
 
-    patched, report = ConsistencyChecker(_StubEditor(rewrite), max_patches=1).run(
+    patched, report = ConsistencyChecker(_StubEditor(rewrite), _StubVerifier(), max_patches=1).run(
         chunks,
         translations,
         {"NMT": "Dịch máy neural", "LLM": "mô hình ngôn ngữ lớn"},
@@ -261,7 +352,7 @@ def test_zero_patches_still_turns_the_pass_off():
     translations = {"chunk-000": "Dịch máy neural ở đây.", "chunk-001": "NMT ở kia."}
     editor = _StubEditor(lambda translation, fixes: translation.replace("NMT", "Dịch máy neural"))
 
-    patched, report = ConsistencyChecker(editor, max_patches=0).run(
+    patched, report = ConsistencyChecker(editor, _StubVerifier(), max_patches=0).run(
         chunks, translations, {"NMT": "Dịch máy neural"}
     )
     assert editor.calls == 0
@@ -273,7 +364,7 @@ def test_disabled_checker_does_not_call_the_model():
     chunks = [_chunk("chunk-000", "NMT is fast."), _chunk("chunk-001", "NMT is slow.")]
     translations = {"chunk-000": "Dịch máy neural nhanh.", "chunk-001": "NMT chậm."}
     editor = _StubEditor(lambda translation, fixes: "Dịch máy neural")
-    patched, report = ConsistencyChecker(editor, enabled=False).run(
+    patched, report = ConsistencyChecker(editor, _StubVerifier(), enabled=False).run(
         chunks, translations, {"NMT": "Dịch máy neural"}
     )
     assert editor.calls == 0
@@ -302,7 +393,9 @@ def test_a_label_rendered_two_ways_is_reported_and_the_minority_patched():
         lambda translation, fixes: translation.replace("Tiền điều kiện", "Điều kiện tiên quyết")
     )
 
-    patched, report = ConsistencyChecker(editor, max_patches=5).run(chunks, translations, {})
+    patched, report = ConsistencyChecker(editor, _StubVerifier(), max_patches=5).run(
+        chunks, translations, {}
+    )
 
     assert editor.calls == 1
     assert report.labels_checked == 1
@@ -320,7 +413,9 @@ def test_a_one_all_tie_is_not_an_inconsistency():
     }
     editor = _StubEditor()
 
-    _, report = ConsistencyChecker(editor, max_patches=5).run(chunks, translations, {})
+    _, report = ConsistencyChecker(editor, _StubVerifier(), max_patches=5).run(
+        chunks, translations, {}
+    )
 
     assert editor.calls == 0
     assert report.inconsistencies == 0
@@ -336,7 +431,9 @@ def test_a_chunk_whose_paragraph_count_differs_is_skipped():
     }
     editor = _StubEditor()
 
-    _, report = ConsistencyChecker(editor, max_patches=5).run(chunks, translations, {})
+    _, report = ConsistencyChecker(editor, _StubVerifier(), max_patches=5).run(
+        chunks, translations, {}
+    )
 
     assert editor.calls == 0
     assert report.drifted_labels == 0
@@ -357,7 +454,9 @@ def test_a_caption_repeated_across_chunks_drifts():
     }
     editor = _StubEditor(lambda translation, fixes: "Hình 2.1 Kiến trúc")
 
-    patched, report = ConsistencyChecker(editor, max_patches=5).run(chunks, translations, {})
+    patched, report = ConsistencyChecker(editor, _StubVerifier(), max_patches=5).run(
+        chunks, translations, {}
+    )
 
     assert editor.calls == 1
     assert report.drifted_labels == 1
@@ -369,7 +468,7 @@ def test_a_unit_used_in_one_chunk_is_not_compared():
         _chunk("chunk-000", "Preconditions: only here"),
         _chunk("chunk-001", "Unrelated body."),
     ]
-    _, report = ConsistencyChecker(_StubEditor(), max_patches=5).run(
+    _, report = ConsistencyChecker(_StubEditor(), _StubVerifier(), max_patches=5).run(
         chunks, {"chunk-000": "Điều kiện: a", "chunk-001": "Nội dung khác"}, {}
     )
     assert report.labels_checked == 0
@@ -395,7 +494,7 @@ def test_a_label_and_a_glossary_term_share_one_patch_request():
             "NMT", "Dịch máy neural"
         )
 
-    patched, report = ConsistencyChecker(_StubEditor(rewrite), max_patches=5).run(
+    patched, report = ConsistencyChecker(_StubEditor(rewrite), _StubVerifier(), max_patches=5).run(
         chunks, translations, {"NMT": "Dịch máy neural"}
     )
 
@@ -448,7 +547,7 @@ def test_a_patch_that_drops_a_code_marker_is_repaired_before_it_is_applied():
         fixed = translation.replace("NMT", "Dịch máy neural")
         return fixed.replace("⟦CODE_1⟧", "").strip()
 
-    patched, report = ConsistencyChecker(_StubEditor(rewrite), max_patches=5).run(
+    patched, report = ConsistencyChecker(_StubEditor(rewrite), _StubVerifier(), max_patches=5).run(
         chunks, translations, {"NMT": "Dịch máy neural"}
     )
 
@@ -471,7 +570,7 @@ def test_a_patch_that_changes_the_heading_structure_is_rejected():
         lambda translation, fixes: "# Cấu trúc dữ liệu\n\n## Dịch máy neural rất nhanh."
     )
 
-    patched, report = ConsistencyChecker(editor, max_patches=5).run(
+    patched, report = ConsistencyChecker(editor, _StubVerifier(), max_patches=5).run(
         chunks, translations, {"NMT": "Dịch máy neural"}
     )
 

@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import os
+
 from loguru import logger
 
 from polyglot_lc.agents.base import Agent
@@ -13,10 +15,47 @@ from polyglot_lc.agents.context import (
 from polyglot_lc.llm.resilience import TruncatedError
 from polyglot_lc.memory.tm import TranslationMemory
 
-#: Output-token cap for the one retry that recovers a truncated reply. High
-#: enough that a 700-token chunk (the default ``chunk_max_tokens``) fits with
-#: room to spare; most providers accept up to 4096 on a free tier.
-_RAISED_OUTPUT_CAP = 4096
+#: Output budget for the recovery ask after a reply is cut at the provider's
+#: limit. A reasoning model charges its thinking to the same completion budget
+#: as the answer: on a real run the Translator's successful calls used a median
+#: of ~9000 completion tokens (thinking ~6100 + answer ~2600) and a maximum of
+#: ~17000, because the first ask sets no cap and the endpoint's own default
+#: allows them. The recovery used to ask for 4096 — under half the median — so
+#: it cut again and reported a failure the chunk had not earned. 16384 stays
+#: below the largest budget that endpoint was observed to serve, so asking for
+#: it explicitly does not exceed what the gateway already allows by default.
+DEFAULT_TRANSLATOR_OUTPUT_CAP = 16384
+
+#: Hard ceiling for the recovery ladder. Doubling is unbounded otherwise, and
+#: gateways reject a ``max_tokens`` above their own limit outright.
+TRANSLATOR_MAX_TOKENS_CEILING = 32768
+
+
+def _translator_output_cap() -> int:
+    """The configured recovery budget, for an endpoint with a different ceiling."""
+    raw = os.getenv("TRANSLATOR_MAX_TOKENS", "").strip()
+    if not raw:
+        return DEFAULT_TRANSLATOR_OUTPUT_CAP
+    try:
+        value = int(raw)
+    except ValueError:
+        logger.warning(
+            "TRANSLATOR_MAX_TOKENS={!r} is not a whole number; using {}",
+            raw,
+            DEFAULT_TRANSLATOR_OUTPUT_CAP,
+        )
+        return DEFAULT_TRANSLATOR_OUTPUT_CAP
+    return value if value > 0 else DEFAULT_TRANSLATOR_OUTPUT_CAP
+
+
+def _recovery_cap(cap: int, cut_at: int | None) -> int:
+    """The budget a recovery ask uses, given the budget that was just cut.
+
+    At least twice what the provider consumed before stopping: asking for less
+    than that cannot produce a longer reply, so a tuned cap below the observed
+    cut yields to the evidence. Never above the ceiling.
+    """
+    return min(max(cap, (cut_at or 0) * 2), TRANSLATOR_MAX_TOKENS_CEILING)
 
 
 class TranslatorAgent(Agent):
@@ -42,6 +81,7 @@ class TranslatorAgent(Agent):
         extra_critique: str = "",
         section_note: str = "",
         skill_instruction: str = "",
+        profile: str = "body",
     ) -> list[dict[str, str]]:
         """Assemble the translation prompt (exposed for SkillOpt testing).
 
@@ -61,6 +101,12 @@ class TranslatorAgent(Agent):
             )
         ]
         user_parts: list[str] = []
+        if profile == "references":
+            user_parts.append(
+                "This chunk is a reference list. Translate citation prose, but "
+                "keep article/book titles, journal names, author names, "
+                "publisher names and chemical names as written."
+            )
         if skill_instruction:
             # Constant for the whole run, first in the dynamic part: the skill
             # is read once per run, so this line does not churn between chunks.
@@ -111,23 +157,43 @@ class TranslatorAgent(Agent):
         )
         # Mark the shared read-source prefix as a cache breakpoint.
         #
-        # A provider that cuts the reply at its own output-token limit raises
-        # TruncatedError: the model was mid-sentence, so the tail of the chunk
-        # was never translated. Retrying with a raised cap is the only fix that
-        # actually recovers those words — a text heuristic cannot tell a cut
-        # sentence from a legitimately short one, so the provider's own
-        # ``finish_reason`` is the signal we act on.
+        # The first ask sets no cap: the endpoint's own default is what let a
+        # reasoning model think ~6000 tokens and still answer ~2600. A budget is
+        # only imposed on a recovery, where the provider has already said the
+        # one it used was not enough — and a text heuristic cannot tell a cut
+        # sentence from a legitimately short one, so ``finish_reason`` is the
+        # signal acted on.
         try:
             resp = self.chat(prompt, cache_prefix=True)
-        except TruncatedError:
+        except TruncatedError as err:
+            cap = _recovery_cap(_translator_output_cap(), err.completion_tokens)
             logger.warning(
-                "chunk={} reply was cut at the provider's output-token limit; "
-                "re-asking with a raised cap",
+                "chunk={} reply was cut at {} completion tokens (thinking={} answer={}); "
+                "re-asking with a budget of {}",
                 chunk_id or "-",
+                err.completion_tokens,
+                err.reasoning_tokens,
+                err.answer_tokens,
+                cap,
             )
-            resp = self.chat(
-                prompt, cache_prefix=True, max_tokens=_RAISED_OUTPUT_CAP
-            )
+            try:
+                resp = self.chat(prompt, cache_prefix=True, max_tokens=cap)
+            except TruncatedError as again:
+                raised = _recovery_cap(cap, again.completion_tokens)
+                if raised <= cap:
+                    # At the ceiling: another ask is the same question. The
+                    # chunk layer salvages by splitting instead of spinning.
+                    raise
+                logger.warning(
+                    "chunk={} reply was cut again at {} (thinking={} answer={}); "
+                    "re-asking with a budget of {}",
+                    chunk_id or "-",
+                    again.completion_tokens,
+                    again.reasoning_tokens,
+                    again.answer_tokens,
+                    raised,
+                )
+                resp = self.chat(prompt, cache_prefix=True, max_tokens=raised)
         out = resp.text.strip()
         # Source text is recovered from the shared context markers.
         source = extract_source(prompt)

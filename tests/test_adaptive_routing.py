@@ -36,10 +36,11 @@ def test_fast_path_gate_requires_a_clean_confident_simple_chunk(mock_env):
     )
 
 
-def test_fast_path_verdict_names_the_comparison_that_decided_it(mock_env):
+def test_fast_path_verdict_names_the_comparison_that_decided_it(mock_env, monkeypatch):
     """The gate's answer was always computed; now it also says why, in numbers."""
     from polyglot_lc.orchestrator.graph import fast_path_verdict
 
+    monkeypatch.setenv("FAST_PATH_MAX_COMPLEXITY", "0.35")
     app = get_app_config()
     taken, reasons = fast_path_verdict({**_GOOD, "complexity": 0.62}, app)
     assert taken is False
@@ -106,11 +107,20 @@ def test_simple_document_takes_the_fast_path(mock_env, tmp_path):
     assert result.avg_critic_estimate is True
 
 
-def test_structured_document_takes_the_full_path(mock_env, tmp_path):
+def test_structured_document_takes_the_full_path(mock_env, tmp_path, monkeypatch):
+    from polyglot_lc.agents.translator import TranslatorAgent
+
     clear_mock_replies()
-    # The mock translation cannot preserve headings, so the deterministic draft
-    # signals report a structural problem and the fast path must not fire. The
-    # signal is structural, so the body is plain prose.
+    translate = TranslatorAgent.translate
+    calls = 0
+
+    def lose_headings_once(self, prompt, chunk_id=""):
+        nonlocal calls
+        calls += 1
+        draft = translate(self, prompt, chunk_id=chunk_id)
+        return "Bản dịch thiếu tiêu đề." if calls == 1 else draft
+
+    monkeypatch.setattr(TranslatorAgent, "translate", lose_headings_once)
     path = _write(
         tmp_path,
         "# Title\n\nA first paragraph of the document body.\n\n## Section\n\n"
@@ -183,3 +193,50 @@ def test_verifier_still_runs_on_the_fast_path_by_default(mock_env, tmp_path):
     by = TokenUsage.snapshot_by_agent()
     assert by.get("CRITIC") is None
     assert by.get("VERIFIER", {}).get("calls", 0) == result.chunks
+
+
+def test_refined_draft_is_repaired_and_checked_again(mock_env):
+    from types import SimpleNamespace
+
+    from polyglot_lc.agents.critic import Critique
+    from polyglot_lc.agents.verifier import VerifyResult
+    from polyglot_lc.orchestrator.graph import GraphContext, make_chunk_graph
+    from polyglot_lc.segment.chunker import Chunk
+
+    source = "# Title\n\nSome text.\n\n⟦CODE_1⟧"
+    draft = "# Tiêu đề\n\nNội dung.\n\n⟦CODE_1⟧"
+    refined = "## Tiêu đề\n\nNội dung đã sửa."
+    reviews = iter(
+        [
+            Critique(score=5, issues=["fix wording"], suggestions=[]),
+            Critique(score=9, issues=[], suggestions=[]),
+        ]
+    )
+    translations = []
+    checked = []
+
+    def translate(*args, **kwargs):
+        translations.append(draft)
+        return draft
+
+    def verify(**kwargs):
+        checked.append(kwargs)
+        return VerifyResult(ok=not kwargs["hard_issues"], reasons=kwargs["hard_issues"])
+
+    ctx = GraphContext(
+        planner=None,
+        translator=SimpleNamespace(build_prompt=lambda **kwargs: [], translate=translate),
+        critic=SimpleNamespace(review=lambda **kwargs: next(reviews)),
+        refiner=SimpleNamespace(refine=lambda **kwargs: refined),
+        verifier=SimpleNamespace(verify=verify),
+    )
+    ctx.app.adaptive_quality = False
+    chunk = Chunk(id="chunk-000", text=source, token_count=30, section_path=[], index=0)
+    result = make_chunk_graph(ctx).invoke(
+        {"chunk": chunk, "src_lang": "en", "tgt_lang": "vi", "strategy": "faithful"}
+    )
+    assert "⟦CODE_1⟧" in checked[0]["translation"]
+    assert checked[0]["hard_issues"] == ["heading structure changed"]
+    assert checked[1]["hard_issues"] == []
+    assert len(translations) == 2
+    assert result["translated"] == draft

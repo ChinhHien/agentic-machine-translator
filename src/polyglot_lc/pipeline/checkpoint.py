@@ -5,9 +5,9 @@ completes, so an interrupted run (Ctrl-C, provider outage, crash) can be
 resumed with ``--resume`` instead of paying for every chunk again.
 
 A checkpoint belongs to one *document identity* — its path, the digest of its
-bytes, the language pair, the Translator model, the user's glossary and the
-chunk hashes. Any of those changing invalidates the whole directory, so a
-resumed run can never reuse results produced from different input, a different
+bytes, the language pair, the Translator model, the user's glossary, the
+chunk hashes and the verification policy. Any change invalidates the directory,
+so a resumed run can never reuse results produced from different input, a different
 chunking, or without the terminology the reader has since asked for.
 
 The document's identity is its **content**, never its ``mtime``. The web UI
@@ -109,6 +109,7 @@ class CheckpointStore:
         model: str,
         chunk_hashes: list[str],
         glossary: str = "",
+        skip_llm_verify: bool = False,
     ) -> str:
         """Stable 16-char key identifying this exact translation job.
 
@@ -132,11 +133,12 @@ class CheckpointStore:
             digest.update(b"\x00")
         digest.update(_content_digest(file_path).encode("utf-8"))
         digest.update(b"\x00")
-        # Appended last and only when there is one, so the key of a run without
-        # a glossary is exactly what it was before this part existed.
         if glossary:
             digest.update(glossary.encode("utf-8"))
             digest.update(b"\x00")
+        # Old checkpoints may contain fail-open verdicts; keep them out of strict runs.
+        digest.update(b"strict-verification-v1\x00")
+        digest.update(b"fast-skip\x00" if skip_llm_verify else b"full-verify\x00")
         return digest.hexdigest()[:16]
 
     # ------------------------------------------------------------------

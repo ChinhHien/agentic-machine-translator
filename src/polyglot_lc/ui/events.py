@@ -47,6 +47,13 @@ class Event(BaseModel):
     active_api_calls: int | None = None
     max_active_api_calls: int | None = None
     cause: str = ""
+    #: The agent that ran this step, and the model that actually answered it.
+    #: A fallback endpoint serves a different model than the configured one, so
+    #: this is the model the status tab names, not the configuration.
+    agent: str = ""
+    model: str = ""
+    #: Character counts a chunk step measured: ``{source, target}``.
+    chars: dict[str, int] | None = None
 
     def to_json(self) -> str:
         return self.model_dump_json()

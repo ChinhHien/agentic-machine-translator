@@ -369,10 +369,31 @@ def test_token_usage_totals_and_per_agent():
     assert snap["calls"] == 4
     assert snap["cached"] == 120
     by_agent = TokenUsage.snapshot_by_agent()
-    assert by_agent["PLANNER"] == {"sent": 110, "received": 55, "cached": 0, "calls": 2}
-    assert by_agent["TRANSLATOR"] == {"sent": 200, "received": 25, "cached": 120, "calls": 1}
+    assert by_agent["PLANNER"] == {
+        "sent": 110,
+        "received": 55,
+        "cached": 0,
+        "thinking": 0,
+        "answer": 55,
+        "calls": 2,
+    }
+    assert by_agent["TRANSLATOR"] == {
+        "sent": 200,
+        "received": 25,
+        "cached": 120,
+        "thinking": 0,
+        "answer": 25,
+        "calls": 1,
+    }
     by_model = TokenUsage.snapshot_by_model()
-    assert by_model["http://p/v1 / m"] == {"sent": 200, "received": 25, "cached": 120, "calls": 1}
+    assert by_model["http://p/v1 / m"] == {
+        "sent": 200,
+        "received": 25,
+        "cached": 120,
+        "thinking": 0,
+        "answer": 25,
+        "calls": 1,
+    }
     TokenUsage.reset()
     assert TokenUsage.snapshot()["sent"] == 0
     assert TokenUsage.snapshot_by_agent() == {}
@@ -526,6 +547,83 @@ def test_mock_chat_records_agent_tokens(mock_env):
     assert TokenUsage.snapshot()["estimated_calls"] == 1
     TokenUsage.reset()
 
+def reasoning_payload(
+    text: str, reasoning: str, *, completion: int = 7, reasoning_tokens: int | None = None
+) -> dict:
+    """A reply whose thinking came back beside the answer."""
+    payload = chat_payload(text)
+    payload["choices"][0]["message"]["reasoning_content"] = reasoning
+    payload["usage"]["completion_tokens"] = completion
+    if reasoning_tokens is not None:
+        payload["usage"]["completion_tokens_details"] = {"reasoning_tokens": reasoning_tokens}
+    return payload
+
+
+@respx.mock
+def test_a_reasoning_reply_splits_the_budget_into_answer_and_thinking():
+    """The provider's own reasoning_tokens is the split, per agent and model.
+
+    A verifier cut at its cap with a full thinking budget is only visible when
+    the two shares are counted apart; the totals carry both.
+    """
+    TokenUsage.reset()
+    respx.post(CHAT_URL).respond(
+        json=reasoning_payload(
+            '{"pass": true, "reasons": []}', "weighing the checks", completion=60, reasoning_tokens=50
+        )
+    )
+    client = LLMClient(make_agent_config())
+    resp = client.chat([{"role": "user", "content": "hello"}])
+
+    assert resp.reasoning_text == "weighing the checks"
+    assert resp.reasoning_tokens == 50
+    assert resp.answer_tokens == 10
+    snap = TokenUsage.snapshot()
+    assert snap["thinking"] == 50
+    assert snap["answer"] == 10
+    assert snap["received"] == 60
+    assert TokenUsage.snapshot_by_agent()["TRANSLATOR"]["thinking"] == 50
+    TokenUsage.reset()
+
+
+@respx.mock
+def test_a_provider_that_reports_no_reasoning_usage_gets_an_estimate():
+    """Without reasoning_tokens the thinking is estimated from its own text."""
+    TokenUsage.reset()
+    respx.post(CHAT_URL).respond(
+        json=reasoning_payload("bonjour", "abcd", completion=7)
+    )
+    client = LLMClient(make_agent_config())
+    resp = client.chat([{"role": "user", "content": "hello"}])
+
+    assert resp.reasoning_text == "abcd"
+    assert resp.reasoning_tokens == 1  # ~chars/4 of the thinking text
+    assert resp.answer_tokens == 6
+    TokenUsage.reset()
+
+
+@respx.mock
+def test_a_cut_after_a_transient_blip_is_still_a_truncation(monkeypatch):
+    """The retry loop must not turn a cut reply into an outage.
+
+    A 503 on the first ask, then a reply the provider cut at the cap: the
+    truncation is what the caller can fix (by raising its cap), so it has to
+    arrive as ``TruncatedError`` — not wrapped as "no backup to switch to".
+    """
+    monkeypatch.setenv("LLM_MAX_RETRIES", "1")
+    monkeypatch.setenv("LLM_RETRY_BASE_DELAY", "0.01")
+    route = respx.post(CHAT_URL)
+    route.side_effect = [
+        httpx.Response(503, json={"error": {"message": "upstream busy"}}),
+        httpx.Response(200, json=truncated_payload("cutoff prefix")),
+    ]
+    client = LLMClient(make_agent_config())
+    with pytest.raises(TruncatedError) as excinfo:
+        client.chat([{"role": "user", "content": "hello"}])
+    assert excinfo.value.partial_text == "cutoff prefix"
+    assert route.call_count == 2
+
+
 def truncated_payload(text: str) -> dict:
     """A reply the provider cut at its output-token limit."""
     payload = chat_payload(text)
@@ -545,6 +643,13 @@ def test_a_length_cut_is_a_truncation_not_a_draft():
     with pytest.raises(TruncatedError) as excinfo:
         client.chat([{"role": "user", "content": "hello"}])
     assert excinfo.value.completion_tokens == 7  # from the mocked usage
+    # The endpoint that cut it travels with the error, and so does the text that
+    # did arrive — a caller may find a complete answer inside it.
+    assert excinfo.value.provider == BASE
+    assert excinfo.value.model == "test-model"
+    assert excinfo.value.partial_text == "cutoff prefix"
+    assert excinfo.value.answer_tokens == 7
+    assert excinfo.value.reasoning_tokens == 0
 
 
 @respx.mock
@@ -555,7 +660,7 @@ def test_the_translator_re_asks_a_cut_reply_with_a_raised_cap():
     the provider cut the first reply on; the recovered draft is returned
     normally (and lands in the translation memory).
     """
-    from polyglot_lc.agents.translator import TranslatorAgent
+    from polyglot_lc.agents.translator import DEFAULT_TRANSLATOR_OUTPUT_CAP, TranslatorAgent
 
     route = respx.post(CHAT_URL)
     route.side_effect = [
@@ -571,4 +676,160 @@ def test_the_translator_re_asks_a_cut_reply_with_a_raised_cap():
     first = json.loads(route.calls[0].request.content)
     assert "max_tokens" not in first, "the first ask must not set a cap"
     second = json.loads(route.calls[1].request.content)
-    assert second.get("max_tokens") == 4096
+    assert second.get("max_tokens") == DEFAULT_TRANSLATOR_OUTPUT_CAP
+
+
+def reasoning_truncated_payload(text: str, *, thinking: int, answer: int) -> dict:
+    """A reasoning model's reply cut at the cap, with the budget split reported.
+
+    This is the shape a real run produced: the gateway counts thinking against
+    the same completion budget as the answer, so a model that thinks 3070 tokens
+    and writes 2 is cut with essentially no translation in hand.
+    """
+    payload = truncated_payload(text)
+    total = thinking + answer
+    payload["usage"] = {
+        "prompt_tokens": 5,
+        "completion_tokens": total,
+        "total_tokens": 5 + total,
+        "completion_tokens_details": {"reasoning_tokens": thinking},
+    }
+    return payload
+
+
+@respx.mock
+def test_a_reply_cut_with_no_answer_is_re_asked_with_room_to_think():
+    """The recovery budget must fit thinking AND answer, not just the answer.
+
+    A real run fell back to a second endpoint whose default cap was 3072; the
+    model spent 3070 of it thinking and emitted 2 tokens of translation. The
+    recovery ask then clamped the primary endpoint — which normally runs
+    uncapped to a median of ~9000 completion tokens — down to 4096, so it cut
+    again and the chunk was reported as a failure it had not earned.
+    """
+    from polyglot_lc.agents.translator import DEFAULT_TRANSLATOR_OUTPUT_CAP, TranslatorAgent
+
+    route = respx.post(CHAT_URL)
+    route.side_effect = [
+        httpx.Response(200, json=reasoning_truncated_payload("d", thinking=3070, answer=2)),
+        httpx.Response(200, json=chat_payload("bản dịch đầy đủ")),
+    ]
+    agent = TranslatorAgent(make_agent_config())
+    out = agent.translate(agent.build_prompt("Chunk text.", "en", "vi", "translate"))
+
+    assert out == "bản dịch đầy đủ"
+    assert route.call_count == 2
+    first = json.loads(route.calls[0].request.content)
+    assert "max_tokens" not in first, "the first ask must not set a cap"
+    cap = json.loads(route.calls[1].request.content)["max_tokens"]
+    assert cap > 3072, "a recovery below the budget just cut cannot succeed"
+    assert cap >= DEFAULT_TRANSLATOR_OUTPUT_CAP
+
+
+@respx.mock
+def test_the_translator_recovery_cap_is_configurable(monkeypatch):
+    """An endpoint with a different ceiling is tuned without editing code."""
+    from polyglot_lc.agents.translator import TranslatorAgent
+
+    monkeypatch.setenv("TRANSLATOR_MAX_TOKENS", "8192")
+    route = respx.post(CHAT_URL)
+    route.side_effect = [
+        httpx.Response(200, json=truncated_payload("đoạn bị cắt")),
+        httpx.Response(200, json=chat_payload("bản dịch đầy đủ")),
+    ]
+    agent = TranslatorAgent(make_agent_config())
+    agent.translate(agent.build_prompt("Chunk text.", "en", "vi", "translate"))
+
+    assert json.loads(route.calls[1].request.content)["max_tokens"] == 8192
+
+
+@respx.mock
+def test_a_configured_cap_below_the_cut_yields_to_the_evidence(monkeypatch):
+    """A tuned cap smaller than the budget just cut is a guaranteed failure.
+
+    The provider said how much it consumed before stopping; asking for less
+    than that cannot produce a longer reply, so the observed cut wins.
+    """
+    from polyglot_lc.agents.translator import TranslatorAgent
+
+    monkeypatch.setenv("TRANSLATOR_MAX_TOKENS", "2048")
+    route = respx.post(CHAT_URL)
+    route.side_effect = [
+        httpx.Response(200, json=reasoning_truncated_payload("d", thinking=3070, answer=2)),
+        httpx.Response(200, json=chat_payload("bản dịch đầy đủ")),
+    ]
+    agent = TranslatorAgent(make_agent_config())
+    agent.translate(agent.build_prompt("Chunk text.", "en", "vi", "translate"))
+
+    assert json.loads(route.calls[1].request.content)["max_tokens"] >= 6144
+
+
+@respx.mock
+def test_a_second_cut_escalates_once_more_then_reports_the_truncation():
+    """The ladder is bounded: two recovery asks, then the caller is told.
+
+    Each rung doubles the budget that was just cut, so a reply that overran one
+    budget gets room instead of the same question again. At the ceiling there is
+    nothing left to raise and the error propagates to the chunk layer, which
+    salvages by splitting rather than spinning.
+    """
+    from polyglot_lc.agents.translator import (
+        DEFAULT_TRANSLATOR_OUTPUT_CAP,
+        TRANSLATOR_MAX_TOKENS_CEILING,
+        TranslatorAgent,
+    )
+
+    route = respx.post(CHAT_URL)
+    route.side_effect = [
+        httpx.Response(200, json=reasoning_truncated_payload("a", thinking=3070, answer=2)),
+        httpx.Response(
+            200,
+            json=reasoning_truncated_payload(
+                "b", thinking=15000, answer=DEFAULT_TRANSLATOR_OUTPUT_CAP - 15000
+            ),
+        ),
+        httpx.Response(
+            200,
+            json=reasoning_truncated_payload(
+                "c", thinking=30000, answer=TRANSLATOR_MAX_TOKENS_CEILING - 30000
+            ),
+        ),
+    ]
+    agent = TranslatorAgent(make_agent_config())
+    with pytest.raises(TruncatedError):
+        agent.translate(agent.build_prompt("Chunk text.", "en", "vi", "translate"))
+
+    assert route.call_count == 3
+    caps = [json.loads(c.request.content).get("max_tokens") for c in route.calls]
+    assert caps == [None, DEFAULT_TRANSLATOR_OUTPUT_CAP, TRANSLATOR_MAX_TOKENS_CEILING]
+
+
+@respx.mock
+def test_the_escalation_never_asks_above_the_ceiling(monkeypatch):
+    """A gateway rejects a max_tokens over its own limit outright, so the
+    ladder stops at the ceiling instead of doubling past it."""
+    from polyglot_lc.agents.translator import TRANSLATOR_MAX_TOKENS_CEILING, TranslatorAgent
+
+    monkeypatch.setenv("TRANSLATOR_MAX_TOKENS", str(TRANSLATOR_MAX_TOKENS_CEILING))
+    route = respx.post(CHAT_URL)
+    route.side_effect = [
+        httpx.Response(
+            200,
+            json=reasoning_truncated_payload(
+                "a", thinking=30000, answer=TRANSLATOR_MAX_TOKENS_CEILING - 30000
+            ),
+        ),
+        httpx.Response(
+            200,
+            json=reasoning_truncated_payload(
+                "b", thinking=30000, answer=TRANSLATOR_MAX_TOKENS_CEILING - 30000
+            ),
+        ),
+    ]
+    agent = TranslatorAgent(make_agent_config())
+    with pytest.raises(TruncatedError):
+        agent.translate(agent.build_prompt("Chunk text.", "en", "vi", "translate"))
+
+    caps = [json.loads(c.request.content).get("max_tokens") for c in route.calls]
+    assert caps == [None, TRANSLATOR_MAX_TOKENS_CEILING]
+    assert route.call_count == 2, "at the ceiling a second recovery ask is the same question"

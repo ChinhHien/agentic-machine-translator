@@ -4,10 +4,7 @@ Everything here is a plain file reader meant to be called from the server
 process, so nothing in this module imports :mod:`polyglot_lc` (see the package
 docstring in :mod:`webui`).
 
-There is deliberately no configuration store: the web application has no view
-of `.env` at all — not a value, not a key name, not whether a key is set. What
-a run needs from the environment it inherits from the process that started the
-server, and the terminal is where a human inspects or changes that.
+The pipeline's endpoints come from `.env` alone: the WebUI never edits them.
 """
 
 from __future__ import annotations
@@ -15,7 +12,7 @@ from __future__ import annotations
 import csv
 import json
 import os
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any
 
@@ -265,7 +262,7 @@ class RunsStore:
 
 
 # ---------------------------------------------------------------------------
-# skills: no store — skills live as skill.md files under skills/<pair>/ and
+# skills: no store — the system skill lives as skills/skill.md and
 # nothing in the server reads them.
 # ---------------------------------------------------------------------------
 # Glossaries

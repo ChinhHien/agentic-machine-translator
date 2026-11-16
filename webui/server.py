@@ -6,17 +6,14 @@ the router and writes the response back. The server binds ``127.0.0.1`` on
 purpose: it can start and kill translation runs, so it must not be reachable
 from the network.
 
-What this surface deliberately does **not** have is any route that reads or
-writes the system configuration. There is no ``/api/config``: the application
-has no view of ``.env`` — not a value, not a key name, not whether a credential
-is set. Runs inherit the server's environment, and a human changes that from a
-terminal. The only translation preferences the API accepts are the ones that
-belong to a single run (languages, glossary, chunk budget, output
-format), and the page sends just the document, its two languages and
-the output format: the terms and the chunk budget are the
-pipeline's own to work out from the text. Continuing a run ("Tiếp tục") accepts
-none of those preferences: it carries the id of the run being continued, and
-what gets relaunched is that run's own stored command with ``--resume``.
+The pipeline's endpoints and models come from ``.env`` by default, and the
+server still never reports them; what it *can* do now is hold endpoint
+overrides entered in the settings dialog (:mod:`webui.settings`). Those are
+merged into a run's child env at launch, after each one passes a live
+connection test — an override that no longer answers is skipped, so the
+pipeline falls back to the ``.env`` value it came to replace. A run resumes
+on its own stored command and the model it reported, so nothing on the page
+can rewrite a run's checkpoint identity.
 
 Everything a response quotes back — run notes, step errors, the child's own
 output — is passed through :func:`_redact` first, so a provider error that
@@ -46,6 +43,12 @@ from webui.runs import (
     RunManager,
     RunPlanError,
     start_sweeper,
+)
+from webui.settings import (
+    AGENT_ENV_PREFIXES,
+    SettingsError,
+    SettingsStore,
+    test_endpoint,
 )
 from webui.store import GlossaryStore, RunRecord, RunsStore
 
@@ -134,6 +137,13 @@ _SECRET_RE = re.compile(r"\b(?:sk|pk|rk|api|key|token)[-_][A-Za-z0-9_\-]{6,}\b",
 
 #: How much of a child's output to quote when a run died before any event.
 TAIL_CHARS = 4000
+
+#: How much of a chunk's saved translation the status panel quotes, at each end.
+CHUNK_TEXT_CHARS = 400
+
+#: Log lines kept for one chunk, and how much of each line.
+CHUNK_LOG_LINES = 200
+CHUNK_LOG_CHARS = 1000
 
 
 def _redact(text: str) -> str:
@@ -248,6 +258,7 @@ class Api:
         runs: RunsStore,
         glossaries: GlossaryStore,
         port: int = DEFAULT_PORT,
+        settings: SettingsStore | None = None,
     ) -> None:
         self.root = Path(root)
         self.manager = manager
@@ -255,6 +266,9 @@ class Api:
         #: Read-only: the run planner resolves a glossary name through it, and
         #: nothing on this surface can write to it.
         self.glossaries = glossaries
+        #: The settings dialog's own store; built over the same root when the
+        #: caller did not bring one (tests construct theirs explicitly).
+        self.settings = settings or SettingsStore(root)
         self.port = port
         #: `(path, size, mtime) -> extracted text`, so flipping between two
         #: panes or reloading the page does not re-read a whole book.
@@ -284,7 +298,7 @@ class Api:
         return self._api(method, path, query, body)
 
     def _api(self, method: str, path: str, query: dict[str, list[str]], body: bytes) -> Response:
-        """The API routes, in one table, with no configuration among them."""
+        """The API routes, in one table."""
         if path.rstrip("/") == "/api/runs":
             if method == "GET":
                 return self._runs()
@@ -300,6 +314,14 @@ class Api:
             # Unquote *before* validating: otherwise `..%2F.env` would look
             # like a harmless single-segment name and slip past `safe_child`.
             return self._upload(unquote(path[len("/api/inputs/") :]), query, body)
+        if path.rstrip("/") == "/api/settings" and method == "GET":
+            return json_response(self.settings.public())
+        if path.rstrip("/") == "/api/settings" and method == "PUT":
+            return self._save_settings(body)
+        if path.rstrip("/") == "/api/settings/test" and method == "POST":
+            return self._test_endpoint(body)
+        if path.startswith("/api/settings/") and method == "DELETE":
+            return self._delete_setting(unquote(path[len("/api/settings/") :]))
         return error(404, f"no such route: {method} {path}")
 
     # Origin --------------------------------------------------------------
@@ -398,6 +420,8 @@ class Api:
             return self._run_detail(run_id)
         if len(parts) == 1 and method == "DELETE":
             return self._delete_run(run_id)
+        if len(parts) == 3 and method == "GET" and parts[1] == "chunks":
+            return self._run_chunk(run_id, parts[2])
         if len(parts) == 2 and method == "GET":
             if parts[1] == "events":
                 return self._run_events(run_id, _first(query, "after"))
@@ -727,6 +751,114 @@ class Api:
             200, buffer.getvalue(), ZIP_TYPE, _content_disposition(f"{record.run_id}-ket-qua.zip")
         )
 
+    def _run_chunk(self, run_id: str, chunk_id: str) -> Response:
+        """One chunk's own record: what it cost, how it got there, and its log.
+
+        The chunk list already knows each chunk's state from the event stream,
+        so this answers only what a list cannot carry: the text sizes, the route
+        through the graph, the per-step agents and models, and the run's own log
+        lines mentioning this chunk. Loaded when a row is opened, never with the
+        list.
+        """
+        try:
+            record = self.manager.status(run_id)
+        except KeyError:
+            return error(404, f"no such run: {run_id}")
+        match = re.fullmatch(r"chunk-(\d+)", chunk_id)
+        if match is None:
+            return error(404, f"no such chunk: {chunk_id}")
+        index = int(match.group(1))
+        if record.chunks and index >= record.chunks:
+            return error(404, f"no such chunk: {chunk_id}")
+        events, _next, _malformed = self.manager.events(run_id, 0)
+        mine = [event for event in events if str(event.get("chunk_id") or "") == chunk_id]
+        steps = [
+            {
+                "step": str(event.get("step") or ""),
+                "type": str(event.get("type") or ""),
+                "status": str(event.get("status") or ""),
+                "latency": float(event.get("latency") or 0.0),
+                "tokens": event.get("tokens"),
+                "agent": str(event.get("agent") or ""),
+                "model": str(event.get("model") or ""),
+                "error": _redact(str(event.get("error") or ""))[:TAIL_CHARS],
+                "ts": event.get("ts"),
+            }
+            for event in mine
+            if str(event.get("type") or "") in {"step_start", "step_end"}
+        ]
+        decisions = [
+            {
+                "kind": str(event.get("kind") or ""),
+                "chosen": bool(event.get("chosen")),
+                "reasons": [
+                    _redact(str(reason))[:TAIL_CHARS]
+                    for reason in (event.get("reasons") or [])
+                ],
+                "numbers": event.get("numbers"),
+                "ts": event.get("ts"),
+            }
+            for event in mine
+            if str(event.get("type") or "") == "decision"
+        ]
+        stats = next(
+            (
+                event
+                for event in reversed(mine)
+                if str(event.get("type") or "") == "chunk_stats"
+            ),
+            None,
+        )
+        saved = self.manager.chunk_record(run_id, chunk_id) or {}
+        rejected = self.manager.chunk_rejected(run_id, chunk_id) or {}
+        translated = str(saved.get("translated") or "")
+        text = {
+            "chars": len(translated),
+            "score": saved.get("score"),
+            "section": str(saved.get("path") or ""),
+            "stored": bool(saved),
+            "head": translated[:CHUNK_TEXT_CHARS],
+            "tail": translated[-CHUNK_TEXT_CHARS:] if len(translated) > CHUNK_TEXT_CHARS else "",
+        }
+        rejected_text = str(rejected.get("translated") or "")
+        return json_response(
+            {
+                "chunk_id": chunk_id,
+                "stats": stats,
+                "steps": steps,
+                "decisions": decisions,
+                "text": text,
+                "rejected": (
+                    {
+                        "reason": _redact(str(rejected.get("reason") or ""))[:TAIL_CHARS],
+                        "chars": len(rejected_text),
+                        "head": rejected_text[:CHUNK_TEXT_CHARS],
+                    }
+                    if rejected
+                    else None
+                ),
+                "log": self._chunk_log(run_id, chunk_id),
+                "has_events": bool(mine),
+            }
+        )
+
+    def _chunk_log(self, run_id: str, chunk_id: str) -> list[str]:
+        """The run's own output lines that name this chunk, newest kept last."""
+        try:
+            directory = self.runs.dir_for(run_id)
+        except ValueError:
+            return []
+        lines: list[str] = []
+        for name in ("stderr.log", "stdout.log"):
+            try:
+                raw = (directory / name).read_text(encoding="utf-8", errors="replace")
+            except OSError:
+                continue
+            for line in raw.splitlines():
+                if chunk_id in line:
+                    lines.append(_redact(line.rstrip())[:CHUNK_LOG_CHARS])
+        return lines[-CHUNK_LOG_LINES:]
+
     def _run_partial(self, run_id: str) -> Response:
         """The translation so far, chunk by chunk, while the run is writing it.
 
@@ -791,6 +923,57 @@ class Api:
         # the two land in the same folder and differ only in what was removed.
         name = f"{stem}.goc.md" if keep_markers else f"{stem}.goc-sach.md"
         return Response(200, body.encode("utf-8"), MARKDOWN_TYPE, _content_disposition(name))
+
+    # Settings -------------------------------------------------------------
+    def _save_settings(self, body: bytes) -> Response:
+        """Persist the dialog's values, then answer with what is stored.
+
+        The answer is the same masked view ``GET`` returns, so the page never
+        has to guess what a key-less field meant.
+        """
+        data = _json_object(body)
+        if data is None:
+            return error(400, "body must be a JSON object")
+        try:
+            self.settings.apply_update(data)
+        except SettingsError as exc:
+            return error(422, str(exc))
+        return json_response(self.settings.public())
+
+    def _delete_setting(self, name: str) -> Response:
+        """Drop one agent's override; the agent goes back to its ``.env`` value."""
+        try:
+            deleted = self.settings.delete_agent(name)
+        except SettingsError as exc:
+            return error(404, str(exc))
+        if not deleted:
+            return error(404, f"no saved override for {name}")
+        return json_response({"deleted": name, "settings": self.settings.public()})
+
+    def _test_endpoint(self, body: bytes) -> Response:
+        """Probe one endpoint from the dialog and remember the verdict.
+
+        With no key typed, the stored key for that agent is what is tested —
+        the dialog never shows a key back, so "test what I have" has to reach
+        the stored copy on the server.
+        """
+        data = _json_object(body)
+        if data is None:
+            return error(400, "body must be a JSON object")
+        agent = str(data.get("agent") or "").strip()
+        base_url = str(data.get("base_url") or "").strip()
+        model = str(data.get("model") or "").strip()
+        api_key = str(data.get("api_key") or "").strip()
+        if agent and agent not in AGENT_ENV_PREFIXES:
+            return error(404, f"unknown agent: {agent}")
+        if not api_key and agent:
+            stored = self.settings.load().agents.get(agent)
+            if stored is not None:
+                api_key = stored.api_key
+        result = test_endpoint(base_url, model, api_key)
+        if agent:
+            self.settings.record_test(agent, result)
+        return json_response(result)
 
     # Static ------------------------------------------------------------
     @property

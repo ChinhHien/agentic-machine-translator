@@ -12,6 +12,8 @@ build/
 data/reasoning_bank/*
 !data/reasoning_bank/.gitkeep
 data/checkpoints/
+data/rejected/
+data/webui-settings.json
 logs/*
 !logs/.gitkeep
 skills/**/session_*.json

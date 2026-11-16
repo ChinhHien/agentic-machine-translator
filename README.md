@@ -65,7 +65,7 @@ Sơ đồ dạng text cho terminal:
         Consistency pass (vá thuật ngữ, lệch nhiều vá trước, ngân sách theo tỉ lệ)
                                ▼
         Assemble + phục hồi code ─▶ SkillOpt ─▶ báo cáo
-          (skills/<src>-<tgt>/skill.md)
+          (skills/skill.md)
 ```
 
 ### Workflow dự án
@@ -79,7 +79,7 @@ Sơ đồ dạng text cho terminal:
 | 5 | `plan` | `analysis/unified_planner` | **1 request** | `DocumentPlan` |
 | 6 | `analyse_chunks` | `analysis/complexity` | không | điểm phức tạp mỗi chunk |
 | 7 | mỗi chunk | `orchestrator/graph` | 1–5 request | bản dịch + `path` |
-| 8 | `consistency` | `pipeline/consistency` | ≤ trần (sàn `CONSISTENCY_MAX_PATCHES`, và ≥30% số chunk lệch) | bản vá thuật ngữ |
+| 8 | `consistency` | `pipeline/consistency` | ≤ ngân sách lượt vá × (1 editor + 1 verifier) | bản vá thuật ngữ đã kiểm định |
 | 9 | `assemble_output` | `pipeline/assembler`, `pipeline/pdf_output` | không | tài liệu cuối (Markdown và/hoặc PDF) |
 | 10 | `skillopt_update` | `skillopt/` | 1 request | kỹ năng (có thể) được promote |
 
@@ -165,12 +165,16 @@ lại bản Markdown đã dịch xong.
   Verifier**, bỏ qua Critic và Refiner; chunk đáng ngờ chạy vòng
   Critic → Refiner đầy đủ.  `FAST_PATH_SKIP_LLM_VERIFY=1` bỏ luôn lần gọi
   Verifier trả phí khi các kiểm tra cứng đã qua. Định tuyến tốn **0 token**.
-- **Verifier lỗi không được ghi thành "đã đạt"**: khi Verifier không chạy được,
-  kết quả vẫn mang `ok` để không chặn bản dịch nhưng có thêm cờ `skipped`;
-  decision ghi "no verdict, the draft ships unverified", mỗi chunk như vậy để
-  lại một bản ghi `error` (cause `verify`), và con số lên `run_end`
-  (`verify_skipped`) cùng dòng cuối CLI. Trước đây cả ba nơi đều đọc như
-  "verifier accepted the draft".
+- **Verifier không cho qua khi thiếu kiểm định**: lỗi API sau retry hoặc JSON
+  không có `pass` kiểu boolean làm lượt dịch dừng với trạng thái `failed`;
+  checkpoint của các chunk đã hoàn thành vẫn được giữ. Bản dịch bị từ chối
+  được dịch lại tối đa một lần trong mỗi lượt chạy graph; nếu vẫn không đạt,
+  chunk đó bị cách ly, không lưu checkpoint và không đưa bản nháp vào đầu ra;
+  các chunk độc lập vẫn tiếp tục. Checkpoint từ cơ chế kiểm định cũ không còn được
+  tái sử dụng (file cũ vẫn giữ nguyên); thay đổi `FAST_PATH_SKIP_LLM_VERIFY`
+  cũng tạo bộ checkpoint riêng.
+  Critic và Refiner nhận toàn bộ bản dịch; sau refine, placeholder được sửa
+  và kiểm tra cấu trúc được chạy lại trên bản mới.
 - **Checkpoint chống sập**: mỗi chunk xong được ghi vào
   `<CHECKPOINT_DIR>/<job>/<chunk>.json`; `--resume` bỏ qua các chunk đã xong
   (một lượt resume trọn vẹn tốn 0 request). Checkpoint gắn với đường dẫn, **nội
@@ -196,15 +200,16 @@ lại bản Markdown đã dịch xong.
   rồi tách đôi chunk, rồi để chunk ở dạng `<!-- chunk-NNN: untranslated -->`
   trong file và **không** ghi checkpoint, thay vì giữ cả lượt chạy đứng ở thanh
   tiến độ (trước đây vòng chờ rỗng không có trần).
-  Bản dịch đã sinh ra **được giữ lại**: hỏng ở Critic/Verifier thì lần chạy sau
-  vào thẳng bước đó, không gọi lại Translator cho cùng một câu (đây cũng là chỗ
-  từng đốt ~14 phút mỗi lần bấm Tiếp tục). Vì vậy file kết quả của một lượt đã
-  xong không còn dấu `<!-- chunk-NNN: untranslated (source blocks 4-6 lost) -->`;
-  marker đó chỉ còn là lưới an toàn cho file viết dở (`PARTIAL_OUTPUT=1`) và cho
-  người gọi thẳng `assemble()`. Trạng thái cuối của lượt nói về **file**: mọi
-  chunk đã dịch thì `run_end` là `done` (mã thoát 0), còn những lần phải chờ vẫn
-  nằm trong log và `problems` — `failed` chỉ dành cho lượt không giao được bản
-  dịch trọn vẹn (còn chunk trống, hoặc lượt chết vì lỗi khác `LLMError`).
+  Bản nháp đã sinh ra **được giữ trong bộ nhớ** khi retry lỗi hạ tầng ở Critic,
+  không gọi lại Translator. Không thể kiểm định vẫn làm dừng lượt chạy;
+  phán quyết chất lượng không đạt chỉ cách ly chunk đó. Chỉ chunk hoàn thành
+  có checkpoint; `--resume` chỉ thử lại phần còn thiếu. Markdown đánh dấu vị trí
+  thiếu bằng `<!-- chunk-NNN: untranslated (source blocks 4-6 lost) -->`.
+  Còn thiếu chunk thì cả `run_end` và CLI báo thất bại (mã thoát 1), kể cả khi
+  đã ghi được file đầu ra. `chunks_rejected` đếm riêng chunk bị từ chối chất lượng;
+  Web UI không tự thử lại lỗi này vì timeout cũ của Planner. Lỗi hạ tầng kết thúc
+  lượt được xét từ `fatal_error`. Khi mọi chunk đã dịch, `run_end` là `done`
+  (mã thoát 0); các lỗi đã phục hồi vẫn nằm trong log và `problems`.
 - **Nhất quán xuyên chunk**: sau khi dịch, glossary đã lên kế hoạch được áp lên
   toàn tài liệu. Chunk đi lệch được **vá** (giới hạn bởi `CONSISTENCY_MAX_PATCHES`,
   mặc định 5) thay vì dịch lại, và bản vá chỉ được giữ nếu nó thật sự đưa đúng
@@ -213,12 +218,14 @@ lại bản Markdown đã dịch xong.
   lúc lắp ráp code chỉ được phục hồi bằng `str.replace`, nên một bản vá làm rơi
   marker là xoá hẳn khối code mà không để lại dấu vết. Một "lệch đồng loạt" (không chunk nào dùng thuật ngữ dự
   kiến) được báo cáo chứ không vá, vì không có gì để các chunk thống nhất *theo*.
-  Ngân sách vá là `max(CONSISTENCY_MAX_PATCHES, 30% số chunk lệch)`, và mỗi bản
-  vá là **một request** gửi cả bản dịch của chunk kèm glossary rồi nhận lại cả
-  bản dịch — nên trần đó lên `run_end` (`consistency_patch_budget`) và dòng CLI
-  (`consistency patch budget: N request(s), M used`) thay vì chỉ nằm trong log.
-  Hai bản vá liền bị từ chối (editor rơi thuật ngữ, mất bản dịch, hoặc phá cấu
-  trúc) là dấu hiệu model đang phớt lờ chỉ dẫn: pass **dừng** thay vì đốt hết
+  Ngân sách vá là `max(CONSISTENCY_MAX_PATCHES, ceil(30% số chunk lệch))`.
+  Mỗi lượt vá gọi editor một lần; bản vá vượt kiểm tra cơ bản được Verifier
+  đối chiếu thêm với nguồn và bản dịch trước vá để kiểm tra ý nghĩa. Chỉ nhận
+  bản vá khi kiểm định đạt; lỗi kiểm định giữ bản dịch trước vá.
+  `consistency_patch_budget` và dòng CLI báo số lượt thử vá, không bao gồm
+  các request kiểm định bổ sung.
+  Hai bản vá liền bị từ chối (thuật ngữ, độ dài, cấu trúc hoặc ngữ nghĩa)
+  khiến pass **dừng** thay vì đốt hết
   ngân sách vào cùng một câu trả lời, và số chunk còn lệch vẫn được đếm là bỏ
   sót (`consistency_skipped`), cùng cờ `stopped_early` trong báo cáo của pass.
   Pass còn so cả **nhãn** (`Preconditions:`, `Bước 3`, `Hình 2.1`) và **cụm lặp
@@ -247,11 +254,17 @@ lại bản Markdown đã dịch xong.
 - **Reasoning Bank** (ChromaDB): trace bền vững `{strategy, few_shot, pitfalls,
   score, ts…}`, chỉ upsert khi score ≥ 0.75. Tự reset collection khi số chiều
   embedding đổi (đổi `EMBED_MODEL`, vào/ra mock).
-- **SkillOpt**: thu thập (prompt, output, điểm) theo từng chunk; Planner đề xuất
-  textual gradient; kỹ năng chỉ được promote khi điểm trung bình 20 chunk gần
-  nhất **thắng** kỹ năng đang dùng. Skill được lưu thành
-  `skills/<src>-<tgt>/skill.md` và được đọc lại vào prompt Translator ở lượt
-  kế tiếp.
+- **SkillOpt**: thu thập (prompt, output, điểm) theo từng chunk và ghi file
+  **một lần/lượt**; Planner đề xuất textual gradient; kỹ năng chỉ được promote
+  khi lượt đó chấm đủ `SKILL_MIN_SAMPLES` chunk và mean **vượt** điểm đo của
+  skill đang dùng ít nhất `SKILL_MIN_GAIN`. Một bản skill duy nhất cho toàn hệ
+  thống (mặc định chỉ dịch en→vi) nằm ở `skills/skill.md`, ghi
+  `skill_id`/`version`/baseline, mỗi bản promote có snapshot trong `versions/`
+  và mỗi lượt một dòng `history.jsonl`; `polyglot skills --history` đọc lại,
+  `--restore <N>` quay về bản cũ, `--validate` kiểm tra file. Version vừa promote
+  **chưa có** mean (lượt đề xuất do bản trước dịch) — lượt sau mới điền, nên
+  "tốt hơn" là so hai bản đã đo, không phải so nhãn. `SKILL_APPLY=0` chạy đối
+  chứng trên cùng tài liệu.
 - **Hàng đợi theo từng provider**: tối đa  `LLM_PROVIDER_CONCURRENCY` (mặc định
   **1**) request đang bay cho mỗi `base_url`, để gói miễn phí chỉ phục vụ một
   request không bị pool chunk giẫm lên. Đây là **hàng đợi**, không phải van: các
@@ -261,11 +274,16 @@ lại bản Markdown đã dịch xong.
   giới hạn thật của provider. Pool worker (`MAX_CONCURRENCY`) giữ nguyên độc lập
   với queue, không bị ép theo.
 - **Timeout theo yêu cầu có trần**: mọi lời gọi LLM/embedding bị chặn bởi
-  `LLM_TIMEOUT` (mặc định 45s), ghi đè theo từng agent bằng `<NAME>_TIMEOUT`
+  `LLM_TIMEOUT` (mặc định **300s**), ghi đè theo từng agent bằng `<NAME>_TIMEOUT`
   (ví dụ `VERIFIER_TIMEOUT`) hoặc `EMBED_TIMEOUT`. SDK `timeout` là *read*
-  timeout (mỗi byte tới lại reset nó), nên còn một **deadline wall-clock thật**
-  ở trên nó: một endpoint treo sẽ thành lỗi timeout có thể retry trong vòng vài
-  chục giây thay vì treo tiến trình hàng chục phút. Verifier suy giảm êm.
+  timeout, nhưng các call này **không stream**: không có byte nào tới cho đến
+  khi cả câu trả lời sinh xong, nên nó thành hạn chót cho toàn bộ quá trình
+  sinh. Model reasoning nghĩ ~6000 token rồi trả lời ~2600 có thể mất hàng phút
+  (median 47s, max 301s đo trên một lần chạy thật) — mặc định 45s cũ giết oan
+  call khoẻ, fallback sang endpoint khác và trả tiền hai lần cho cùng một chunk.
+  Trên nó vẫn còn một **deadline wall-clock thật**: một endpoint treo sẽ thành
+  lỗi timeout có thể retry thay vì treo tiến trình vĩnh viễn. Verifier không có
+  phán quyết hợp lệ sau retry/fallback sẽ làm dừng lượt dịch.
 - **Retry có kiểm soát**: lỗi hạ tầng (429/408/timeout/5xx/lỗi kết nối) retry
   theo backoff lũy thừa + jitter giới hạn (`LLM_RETRY_JITTER`) và tôn trọng
   `Retry-After`. Một 429 kiểu "vẫn còn request đang chạy" được thử lại sau **ít
@@ -296,9 +314,12 @@ lại bản Markdown đã dịch xong.
   spinner, không progress bar, không dashboard vẽ lại. Sự kiện có cấu trúc vẫn
   được ghi ra `logs/run_<ts>.jsonl`.
 - **Song song có trần**: các chunk độc lập chạy song song tối đa
-  `MAX_CONCURRENCY` (mặc định 2), mỗi chunk giữ nguyên thứ tự nội bộ
+  `MAX_CONCURRENCY` (mặc định **1**), mỗi chunk giữ nguyên thứ tự nội bộ
   Translate → [Critic → Refiner] → Verify. Output luôn được hợp nhất theo thứ tự
-  chunk gốc bất kể thứ tự hoàn thành.
+  chunk gốc bất kể thứ tự hoàn thành. Hai tầng song song là độc lập: nâng
+  `MAX_CONCURRENCY` mà để `LLM_PROVIDER_CONCURRENCY=1` thì mọi worker vẫn xếp
+  hàng trên một slot provider — lượt chạy trông song song mà thực chất tuần tự,
+  nên pipeline cảnh báo khi hai giá trị lệch nhau.
 - **Cổng chất lượng**: kiểm tra cứng tất định (placeholder `⟦CODE_n⟧`, cấp tiêu
   đề) + phán quyết LLM; Verifier fail kéo theo một lần dịch lại có kèm lý do.
   Lỗi cấu trúc chặn **trước** lời gọi Verifier trả phí.
@@ -462,15 +483,17 @@ Một lựa chọn thay vì hai ô tick, vì hai ô tick cho phép một trạng
 được vì đường dẫn PDF được suy ra từ đường dẫn Markdown, và **Tải tất cả (.zip)**
 gói cả hai khi lượt chạy viết ra cả hai.
 
-**Trang này không có bề mặt cấu hình nào.** Không màn hình cài đặt, không trạng
-thái API key, không công tắc chạy thử. Lượt chạy thừa hưởng môi trường của tiến
-trình server, còn những gì trang gửi chỉ là tài liệu, hai ngôn ngữ và định dạng
-kết quả. Lĩnh vực, glossary và ngân sách token không có ô nhập nào: lượt chạy
-mặc định `general`, từ điển thuật ngữ do pipeline tự luận ra từ chính văn bản, và
-ngân sách token lấy từ `.env` (`CHUNK_MAX_TOKENS`).
-Muốn đổi thiết lập thì sửa `.env` rồi chạy lại server; `python webui/probe.py
---config` cho biết cấu hình hiệu lực cùng nguồn của từng giá trị (`env` /
-`dotenv` / `default`).
+**Bề mặt cấu hình duy nhất là hộp thoại endpoint** (biểu tượng bánh răng ở góc
+phải header): nó ghi đè lên `.env` cho các lượt dịch mới — từng agent, endpoint
+gom cụm Translator · Critic · Refiner, Backup, và `MAX_CONCURRENCY` — với cơ
+chế fallback an toàn: endpoint nào không còn trả lời khi bắt đầu lượt sẽ bị bỏ
+qua và pipeline dùng lại giá trị `.env` (chi tiết ở mục 6 của
+`docs/configuration.md`). Mọi thứ khác vẫn không có ô nhập nào: lượt chạy
+mặc định `general`, từ điển thuật ngữ do pipeline tự luận ra từ chính văn bản,
+và ngân sách token lấy từ `.env` (`CHUNK_MAX_TOKENS`).
+Muốn đổi thiết lập ngoài hộp thoại đó thì sửa `.env` rồi chạy lại server;
+`python webui/probe.py --config` cho biết cấu hình hiệu lực cùng nguồn của
+từng giá trị (`env` / `dotenv` / `default`).
 
 - Server chỉ bind `127.0.0.1`, và chỉ nhận `POST`/`PUT` mang `Origin` của chính nó.
 - Mỗi lượt là một tiến trình `python -m polyglot_lc.cli translate` riêng, có
@@ -553,10 +576,9 @@ webui/                     # ứng dụng UI web (chạy polyglot_lc như tiến
 - `LLM_PROVIDER_CONCURRENCY=1` là lựa chọn thận trọng: nó tuần tự hoá các request
   trong cùng một `base_url`, nên provider trả phí sẽ chậm hơn cho tới khi bạn
   nâng lên đúng giới hạn thật. Chưa có cơ chế tự nới/thu.
-- Verifier **không** nhận glossary: nó xác minh độ đầy đủ, không thêm bớt, ngôn
-  ngữ và cấu trúc, chứ không xác minh thuật ngữ (việc đó thuộc Consistency pass).
-- Verifier chụp 2000 ký tự đầu của nguồn và của bản dịch; chunk dài hơn sẽ được
-  xác minh trên phần đầu đó.
+- Verifier nhận toàn bộ nguồn, bản dịch và glossary, nhưng phán quyết của LLM
+  vẫn có thể sai; đây không phải bảo đảm tương đương ngữ nghĩa tuyệt đối.
+  Bản vá thuật ngữ còn được đối chiếu với bản dịch trước vá.
 - **PDF dựng lại ở mức block, không phải mức content-stream.** Bản dịch được in
   vào đúng khung của block nguồn (PyMuPDF: redaction rồi chèn chữ, nhúng font
   Unicode), chứ không viết lại từng glyph trong content stream như PDFMathTranslate/

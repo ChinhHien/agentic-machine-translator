@@ -306,6 +306,18 @@ def _fallback_plan(
     )
 
 
+def _canonical_translation(text: str) -> str:
+    """Collapse a multi-form planner rendering to the form the glossary carries.
+
+    The planner sometimes answers ``"bảo mật / an toàn thông tin"``: two
+    acceptable renderings joined by a slash. Prompts and the deterministic
+    glossary check need one form, so the first is kept; the check itself still
+    accepts the alternatives when they come from a user glossary.
+    """
+    first = text.split(" / ")[0].strip()
+    return first or text
+
+
 def _parse_pairs(raw: Any, limit: int = MAX_PLANNER_TERMS) -> list[GlossaryPair]:
     pairs: list[GlossaryPair] = []
     seen: set[str] = set()
@@ -321,6 +333,7 @@ def _parse_pairs(raw: Any, limit: int = MAX_PLANNER_TERMS) -> list[GlossaryPair]
             reason = "planner"
         else:
             continue
+        translation = _canonical_translation(translation)
         if not term or not translation or term.casefold() in seen:
             continue
         seen.add(term.casefold())

@@ -38,6 +38,7 @@ from polyglot_lc.llm.resilience import (
     PermanentError,
     RateLimitError,
     TransientError,
+    TruncatedError,
     is_concurrency_limit,
 )
 
@@ -67,6 +68,7 @@ CAUSES: frozenset[str] = frozenset(
         "verify",
         "placeholder",
         "emphasis",
+        "truncated",
         "config",
         "input",
         "unknown",
@@ -97,6 +99,11 @@ def cause_for(exc: BaseException, *, step: str = "") -> str:
         return "concurrency"
     if isinstance(exc, RateLimitError):
         return "rate_limit"
+    if isinstance(exc, TruncatedError):
+        # The output budget ran out mid-reply. Not an outage, and not something
+        # the reader should be told is unclassifiable: the code knows exactly
+        # what happened and how many tokens went to thinking instead of answer.
+        return "truncated"
     if isinstance(exc, (TransientError, TimeoutError)):
         return "timeout"
     if isinstance(exc, PermanentError):

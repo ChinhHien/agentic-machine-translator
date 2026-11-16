@@ -13,9 +13,12 @@ from polyglot_lc.ingest.md import parse_markdown
 from polyglot_lc.ingest.model import Block, Document
 from polyglot_lc.ingest.pdf_layout import (
     _build_units,
+    _classify,
+    _demote_continuation_headings,
     _line_spacing,
     _page_lines,
     _table_grid,
+    _Unit,
     bind_page_geometry,
     line_spans,
     line_text,
@@ -208,6 +211,56 @@ def test_chapter_title_lines_merge_into_one_heading():
     ]
     md = pages_to_markdown([_page(lines)])
     assert md.strip() == "# Chapter 3 ArrayList"
+
+
+def test_one_oversized_glyph_does_not_turn_a_prose_line_into_a_heading():
+    """CDC 134910 page 32: one 12 pt glyph in a 9.96 pt line must not win."""
+    line = _line(["contaminated", "products", "must", "be", "diluted"], top=327.7, size=9.96)
+    line["chars"][0]["size"] = 12.0  # the footnote/encoding outlier
+    classified = _classify(0, line, heading_min=11.96, h1_min=22.0)
+    assert classified is not None
+    assert classified.kind == "body"
+
+
+def test_a_heading_that_reads_on_from_a_paragraph_is_folded_back_into_body():
+    """A mid-sentence line misclassified as a heading must not reach chunking."""
+    body = _Unit("body", "The following measures should be instituted for use of such")
+    body.rects = [(0, 72.0, 315.0, 520.0, 325.0)]
+    body.size = 9.96
+    heading = _Unit("heading", "## contaminated products. First, some disinfectants", level=2)
+    heading.rects = [(0, 72.0, 327.7, 531.0, 342.6)]
+    heading.size = 12.0
+    kept = _demote_continuation_headings([body, heading])
+    assert len(kept) == 1
+    assert kept[0].kind == "body"
+    assert "contaminated products" in kept[0].text
+
+
+def test_a_heading_opening_with_a_bullet_is_list_content_not_a_title():
+    """An oversized bullet line is a list item; keeping it as ``##`` makes every
+    faithful translation 'change the heading structure' (NIST.SP.800-53r5)."""
+    heading = _Unit("heading", "## • Separating control selection from the controls", level=2)
+    kept = _demote_continuation_headings([heading])
+    assert len(kept) == 1
+    assert kept[0].kind == "list"
+    assert kept[0].text == "- Separating control selection from the controls"
+
+
+def test_a_heading_that_reads_on_from_the_previous_heading_folds_into_it():
+    """A bullet-open heading becomes a list item, and the title line that reads
+    on from it (split across an oversized line or a page break) folds into it:
+    one block survives, not two ``##`` headings."""
+    first = _Unit("heading", "## • Separating control selection from the controls, thereby allowing the", level=2)
+    first.rects = [(3, 72.0, 315.0, 520.0, 325.0)]
+    tail = _Unit("heading", "## content to NIST SP 800-53B, Control Baselines;", level=2)
+    tail.rects = [(3, 72.0, 327.7, 531.0, 342.6)]
+    kept = _demote_continuation_headings([first, tail])
+    assert len(kept) == 1
+    assert kept[0].kind == "list"
+    assert kept[0].text.startswith("- ")
+    assert "##" not in kept[0].text
+    assert "Separating control selection" in kept[0].text
+    assert "content to NIST" in kept[0].text
 
 
 def test_cover_fields_that_each_open_with_a_bold_label_are_separate_blocks():
@@ -940,6 +993,27 @@ def test_bullet_lines_become_list_items_with_wrapped_continuation():
 def test_normalize_glyphs_collapses_doubled_ligature_and_expands():
     """This PDF doubles the ligature glyph and writes it as one codepoint."""
     assert normalize_glyphs("the eﬀﬀect of Proﬁﬁling") == "the effect of Profiling"
+
+
+def test_normalize_glyphs_repairs_utf8_mojibake_from_the_pdf_text_layer():
+    """A bullet that arrives as 'Â·' is structure the translator cannot keep.
+
+    The verifier asks for the source's structure to survive; a corrupt glyph
+    that the model normalises away then reads as a structure defect, and the
+    chunk is rejected again on every run.
+    """
+    assert normalize_glyphs("a Â· b") == "a · b"
+    assert normalize_glyphs("itâ€™s") == "it's"
+    assert normalize_glyphs("â€œquotedâ€") == '"quoted"'
+    assert normalize_glyphs("range 1â€“5") == "range 1–5"
+    assert normalize_glyphs("waitâ€¦") == "wait…"
+    assert normalize_glyphs("softÂ­hyphen") == "softhyphen"
+
+
+def test_normalize_glyphs_leaves_legitimate_vietnamese_alone():
+    """'Â' and 'â' are real Vietnamese letters; only the mojibake pairs go."""
+    text = "Ấn phẩm này nói về chữ Â và â, ế, ơ, ư."
+    assert normalize_glyphs(text) == text
 
 
 # ------------------------------- contents page -------------------------------

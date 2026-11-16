@@ -37,6 +37,27 @@ def test_router_verifier_fail_retranslates_once():
     assert after_verifier(state2) == "next"
 
 
+def test_router_gives_a_major_term_defect_two_chances_but_not_a_source_defect():
+    from polyglot_lc.agents.verifier import VerifyResult
+
+    major = VerifyResult(
+        False,
+        ["missing term"],
+        defects=[{"severity": "major", "type": "terminology"}],
+    )
+    assert after_verifier({"verify_result": major, "retranslate_count": 0}) == "retranslate"
+    assert after_verifier({"verify_result": major, "retranslate_count": 1}) == "retranslate"
+    assert after_verifier({"verify_result": major, "retranslate_count": 2}) == "next"
+
+    source = VerifyResult(
+        False,
+        ["heading structure changed"],
+        defects=[{"severity": "fatal", "type": "structure"}],
+        source_defect=True,
+    )
+    assert after_verifier({"verify_result": source, "retranslate_count": 0}) == "next"
+
+
 # ------------------------------ pipeline ------------------------------------
 def test_pipeline_end_to_end_mock(mock_env, sample_pdf_file):
     from polyglot_lc.pipeline import TranslationPipeline
@@ -49,6 +70,33 @@ def test_pipeline_end_to_end_mock(mock_env, sample_pdf_file):
     with open(result.output_path, encoding="utf-8") as fh:
         out = fh.read()
     assert out.strip()
+
+
+def test_a_soft_verifier_rejection_keeps_the_best_draft_and_warns(
+    mock_env, sample_pdf_file, monkeypatch, tmp_path
+):
+    """The chunk is reviewable, not a hole, and the run is not a hard failure."""
+    from polyglot_lc.agents.verifier import VerifierAgent, VerifyResult
+    from polyglot_lc.pipeline import TranslationPipeline
+
+    def reject(self, source, translation, *args, **kwargs):
+        return VerifyResult(
+            False,
+            ["a style note"],
+            defects=[{"severity": "major", "type": "language", "message": "style"}],
+        )
+
+    monkeypatch.setattr(VerifierAgent, "verify", reject)
+    pipeline = TranslationPipeline(quiet=True)
+    target = tmp_path / "review.md"
+    result = pipeline.run(sample_pdf_file, src="en", tgt="vi", out=str(target))
+    text = target.read_text(encoding="utf-8")
+    assert result.chunks_failed == 0
+    assert result.chunks_rejected >= 1
+    # The verdict lives in the run report and the JSONL log, not in the
+    # reader's document.
+    assert "needs review" not in text
+    assert "<!-- chunk-000: untranslated" not in text
 
 
 def test_pipeline_writes_jsonl_log(mock_env, sample_pdf_file):
@@ -67,6 +115,68 @@ def test_pipeline_writes_jsonl_log(mock_env, sample_pdf_file):
     assert required.issubset(set(lines[0].keys()))
     steps = {l["step"] for l in lines}
     assert "ingest" in steps and "translate" in steps
+
+
+def test_run_start_names_the_skill_the_run_used(mock_env, sample_pdf_file):
+    """The report must be able to say which skill shaped a run: the first
+    record carries its id/version, not only the optional promotion step."""
+    import os
+    from pathlib import Path
+
+    from polyglot_lc.pipeline import TranslationPipeline
+    from polyglot_lc.skillopt.skill_store import SkillStore
+
+    store = SkillStore(Path(os.environ["SKILLS_DIR"]))
+    store.save(instruction="Be terse.", few_shot=[], rationale="r")
+    expected = store.load()
+    os.environ["LOG_JSONL"] = "1"
+
+    result = TranslationPipeline(quiet=True).run(sample_pdf_file, src="en", tgt="vi")
+    assert result.skill_applied and result.skill_id == expected["skill_id"]
+    with open(result.log_path, encoding="utf-8") as fh:
+        start = next(
+            json.loads(line)
+            for line in fh
+            if json.loads(line).get("type") == "run_start"
+        )
+    assert start["skill"] == {
+        "id": expected["skill_id"],
+        "version": 1,
+        "scope": "system",
+        "applied": True,
+    }
+
+
+def test_each_chunk_closes_with_its_own_stats(mock_env, sample_pdf_file, monkeypatch):
+    """A finished chunk records what it cost and which model answered.
+
+    The status tab shows sizes, retries and the model behind each step from the
+    run's own log, so it never has to guess from the configuration — and a
+    fallback endpoint's model is the one that shows.
+    """
+    monkeypatch.setenv("LOG_JSONL", "1")
+    from polyglot_lc.pipeline import TranslationPipeline
+
+    result = TranslationPipeline(quiet=True).run(sample_pdf_file, src="en", tgt="vi")
+    assert result.log_path
+    with open(result.log_path, encoding="utf-8") as fh:
+        lines = [json.loads(line) for line in fh]
+    stats = [line for line in lines if line.get("type") == "chunk_stats"]
+    assert stats, "every finished chunk writes one record"
+    record = stats[0]
+    assert record["chunk_id"].startswith("chunk-")
+    assert record["source_chars"] > 0
+    assert record["target_chars"] > 0
+    assert record["path"] in {"fast", "standard", "deep"}
+    assert isinstance(record["retranslates"], int)
+    translate = [
+        line
+        for line in lines
+        if line.get("type") == "step_end" and line.get("step") == "translate"
+    ]
+    assert translate
+    assert translate[0]["agent"] == "TRANSLATOR"
+    assert translate[0]["model"]
 
 
 def test_the_run_end_record_carries_the_consistency_tally(mock_env, sample_pdf_file):
@@ -139,51 +249,43 @@ def test_a_run_with_a_glossary_reports_the_terms_it_compared(mock_env, sample_pd
     assert result.consistency_checked_terms >= 1
 
 
-def test_a_missing_verifier_is_reported_not_hidden(
-    mock_env, sample_pdf_file, monkeypatch, tmp_path
+@pytest.mark.parametrize("failure", ["unavailable", "skipped"])
+def test_unverified_translation_stops_the_run(
+    mock_env, sample_pdf_file, monkeypatch, tmp_path, failure
 ):
-    """Chunk không được ai kiểm phải đọc là "chưa kiểm", không phải "đã đạt".
+    from polyglot_lc.agents.verifier import VerificationError, VerifierAgent, VerifyResult
+    from polyglot_lc.pipeline import TranslationPipeline
 
-    Verifier lỗi vẫn trả `ok=True` để không chặn bản dịch, nhưng trước đây đó là
-    thứ duy nhất được ghi: decision ghi "verifier accepted the draft" và báo cáo
-    không có con số nào cho biết QA đã không chạy.
-    """
-    import os
+    monkeypatch.setenv("LOG_JSONL", "1")
+    asked = []
 
-    from polyglot_lc.agents.verifier import VerifierAgent, VerifyResult
-
-    os.environ["LOG_JSONL"] = "1"
-    asked: list[str] = []
-
-    def unavailable(
-        self, source, translation, src_lang, tgt_lang, glossary_md="", *, hard_issues=None
-    ):
+    def verify(self, source, translation, *args, **kwargs):
         asked.append(source)
-        return VerifyResult(ok=True, reasons=["verifier unavailable; skipped"], skipped=True)
+        if failure == "unavailable":
+            raise VerificationError("verification unavailable")
+        return VerifyResult(
+            ok=failure == "skipped", reasons=[failure], skipped=failure == "skipped"
+        )
 
-    monkeypatch.setattr(VerifierAgent, "verify", unavailable)
-    result = _run_pipeline(sample_pdf_file, tmp_path / "a.md")
-
-    assert asked, "the sample must reach the verifier for this test to mean anything"
-    assert result.verify_skipped == len(asked)
-
-    with open(result.log_path, encoding="utf-8") as fh:
-        records = [json.loads(line) for line in fh]
+    monkeypatch.setattr(VerifierAgent, "verify", verify)
+    pipeline = TranslationPipeline(quiet=True)
+    target = tmp_path / "a.md"
+    with pytest.raises(VerificationError):
+        pipeline.run(sample_pdf_file, src="en", tgt="vi", out=str(target))
+    assert len(asked) == 1
+    assert not target.exists()
+    records = [
+        json.loads(line) for line in pipeline.sink.path.read_text(encoding="utf-8").splitlines()
+    ]
     end = [record for record in records if record.get("type") == "run_end"][-1]
-    assert end["verify_skipped"] == len(asked)
-    decisions = [
-        record
-        for record in records
-        if record.get("type") == "decision" and record.get("kind") == "retranslate"
-    ]
-    assert decisions
-    assert all("accepted" not in " ".join(record["reasons"]) for record in decisions)
-    problems = [
-        record
-        for record in records
-        if record.get("type") == "error" and record.get("cause") == "verify"
-    ]
-    assert len(problems) == len(asked)
+    assert end["status"] == "failed"
+    assert end["exit_code"] == 1
+    assert end["chunks_done"] == 0
+    assert end["chunks_failed"] > 0
+    assert end["verify_skipped"] == 1
+    assert any(
+        record.get("type") == "error" and record.get("cause") == "verify" for record in records
+    )
 
 
 def test_drift_the_pass_could_not_fix_is_reported(mock_env, sample_pdf_file, monkeypatch, tmp_path):
@@ -318,6 +420,19 @@ def test_assemble_dedupes_overlapping_chunks():
     assert "Para2-again" not in out
 
 
+def test_assemble_keeps_best_effort_text_without_a_review_note():
+    """A verification warning must not turn a translated chunk into a hole —
+    and the warning belongs to the run report, not to the reader's document."""
+    from polyglot_lc.pipeline.assembler import assemble
+
+    out = assemble(
+        [_FakeChunk("c0", [0])],
+        {"c0": "Bản dịch tốt nhất"},
+    )
+    assert "Bản dịch tốt nhất" in out
+    assert "needs review" not in out
+
+
 # --------------------- truncated-translation coverage ------------------------
 def _coverage_chunk(n_paras=8):
     """A chunk whose source is *n_paras* full paragraphs."""
@@ -400,9 +515,13 @@ def test_a_cut_short_reply_is_retried_and_never_checkpointed(
     """
     from polyglot_lc.llm.client import TokenUsage, clear_mock_replies
     from polyglot_lc.llm.resilience import RetryStats
+    from polyglot_lc.pipeline import coordinator
 
     clear_mock_replies()
     _force_coverage_gate(monkeypatch)
+    monkeypatch.setattr(
+        coordinator, "coverage_error", lambda chunk, translated: "truncated translation"
+    )
     RetryStats.reset()
     first = _run_pipeline(sample_pdf_file, tmp_path / "a.md")
     assert first.chunks >= 1
@@ -422,15 +541,14 @@ def test_a_cut_short_reply_is_retried_and_never_checkpointed(
 
 def test_a_covering_reply_checkpoints_normally(mock_env, tmp_path, monkeypatch, sample_pdf_file):
     """A reply that covers its chunk passes the gate and resumes for free."""
-    from polyglot_lc.llm.client import TokenUsage, clear_mock_replies, register_mock_reply
+    from polyglot_lc.agents.context import extract_source
+    from polyglot_lc.agents.translator import TranslatorAgent
+    from polyglot_lc.llm.client import TokenUsage, clear_mock_replies
 
     clear_mock_replies()
     _force_coverage_gate(monkeypatch)
-    # The translator's own instruction line is the one prompt marker unique to
-    # its requests; its reply is long enough to cover any chunk of the sample.
-    register_mock_reply(
-        "Output ONLY the translation, no commentary.",
-        "Bản dịch đầy đủ của tài liệu mẫu. " * 40,
+    monkeypatch.setattr(
+        TranslatorAgent, "translate", lambda self, prompt, **kwargs: extract_source(prompt)
     )
     first = _run_pipeline(sample_pdf_file, tmp_path / "a.md")
     assert first.chunks >= 1
@@ -491,6 +609,52 @@ def test_a_chunk_cut_short_every_time_is_salvaged_by_splitting(
     assert TokenUsage.snapshot()["calls"] == 0
     # Leave the suite the counters it found.
     RetryStats.reset()
+
+
+def test_a_chunk_whose_reply_is_always_cut_stops_asking(
+    mock_env, tmp_path, monkeypatch, sample_pdf_file
+):
+    """A TruncatedError used to be retried with no ceiling at all.
+
+    The empty-reply and coverage paths both bound their asks and then salvage by
+    splitting; the truncation path did neither, so a chunk whose output budget
+    can never fit held the run at its progress bar for as long as the reader
+    kept the page open — paying for the same failed ask every time. A real run
+    showed exactly this shape: a reasoning model spent 3070 of 3072 tokens
+    thinking and emitted 2 tokens of translation.
+    """
+    from polyglot_lc.agents.translator import TranslatorAgent
+    from polyglot_lc.llm.client import clear_mock_replies
+    from polyglot_lc.llm.resilience import PermanentError, TruncatedError
+
+    clear_mock_replies()
+    # The wait is what makes an unbounded loop expensive; shrink it so a
+    # regression fails the assertion in about a second instead of hanging.
+    monkeypatch.setenv("CHUNK_RETRY_BASE_DELAY", "0.01")
+    monkeypatch.setenv("CHUNK_RETRY_MAX_DELAY", "0.02")
+    asks = {"n": 0}
+    valve = {"tripped": False}
+
+    def always_cut(self, prompt, **kwargs):
+        asks["n"] += 1
+        if asks["n"] > 60:
+            # Safety valve: a permanent error stops the run, so the unbounded
+            # case terminates and is reported rather than hanging the suite.
+            valve["tripped"] = True
+            raise PermanentError("safety valve: the truncation path has no ceiling")
+        raise TruncatedError(
+            "cut at the output-token limit",
+            completion_tokens=4096,
+            answer_tokens=2,
+            reasoning_tokens=4094,
+        )
+
+    monkeypatch.setattr(TranslatorAgent, "translate", always_cut)
+    result = _run_pipeline(sample_pdf_file, tmp_path / "a.md")
+
+    assert not valve["tripped"], f"asked {asks['n']} times without a ceiling"
+    assert asks["n"] < 60
+    assert result.chunks >= 1
 
 
 class _SilentGraph:

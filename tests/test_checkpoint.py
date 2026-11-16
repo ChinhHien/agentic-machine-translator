@@ -49,6 +49,41 @@ def test_put_get_roundtrip_preserves_fields(tmp_path):
     assert set(store.completed("key1")) == {"chunk-000"}
 
 
+def test_verification_failure_preserves_only_completed_checkpoints(mock_env, tmp_path):
+    from types import SimpleNamespace
+
+    from polyglot_lc.agents.verifier import VerificationError
+    from polyglot_lc.pipeline import TranslationPipeline
+    from polyglot_lc.segment.chunker import Chunk
+
+    chunks = [
+        Chunk(id=f"c{i}", text=f"Source {i}.", token_count=3, section_path=[], index=i)
+        for i in range(3)
+    ]
+    asked = []
+
+    def invoke(state, **kwargs):
+        chunk = state["chunk"]
+        asked.append(chunk.id)
+        if chunk.id == "c1":
+            raise VerificationError("verification unavailable")
+        return {"translated": "Bản dịch đã kiểm định.", "chunk": chunk}
+
+    store = CheckpointStore(tmp_path / "cp")
+    pipeline = TranslationPipeline(quiet=True)
+    with pytest.raises(VerificationError):
+        pipeline._run_chunks(
+            SimpleNamespace(invoke=invoke),
+            chunks,
+            {},
+            SimpleNamespace(advance=lambda: None),
+            store=store,
+            doc_key="document",
+        )
+    assert asked == ["c0", "c1"]
+    assert set(store.completed("document")) == {"c0"}
+
+
 def test_get_ignores_a_stale_chunk_hash(tmp_path):
     store = CheckpointStore(tmp_path / "cp")
     store.put("key1", ChunkCheckpoint("chunk-000", "old-hash", "cũ"))
@@ -106,8 +141,6 @@ def test_doc_key_changes_when_the_glossary_changes(tmp_path):
     assert _key(path, glossary="NMT\tDịch máy neural") != _key(
         path, glossary="NMT\tDịch máy nơ-ron"
     )
-    # No glossary still keys exactly as it did before the glossary was part of
-    # the identity, so old checkpoints stay reachable.
     assert base == _key(path, glossary="")
 
 
@@ -153,6 +186,342 @@ def test_full_resume_translates_nothing_again(mock_env, tmp_path):
     assert (tmp_path / "a.md").read_text(encoding="utf-8") == (tmp_path / "b.md").read_text(
         encoding="utf-8"
     )
+
+
+def test_resume_does_not_trust_legacy_checkpoints(mock_env, tmp_path, monkeypatch):
+    import hashlib
+
+    from polyglot_lc.pipeline import coordinator
+
+    monkeypatch.setattr(coordinator, "default_glossary", lambda src, tgt: {})
+    clear_mock_replies()
+    path = _write(tmp_path)
+    chunks = _chunks_of(path, max_tokens=1000)
+    digest = hashlib.sha1()
+    for part in (
+        str(path.resolve()),
+        "en",
+        "vi",
+        "mock-model",
+        *(chunk.hash() for chunk in chunks),
+        hashlib.sha256(path.read_bytes()).hexdigest(),
+    ):
+        digest.update(part.encode("utf-8"))
+        digest.update(b"\x00")
+    legacy_key = digest.hexdigest()[:16]
+    store = CheckpointStore(tmp_path / "checkpoints")
+    for chunk in chunks:
+        store.put(legacy_key, ChunkCheckpoint(chunk.id, chunk.hash(), "Legacy unchecked text"))
+    snapshots = {file: file.read_bytes() for file in store.dir_for(legacy_key).glob("*.json")}
+
+    result = _run(path, out=str(tmp_path / "checked.md"), max_tokens=1000, resume=True)
+
+    assert result.resumed_chunks == 0
+    assert "Legacy unchecked text" not in (tmp_path / "checked.md").read_text(encoding="utf-8")
+    assert all(file.read_bytes() == data for file, data in snapshots.items())
+    resumed = _run(path, out=str(tmp_path / "resumed.md"), max_tokens=1000, resume=True)
+    assert resumed.resumed_chunks == resumed.chunks
+
+
+def test_enabling_full_verification_invalidates_fast_skip_checkpoints(
+    mock_env, tmp_path, monkeypatch
+):
+    clear_mock_replies()
+    path = _write(tmp_path)
+    monkeypatch.setenv("FAST_PATH_SKIP_LLM_VERIFY", "1")
+    first = _run(path, out=str(tmp_path / "fast.md"))
+    assert first.chunks > 0
+
+    monkeypatch.setenv("FAST_PATH_SKIP_LLM_VERIFY", "0")
+    checked = _run(path, out=str(tmp_path / "checked.md"), resume=True)
+    assert checked.resumed_chunks == 0
+
+
+def test_verification_failure_records_finished_chunks_and_can_resume(
+    mock_env, tmp_path, monkeypatch
+):
+    from polyglot_lc.agents.context import extract_source
+    from polyglot_lc.agents.translator import TranslatorAgent
+    from polyglot_lc.agents.verifier import VerificationError, VerifierAgent, VerifyResult
+    from polyglot_lc.pipeline import TranslationPipeline
+
+    monkeypatch.setenv("MAX_CONCURRENCY", "1")
+    monkeypatch.setenv("CHUNK_OVERLAP_TOKENS", "0")
+    monkeypatch.setenv("LOG_JSONL", "1")
+    clear_mock_replies()
+    path = _write(tmp_path, DOC + "\nA third paragraph to translate as well.\n")
+    chunks = _chunks_of(path)
+    assert len(chunks) >= 3
+    monkeypatch.setattr(
+        TranslatorAgent, "translate", lambda self, prompt, **kw: extract_source(prompt)
+    )
+
+    def verify(self, source, *args, **kwargs):
+        if source == chunks[1].text:
+            raise VerificationError("verification unavailable")
+        return VerifyResult(ok=True, reasons=[])
+
+    monkeypatch.setattr(VerifierAgent, "verify", verify)
+    pipeline = TranslationPipeline(quiet=True)
+    with pytest.raises(VerificationError):
+        pipeline.run(path, src="en", tgt="vi", out=str(tmp_path / "stopped.md"), max_tokens=15)
+
+    end = _records_of(pipeline.sink.path, "run_end")[-1]
+    assert end["status"] == "failed"
+    assert end["chunks_done"] == 1
+    assert end["chunks_failed"] == len(chunks) - 1
+    assert end["verify_skipped"] == 1
+    named = _records_of(pipeline.sink.path, "checkpoint")[0]
+    stored = CheckpointStore(tmp_path / "checkpoints").completed(named["doc_key"])
+    assert set(stored) == {chunks[0].id}
+
+    monkeypatch.setattr(VerifierAgent, "verify", lambda *a, **kw: VerifyResult(ok=True, reasons=[]))
+    resumed = _run(path, out=str(tmp_path / "resumed.md"), max_tokens=15, resume=True)
+    assert resumed.resumed_chunks == 1
+    assert resumed.chunks_failed == 0
+
+
+@pytest.mark.parametrize("workers", [1, 4])
+@pytest.mark.parametrize("rejected_indices", [(1,), (0, 2), None])
+def test_quality_rejections_are_isolated_and_resume_only_missing_chunks(
+    mock_env, tmp_path, monkeypatch, workers, rejected_indices
+):
+    from collections import Counter
+
+    from polyglot_lc.agents.context import extract_source
+    from polyglot_lc.agents.translator import TranslatorAgent
+    from polyglot_lc.agents.verifier import VerifierAgent, VerifyResult
+    from polyglot_lc.pipeline.consistency import ConsistencyChecker
+
+    monkeypatch.setenv("MAX_CONCURRENCY", str(workers))
+    monkeypatch.setenv("CHUNK_OVERLAP_TOKENS", "0")
+    monkeypatch.setenv("LOG_JSONL", "1")
+    clear_mock_replies()
+    path = _write(tmp_path, DOC + "\nA third paragraph to translate as well.\n")
+    chunks = _chunks_of(path)
+    assert len(chunks) >= 3
+    rejected = {
+        chunks[i].id for i in (range(len(chunks)) if rejected_indices is None else rejected_indices)
+    }
+    rejected_sources = {chunk.text for chunk in chunks if chunk.id in rejected}
+    asked = []
+
+    def translate(self, prompt, chunk_id=""):
+        asked.append(chunk_id)
+        return "DRAFT " + extract_source(prompt)
+
+    def verify(self, source, *args, **kwargs):
+        return VerifyResult(ok=source not in rejected_sources, reasons=["content missing"])
+
+    original_check = ConsistencyChecker.run
+
+    def check(self, checked_chunks, translations, *args, **kwargs):
+        assert not rejected.intersection(chunk.id for chunk in checked_chunks)
+        return original_check(self, checked_chunks, translations, *args, **kwargs)
+
+    monkeypatch.setattr(TranslatorAgent, "translate", translate)
+    monkeypatch.setattr(VerifierAgent, "verify", verify)
+    monkeypatch.setattr(ConsistencyChecker, "run", check)
+    target = tmp_path / "incomplete.md"
+    result = _run(path, out=str(target), max_tokens=15)
+
+    assert Counter(asked) == Counter({c.id: 2 if c.id in rejected else 1 for c in chunks})
+    # Best-effort output: every chunk has text; rejected chunks carry a review
+    # note instead of a hole and are not checkpointed for resume.
+    assert result.chunks_failed == 0
+    assert result.chunks_rejected == len(rejected)
+    assert result.fatal_error == ""
+    assert result.verify_skipped == 0
+    assert all(any(cid in error for error in result.errors) for cid in rejected)
+    text = target.read_text(encoding="utf-8")
+    for chunk in chunks:
+        if chunk.id in rejected:
+            assert "DRAFT " + chunk.text in text
+        else:
+            assert "DRAFT " + chunk.text in text
+    # Rejected chunks still ship their best draft; the verdict is reported in
+    # the run summary, never written into the document itself.
+    assert "needs review" not in text
+    end = _records_of(Path(result.log_path), "run_end")[-1]
+    assert end["status"] == "done_with_warnings"
+    assert end["exit_code"] == 0
+    assert end["chunks_done"] == len(chunks)
+    assert end["chunks_failed"] == 0
+    assert end["chunks_rejected"] == len(rejected)
+    assert end["fatal_error"] == ""
+    named = _records_of(Path(result.log_path), "checkpoint")[0]
+    store = CheckpointStore(tmp_path / "checkpoints")
+    assert set(store.completed(named["doc_key"])) == {c.id for c in chunks} - rejected
+    snapshots = {
+        file: file.read_bytes() for file in store.dir_for(named["doc_key"]).glob("chunk-*.json")
+    }
+
+    asked.clear()
+    monkeypatch.setattr(VerifierAgent, "verify", lambda *a, **kw: VerifyResult(True, []))
+    monkeypatch.setattr(ConsistencyChecker, "run", original_check)
+    resumed = _run(path, out=str(target), max_tokens=15, resume=True)
+
+    assert Counter(asked) == Counter({cid: 1 for cid in rejected})
+    assert resumed.resumed_chunks == len(chunks) - len(rejected)
+    assert resumed.chunks_failed == resumed.chunks_rejected == 0
+    assert all(file.read_bytes() == data for file, data in snapshots.items())
+    assert "needs review" not in target.read_text(encoding="utf-8")
+    assert _records_of(Path(resumed.log_path), "run_end")[-1]["status"] == "done"
+
+
+def test_a_passing_verdict_with_praise_reasons_accepts_every_chunk(mock_env, tmp_path, monkeypatch):
+    """A pass that names no defect must ship: the reasons fallback once turned
+    the verifier's own praise into a 'major' defect and rejected every chunk."""
+    from polyglot_lc.agents.context import extract_source
+    from polyglot_lc.agents.translator import TranslatorAgent
+    from polyglot_lc.agents.verifier import VerifierAgent
+
+    monkeypatch.setenv("MAX_CONCURRENCY", "1")
+    monkeypatch.setenv("CHUNK_OVERLAP_TOKENS", "0")
+    monkeypatch.setenv("CONSISTENCY_CHECK", "0")
+    monkeypatch.setenv("FAST_PATH_SKIP_LLM_VERIFY", "0")
+    monkeypatch.setenv("LOG_JSONL", "1")
+    clear_mock_replies()
+    path = _write(tmp_path, DOC + "\nA third paragraph to translate as well.\n")
+    chunks = _chunks_of(path)
+    assert len(chunks) >= 3
+
+    monkeypatch.setattr(
+        TranslatorAgent,
+        "translate",
+        lambda self, prompt, chunk_id="": "DRAFT " + extract_source(prompt),
+    )
+    monkeypatch.setattr(
+        VerifierAgent,
+        "chat_json",
+        lambda *a, **kw: {
+            "pass": True,
+            "defects": [],
+            "reasons": ["All checks passed: complete, natural Vietnamese, structure intact."],
+        },
+    )
+    target = tmp_path / "praised.md"
+    result = _run(path, out=str(target), max_tokens=15)
+
+    assert result.chunks_rejected == 0
+    assert result.chunks_failed == 0
+    assert result.fatal_error == ""
+    assert not any("verification failed" in error for error in result.errors)
+    end = _records_of(Path(result.log_path), "run_end")[-1]
+    assert end["chunks_rejected"] == 0
+    assert end["status"] == "done"
+    text = target.read_text(encoding="utf-8")
+    for chunk in chunks:
+        assert "DRAFT " + chunk.text in text
+
+
+def test_a_glossary_term_hidden_inside_longer_words_costs_no_retranslation(
+    mock_env, tmp_path, monkeypatch
+):
+    """A real 609-chunk run rejected 27 chunks demanding 'thấp' for 'low'.
+
+    The source only ever said 'below'/'allow'/'flow'. The verdict on record was
+    ``pass=true`` with no defects; the deterministic glossary check invented the
+    failure, every chunk burned its single retranslate on a term it did not
+    contain, and the run logged "verification failed" quoting the verifier's
+    praise instead of a fault.
+    """
+    from polyglot_lc.agents.context import extract_source
+    from polyglot_lc.agents.translator import TranslatorAgent
+    from polyglot_lc.agents.verifier import VerifierAgent
+
+    monkeypatch.setenv("MAX_CONCURRENCY", "1")
+    monkeypatch.setenv("CHUNK_OVERLAP_TOKENS", "0")
+    monkeypatch.setenv("CONSISTENCY_CHECK", "0")
+    monkeypatch.setenv("FAST_PATH_SKIP_LLM_VERIFY", "0")
+    monkeypatch.setenv("LOG_JSONL", "1")
+    clear_mock_replies()
+    path = _write(
+        tmp_path,
+        "The values below are listed in the table. " * 6
+        + "\n\nAllow the flow to continue and update the candidate list. " * 6
+        + "\n\nA higher value follows the same rule. " * 6,
+    )
+    csv = tmp_path / "glossary.csv"
+    csv.write_text("low,thấp\ndate,ngày\nhigh,cao\n", encoding="utf-8")
+
+    monkeypatch.setattr(
+        TranslatorAgent,
+        "translate",
+        lambda self, prompt, chunk_id="": "DRAFT " + extract_source(prompt),
+    )
+    monkeypatch.setattr(
+        VerifierAgent,
+        "chat_json",
+        lambda *a, **kw: {"pass": True, "defects": [], "reasons": ["All checks passed."]},
+    )
+    target = tmp_path / "glossary.md"
+    result = _run(path, out=str(target), max_tokens=15, glossary=str(csv))
+
+    assert result.chunks >= 1
+    assert result.chunks_rejected == 0
+    assert result.chunks_failed == 0
+    assert not any("verification failed" in error for error in result.errors)
+    decisions = _records_of(Path(result.log_path), "decision")
+    assert not [
+        d for d in decisions if d.get("kind") == "retranslate" and d.get("chosen")
+    ], "no chunk may be sent back for a term its source does not contain"
+    assert "DRAFT The values below" in target.read_text(encoding="utf-8")
+
+
+def test_a_real_glossary_miss_is_logged_as_the_miss_not_as_praise(
+    mock_env, tmp_path, monkeypatch
+):
+    """When a chunk genuinely is rejected, the log must say what is wrong.
+
+    The run's error record used to read "verification failed after
+    retranslation: All source segments are present..." — the verifier's own
+    summary of the checks it cleared, with the actual fault buried past the
+    three reasons the graph quotes.
+    """
+    from polyglot_lc.agents.context import extract_source
+    from polyglot_lc.agents.translator import TranslatorAgent
+    from polyglot_lc.agents.verifier import VerifierAgent
+
+    monkeypatch.setenv("MAX_CONCURRENCY", "1")
+    monkeypatch.setenv("CHUNK_OVERLAP_TOKENS", "0")
+    monkeypatch.setenv("CONSISTENCY_CHECK", "0")
+    monkeypatch.setenv("FAST_PATH_SKIP_LLM_VERIFY", "0")
+    monkeypatch.setenv("LOG_JSONL", "1")
+    clear_mock_replies()
+    path = _write(tmp_path, "The impact level is low. " * 12)
+    csv = tmp_path / "glossary.csv"
+    csv.write_text("low,thấp\n", encoding="utf-8")
+
+    monkeypatch.setattr(
+        TranslatorAgent,
+        "translate",
+        lambda self, prompt, chunk_id="": "DRAFT " + extract_source(prompt),
+    )
+    monkeypatch.setattr(
+        VerifierAgent,
+        "chat_json",
+        lambda *a, **kw: {
+            "pass": True,
+            "defects": [],
+            "reasons": [
+                "Completeness: all source sentences are represented.",
+                "No additions: no invented content detected.",
+                "Language: reads naturally.",
+            ],
+        },
+    )
+    result = _run(path, out=str(tmp_path / "miss.md"), max_tokens=15, glossary=str(csv))
+
+    assert result.chunks_rejected >= 1
+    records = _records_of(Path(result.log_path), "error")
+    failures = [
+        str(r.get("message")) for r in records if "verification failed" in str(r.get("message"))
+    ]
+    assert failures, records
+    assert "thấp" in failures[0]
+    head = failures[0].split("retranslation:", 1)[-1].lstrip()
+    assert head.startswith("glossary term"), head
 
 
 def test_resume_without_checkpoints_re_translates(mock_env, tmp_path):

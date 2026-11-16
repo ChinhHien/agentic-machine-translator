@@ -27,7 +27,7 @@ from typing import Any
 
 from loguru import logger
 
-from polyglot_lc.agents.verifier import hard_checks
+from polyglot_lc.agents.verifier import VerificationError, hard_checks
 from polyglot_lc.pipeline.placeholders import repair_code_placeholders
 
 _WS_RE = re.compile(r"\s+")
@@ -147,9 +147,7 @@ class ConsistencyReport:
     labels_checked: int = 0
     drifted_labels: int = 0
     inconsistencies: int = 0
-    #: Patch requests this pass was allowed to spend (``min(budget, drifting)``).
-    #: Reported before the run so the pass's cost is not a surprise: each patch
-    #: sends one chunk's whole translation plus the glossary and gets it back.
+    #: Patch attempts; candidates passing local checks also require a Verifier request.
     patch_budget: int = 0
     patched_chunks: int = 0
     skipped_chunks: int = 0
@@ -367,6 +365,7 @@ class ConsistencyChecker:
     def __init__(
         self,
         agent: Any,
+        verifier: Any,
         *,
         max_patches: int = 5,
         enabled: bool = True,
@@ -374,6 +373,7 @@ class ConsistencyChecker:
         sink: Any = None,
     ) -> None:
         self.agent = agent
+        self.verifier = verifier
         self.max_patches = max(0, max_patches)
         self.enabled = enabled
         self.ui = ui
@@ -408,15 +408,12 @@ class ConsistencyChecker:
         if not issues:
             return translations, report
 
-        # One request per drifting chunk, carrying every term it must fix.
+        # One editor request per drifting chunk, carrying every term it must fix.
         fixes: dict[str, list[tuple[str, str]]] = {}
         for issue in issues:
             for chunk_id in issue.missing_chunks:
                 fixes.setdefault(chunk_id, []).append((issue.term, issue.expected))
-        # Worst first: a patch costs one request whatever it fixes, so with a
-        # bounded budget the chunk carrying four drifting terms is worth the
-        # same request as one carrying a single term. Document order only breaks
-        # ties, which keeps a run reproducible.
+        # Prioritize chunks with the most drifting terms; document order breaks ties.
         position = {c.id: i for i, c in enumerate(chunks)}
         ordered = sorted(
             (c for c in chunks if c.id in fixes),
@@ -461,9 +458,10 @@ class ConsistencyChecker:
                     self.sink.info("consistency", chunk.id, f"{reason} for {chunk.id}")
                 continue
             with self._step(chunk.id):
+                original = rendered.get(chunk.id, "")
                 patched = self.agent.patch(
                     source=chunk.text,
-                    translation=rendered.get(chunk.id, ""),
+                    translation=original,
                     fixes=wanted,
                     src_lang=context.get("src_lang", ""),
                     tgt_lang=context.get("tgt_lang", ""),
@@ -471,30 +469,41 @@ class ConsistencyChecker:
                     glossary_md=context.get("glossary_md", ""),
                     section_note=context.get("section_note", ""),
                 )
-            original = rendered.get(chunk.id, "")
-            if original and len(patched) < _MIN_PATCH_LENGTH_SHARE * len(original):
-                refuse(chunk.id, "rewrite lost most of the translation")
-                continue
-            # A patch is a rewrite, and the model rewriting a chunk can drop the
-            # code markers it was told to keep. Restoration at assembly is a
-            # plain ``str.replace``, so an unmentioned marker means the block is
-            # deleted without trace — repaired here, exactly as the translator's
-            # reply is repaired, and then gated like any other translation.
-            patched, repaired = repair_code_placeholders(chunk.text, patched)
-            problems = hard_checks(chunk.text, patched)
-            if problems:
-                refuse(chunk.id, "; ".join(problems[:2]))
-                continue
-            if not all(contains_term(patched, expected) for _, expected in wanted):
-                refuse(chunk.id, "expected terminology still missing")
-                continue
-            if repaired and self.sink is not None:
-                self.sink.info(
-                    "consistency",
-                    chunk.id,
-                    f"patch re-inserted {len(repaired)} dropped code marker(s)",
-                )
-            rendered[chunk.id] = patched
-            report.patched_chunks += 1
-            consecutive_refusals = 0
+                if original and len(patched) < _MIN_PATCH_LENGTH_SHARE * len(original):
+                    refuse(chunk.id, "rewrite lost most of the translation")
+                    continue
+                patched, repaired = repair_code_placeholders(chunk.text, patched)
+                problems = hard_checks(chunk.text, patched)
+                if problems:
+                    refuse(chunk.id, "; ".join(problems[:2]))
+                    continue
+                if not all(contains_term(patched, expected) for _, expected in wanted):
+                    refuse(chunk.id, "expected terminology still missing")
+                    continue
+                try:
+                    verdict = self.verifier.verify(
+                        source=chunk.text,
+                        translation=patched,
+                        src_lang=context.get("src_lang", ""),
+                        tgt_lang=context.get("tgt_lang", ""),
+                        glossary_md=context.get("glossary_md", ""),
+                        hard_issues=problems,
+                        previous_translation=original,
+                    )
+                except VerificationError as exc:
+                    refuse(chunk.id, f"semantic verification unavailable: {exc}")
+                    continue
+                if verdict.skipped or not verdict:
+                    reason = "; ".join(verdict.reasons[:2]) or "no positive verdict"
+                    refuse(chunk.id, f"semantic verification rejected: {reason}")
+                    continue
+                if repaired and self.sink is not None:
+                    self.sink.info(
+                        "consistency",
+                        chunk.id,
+                        f"patch re-inserted {len(repaired)} dropped code marker(s)",
+                    )
+                rendered[chunk.id] = patched
+                report.patched_chunks += 1
+                consecutive_refusals = 0
         return rendered, report

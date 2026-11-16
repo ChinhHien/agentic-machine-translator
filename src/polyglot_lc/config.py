@@ -57,9 +57,17 @@ SOURCE_GROUP_PREFIX = "SOURCE_GROUP_"
 
 #: Default wall-clock timeout per LLM request (seconds). Overridable globally
 #: via ``LLM_TIMEOUT`` (applies to every agent/embedding that doesn't set its
-#: own ``<NAME>_TIMEOUT`` / ``EMBED_TIMEOUT``). Kept modest so a hung endpoint
-#: can't stall the whole pipeline for minutes on end.
-DEFAULT_TIMEOUT = 45.0
+#: own ``<NAME>_TIMEOUT`` / ``EMBED_TIMEOUT``).
+#:
+#: Sized for a reasoning model, not a plain one. The SDK timeout is a *read*
+#: timeout and these calls do not stream, so nothing arrives until the whole
+#: reply is generated: it acts as a total generation deadline. A real run's
+#: translate steps had a median of 47s and a maximum of 301s (verify up to
+#: 326s) while the model thought ~6000 tokens before answering ~2600. At the
+#: old 45s default, healthy calls were killed mid-generation, fell back to a
+#: second endpoint and paid for the same chunk twice. A genuinely wedged
+#: request is still caught by the client's hard wall-clock deadline.
+DEFAULT_TIMEOUT = 300.0
 
 
 def _default_timeout() -> float:
@@ -243,7 +251,7 @@ def _agent_from_env(name: str) -> AgentConfig:
         api_key = api_key or "sk-mock"
         temperature_raw = temperature_raw or str(MOCK_TEMPERATURE)
 
-    temperature = 0.3
+    temperature = 0.0 if name == "VERIFIER" else 0.3
     if temperature_raw:
         try:
             temperature = float(temperature_raw)
@@ -339,6 +347,14 @@ class AppConfig(BaseModel):
     critic_threshold: float = Field(default=7.0, ge=0, le=10)
     refine_rounds: int = Field(default=2, ge=0)
     rb_top_k: int = Field(default=4, ge=1)
+    #: Whether a promoted SkillOpt skill is injected into the Translator prompt.
+    #: ``off`` is the control arm: same document, no skill, so two runs can be
+    #: compared honestly instead of trusting a mean from another document.
+    skill_apply: bool = True
+    #: Evidence a promotion needs: how many chunks a run must score, and by how
+    #: much its mean must beat the current skill's measured mean. A tie is noise.
+    skill_min_samples: int = Field(default=20, ge=1)
+    skill_min_gain: float = Field(default=0.2, ge=0)
     #: Bounded concurrency across independent chunks (each chunk keeps its
     #: internal Translate->Critic->Refiner->Verify order). Conservative default.
     max_concurrency: int = Field(default=1, ge=1, le=16)
@@ -353,8 +369,13 @@ class AppConfig(BaseModel):
     #: Adaptive quality pipeline: route simple, confidently-translated chunks
     #: straight to the Verifier instead of Critic -> Refiner -> Verifier.
     adaptive_quality: bool = True
-    #: Fast path gate — a chunk is simple below this complexity (0..1)...
-    fast_path_max_complexity: float = Field(default=0.35, ge=0, le=1)
+    #: Fast path gate — a chunk is simple below this complexity (0..1).
+    #: Calibrated on a real 609-chunk run: chunk complexity there spanned
+    #: 0.60-0.79 (median 0.65), because a full 700-token chunk already scores
+    #: the maximum length weight. At 0.35 — or 0.50 — not one chunk qualified,
+    #: so every chunk paid for Critic and Refiner. 0.65 admits the simpler two
+    #: thirds while still holding back the structurally heaviest chunks.
+    fast_path_max_complexity: float = Field(default=0.65, ge=0, le=1)
     #: ...and confident at or above this deterministic draft score (0..10).
     fast_path_min_score: float = Field(default=9.0, ge=0, le=10)
     #: Also skip the paid LLM verification on fast-path chunks (hard checks only).
@@ -567,6 +588,12 @@ def get_app_config() -> AppConfig:
         kwargs["refine_rounds"] = _get_int_env("REFINE_ROUNDS", 2)
     if os.getenv("RB_TOP_K"):
         kwargs["rb_top_k"] = _get_int_env("RB_TOP_K", 4)
+    if os.getenv("SKILL_APPLY"):
+        kwargs["skill_apply"] = _get_bool_env("SKILL_APPLY", True)
+    if os.getenv("SKILL_MIN_SAMPLES"):
+        kwargs["skill_min_samples"] = _get_int_env("SKILL_MIN_SAMPLES", 20)
+    if os.getenv("SKILL_MIN_GAIN"):
+        kwargs["skill_min_gain"] = _get_float_env("SKILL_MIN_GAIN", 0.2)
     if os.getenv("MAX_CONCURRENCY"):
         kwargs["max_concurrency"] = _get_int_env("MAX_CONCURRENCY", 1)
     if os.getenv("REFINE_MIN_SCORE"):
@@ -574,7 +601,7 @@ def get_app_config() -> AppConfig:
     if os.getenv("ADAPTIVE_QUALITY"):
         kwargs["adaptive_quality"] = _get_bool_env("ADAPTIVE_QUALITY", True)
     if os.getenv("FAST_PATH_MAX_COMPLEXITY"):
-        kwargs["fast_path_max_complexity"] = _get_float_env("FAST_PATH_MAX_COMPLEXITY", 0.35)
+        kwargs["fast_path_max_complexity"] = _get_float_env("FAST_PATH_MAX_COMPLEXITY", 0.65)
     if os.getenv("FAST_PATH_MIN_SCORE"):
         kwargs["fast_path_min_score"] = _get_float_env("FAST_PATH_MIN_SCORE", 9.0)
     if os.getenv("FAST_PATH_SKIP_LLM_VERIFY"):

@@ -783,6 +783,157 @@ def test_sweep_does_not_retry_a_failure_it_cannot_read(repo, planned):
     assert len(made) == 1
 
 
+@pytest.mark.parametrize(
+    ("chunks_rejected", "fatal_error", "retryable"),
+    [
+        pytest.param(1, "", False, id="quality-only"),
+        pytest.param(1, "TransientError: service unavailable", True, id="fatal-transient"),
+        pytest.param(0, "ZeroDivisionError: division by zero", False, id="fatal-bug"),
+        pytest.param(1, "ZeroDivisionError: division by zero", False, id="fatal-bug-and-quality"),
+        pytest.param(0, "PermanentError: timeout on invalid request", False, id="fatal-permanent"),
+        pytest.param(0, "", True, id="unclassified-fallback"),
+    ],
+)
+def test_sweep_uses_current_run_end_failure(repo, planned, chunks_rejected, fatal_error, retryable):
+    """Recovered Planner timeouts must not override the terminal failure."""
+    made: list = []
+    mgr = _manager(repo, made)
+    rec = _run(mgr)
+    log = mgr.logs_dir(rec.run_id) / "run_20260101_000000.jsonl"
+    log.write_text(
+        json.dumps({"step": "plan", "status": "retry", "error": "Planner timeout"})
+        + "\n"
+        + json.dumps(
+            {
+                "type": "run_end",
+                "status": "failed",
+                "chunks_failed": 1,
+                "chunks_rejected": chunks_rejected,
+                "fatal_error": fatal_error,
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    _died(mgr, rec, "Planner timeout (recovered)\nRun failed: document incomplete\n")
+
+    scheduled = mgr.sweep(now=1000.0)
+
+    stored = mgr.store.read_record(rec.run_id)
+    assert stored.status == "failed" and stored.exit_code == 1
+    assert mgr._missing_chunks(stored) == 1
+    if retryable:
+        assert [r.run_id for r in scheduled] == [rec.run_id]
+        assert stored.auto_resumes == 1
+        assert stored.retry_at == 1000.0 + AUTO_RESUME_DELAYS[0]
+        assert len(made) == 1
+        continued = mgr.sweep(now=stored.retry_at)
+        assert [r.run_id for r in continued] == [rec.run_id]
+        assert continued[0].status == "running"
+        assert made[1][0] == rec.command + ["--resume"]
+    else:
+        assert scheduled == []
+        assert stored.auto_resumes == 0 and stored.retry_at == 0.0
+        assert mgr.sweep(now=1_000_000.0) == []
+        assert len(made) == 1
+
+
+def test_manual_resume_of_quality_rejected_run_keeps_identity_and_logs(repo, planned):
+    made: list = []
+    mgr = _manager(repo, made)
+    rec = _run(mgr, glossary="g.csv", max_tokens=555)
+    log = mgr.logs_dir(rec.run_id) / "run_20260101_000000.jsonl"
+    events = (
+        json.dumps(
+            {
+                "type": "run_end",
+                "status": "failed",
+                "chunks_failed": 1,
+                "chunks_rejected": 1,
+                "fatal_error": "",
+            }
+        )
+        + "\n"
+    )
+    log.write_text(events, encoding="utf-8")
+    _died(mgr, rec, "Run failed: chunk quality rejected\n")
+
+    again = mgr.resume(rec.run_id)
+
+    assert again.run_id == rec.run_id
+    assert again.started == rec.started and again.output_path == rec.output_path
+    assert again.status == "running" and again.exit_code is None
+    assert again.auto_resumes == 0 and again.retry_at == 0.0
+    assert made[1][0] == rec.command + ["--resume"]
+    assert made[1][1]["env"]["LOGS_DIR"] == str(mgr.logs_dir(rec.run_id))
+    assert log.read_text(encoding="utf-8") == events
+
+
+@pytest.mark.parametrize(
+    ("current_end", "exit_code", "retryable"),
+    [
+        pytest.param(
+            {"status": "done", "chunks_failed": 0, "chunks_rejected": 0, "fatal_error": ""},
+            0,
+            False,
+            id="clean-attempt",
+        ),
+        pytest.param(
+            {
+                "status": "failed",
+                "chunks_failed": 1,
+                "chunks_rejected": 0,
+                "fatal_error": "TransientError: connection reset",
+            },
+            1,
+            True,
+            id="current-fatal-attempt",
+        ),
+        pytest.param({"status": "failed", "chunks_failed": 1}, 1, True, id="legacy-attempt"),
+        pytest.param(None, 1, True, id="current-attempt-without-run-end"),
+        pytest.param(None, None, False, id="current-attempt-still-running"),
+    ],
+)
+def test_sweep_ignores_quality_counts_from_previous_attempts(
+    repo, planned, current_end, exit_code, retryable
+):
+    made: list = []
+    mgr = _manager(repo, made)
+    rec = _run(mgr)
+    logs = mgr.logs_dir(rec.run_id)
+    (logs / "run_20260101_000000.jsonl").write_text(
+        json.dumps(
+            {
+                "type": "run_end",
+                "status": "failed",
+                "chunks_failed": 1,
+                "chunks_rejected": 1,
+                "fatal_error": "",
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    events = [{"type": "run_start"}]
+    if current_end is not None:
+        events.append({"type": "run_end", **current_end})
+    (logs / "run_20260101_000001.jsonl").write_text(
+        "".join(json.dumps(event) + "\n" for event in events), encoding="utf-8"
+    )
+    (logs / "stderr.log").write_text("TransientError: connection reset\n", encoding="utf-8")
+    mgr.procs[rec.run_id].returncode = exit_code
+
+    scheduled = mgr.sweep(now=1000.0)
+
+    assert [r.run_id for r in scheduled] == ([rec.run_id] if retryable else [])
+    stored = mgr.store.read_record(rec.run_id)
+    assert stored.auto_resumes == int(retryable)
+    assert stored.status == (
+        "running" if exit_code is None else "done" if exit_code == 0 else "failed"
+    )
+    assert len(made) == 1
+
+
 def test_sweep_never_touches_a_run_the_reader_stopped(repo, planned):
     """ "Dừng" is a decision, and it outranks a retryable error."""
     made: list = []

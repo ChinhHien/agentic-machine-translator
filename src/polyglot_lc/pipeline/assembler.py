@@ -220,6 +220,9 @@ def assemble(
     replay that survived the cut is folded only across the chunk boundary where
     it can occur (:func:`_repeat_of`). Shielded code blocks are restored from
     *code_map* while each chunk is placed.
+
+    Review warnings are not written into the document — a reader gets clean
+    Markdown, and the verdicts live in the run report and the JSONL log.
     """
     paragraphs: list[str] = []
     for i, chunk in enumerate(chunks):

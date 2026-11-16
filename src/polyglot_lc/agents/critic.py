@@ -60,7 +60,7 @@ class CriticAgent(Agent):
         ]
         dynamic = (
             "You are a meticulous translation critic.\n"
-            f"Translation ({tgt_lang}):\n{draft[:2500]}\n\n"
+            f"Translation ({tgt_lang}):\n{draft}\n\n"
             "Score fidelity, fluency, terminology and structure from 0 to 10 "
             "against this rubric:\n"
             "- 9-10: publishable as-is; nothing a careful editor would touch.\n"

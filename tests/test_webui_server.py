@@ -781,6 +781,98 @@ def _names_checkpoints(api, path):
     )
 
 
+# --- One chunk's own record -------------------------------------------------
+
+
+def _chunk_events(api, events):
+    """Pin the event stream this run answers with, checkpoint record included."""
+    api.manager.events = lambda rid, after: (events, len(events), 0)
+
+
+def test_one_chunks_record_carries_its_steps_models_text_and_log(api, tmp_path):
+    api.runs.write_record(record(api.root, "r1", chunks=3))
+    directory = _checkpoints(tmp_path, {"chunk-001": "Câu dịch."})
+    log_dir = api.root / "logs" / "webui" / "r1"
+    log_dir.mkdir(parents=True, exist_ok=True)
+    (log_dir / "stderr.log").write_text(
+        "translate chunk-001: ok\n"
+        "translate chunk-002: ok\n"
+        "VERIFIER failed chunk-001: api_key=sk-live-secret\n",
+        encoding="utf-8",
+    )
+    _chunk_events(
+        api,
+        [
+            {"type": "checkpoint", "doc_key": "abc123", "path": str(directory)},
+            {
+                "type": "step_start",
+                "step": "translate",
+                "chunk_id": "chunk-001",
+                "status": "start",
+                "agent": "TRANSLATOR",
+                "model": "m1",
+            },
+            {
+                "type": "step_end",
+                "step": "translate",
+                "chunk_id": "chunk-001",
+                "status": "ok",
+                "latency": 12.0,
+                "tokens": {"sent": 10, "received": 20, "cached": 0},
+                "agent": "TRANSLATOR",
+                "model": "m1",
+            },
+            {
+                "type": "chunk_stats",
+                "chunk_id": "chunk-001",
+                "source_chars": 100,
+                "target_chars": 120,
+                "path": "standard",
+                "retranslates": 1,
+            },
+        ],
+    )
+    payload = json.loads(call(api, "GET", "/api/runs/r1/chunks/chunk-001").body)
+    assert payload["stats"]["source_chars"] == 100
+    assert [step["step"] for step in payload["steps"]] == ["translate", "translate"]
+    assert payload["steps"][1]["model"] == "m1"
+    assert payload["steps"][1]["tokens"]["received"] == 20
+    assert payload["text"]["stored"] is True
+    assert payload["text"]["chars"] == len("Câu dịch.")
+    # Only the lines naming this chunk, and never a credential inside them.
+    assert len(payload["log"]) == 2
+    assert all("chunk-001" in line for line in payload["log"])
+    assert "sk-live-secret" not in "".join(payload["log"])
+
+
+def test_one_chunks_record_refuses_an_id_the_run_does_not_have(api):
+    api.runs.write_record(record(api.root, "r1", chunks=2))
+    _chunk_events(api, [])
+    # Past the run's own chunk count, not shaped like an id, and a run that is
+    # not there at all.
+    assert call(api, "GET", "/api/runs/r1/chunks/chunk-009").status == 404
+    assert call(api, "GET", "/api/runs/r1/chunks/chunk-abc").status == 404
+    assert call(api, "GET", "/api/runs/nope/chunks/chunk-000").status == 404
+
+
+def test_one_chunks_record_includes_the_rejected_draft(api, tmp_path):
+    api.runs.write_record(record(api.root, "r1", chunks=2))
+    directory = _checkpoints(tmp_path, {})
+    rejected = directory.parent / "rejected" / directory.name
+    rejected.mkdir(parents=True)
+    (rejected / "chunk-000.json").write_text(
+        json.dumps(
+            {"chunk_id": "chunk-000", "translated": "Bản nháp.", "reason": "thiếu thuật ngữ"}
+        ),
+        encoding="utf-8",
+    )
+    _chunk_events(api, [{"type": "checkpoint", "doc_key": "abc123", "path": str(directory)}])
+    payload = json.loads(call(api, "GET", "/api/runs/r1/chunks/chunk-000").body)
+    assert payload["rejected"]["chars"] == len("Bản nháp.")
+    assert payload["rejected"]["head"] == "Bản nháp."
+    assert payload["has_events"] is False
+
+
 def test_the_translation_so_far_comes_out_of_the_runs_own_chunks(api, tmp_path):
     """A run writes each finished chunk's own text as that chunk completes, so
     the column a reader compares against can fill in behind the run instead of
@@ -1390,10 +1482,47 @@ def test_every_control_has_a_label_and_live_regions_are_marked():
     assert len(scan.ids) == len(set(scan.ids)), "duplicate element id"
 
 
-def test_the_page_has_no_developer_surface():
-    """The redesign's whole point: what the product does not offer, it does not
-    offer anywhere — no settings screen, no key status, no demo switch, no raw
-    step log, and no `.env` name anywhere in the shipped assets."""
+def test_the_library_can_be_searched_by_uploaded_file_name():
+    """The uploaded documents are found by name, not by their place in a list.
+
+    The box narrows the same list the status chips do, matches a name typed
+    without diacritics, and says when the query is what emptied the list.
+    """
+    from pathlib import Path
+
+    static = Path(__file__).resolve().parents[1] / "webui" / "static"
+    html = (static / "index.html").read_text(encoding="utf-8")
+    js = (static / "app.js").read_text(encoding="utf-8")
+    assert 'id="jobs-search"' in html and 'for="jobs-search"' in html
+    for hook in ("foldText", "state.query", 'querySelector(".job-row")'):
+        assert hook in js, hook
+    assert "Không có tài liệu nào khớp" in js
+
+
+def test_the_translation_column_can_be_searched():
+    """A reader looking for one term in a hundred-page translation gets a box in
+    the reading tools: it says how many matches it found, Enter and Shift+Enter
+    walk them, Esc empties it, and the matches are marked with nodes around the
+    document's own text — never by inserting the query as markup."""
+    from pathlib import Path
+
+    static = Path(__file__).resolve().parents[1] / "webui" / "static"
+    html = (static / "index.html").read_text(encoding="utf-8")
+    js = (static / "app.js").read_text(encoding="utf-8")
+    for needed in ('id="find-target"', 'id="find-count"', 'id="find-prev"', 'id="find-next"'):
+        assert needed in html, needed
+    assert 'for="find-target"' in html
+    for hook in ("highlightTarget", "moveFind", "findRanges", "MAX_FIND_MATCHES", "find-hit"):
+        assert hook in js, hook
+    assert 'event.key === "Enter"' in js and 'event.key === "Escape"' in js
+    assert 'createElement("mark")' in js
+
+
+def test_the_page_has_a_settings_dialog_and_no_demo_switch():
+    """The settings dialog may hold endpoint overrides (webui.settings), but the
+    page still offers no demo switch and no raw `.env` view either: `.env` is
+    named only as the fallback the pipeline returns to, and a stored key is
+    never echoed back into any field."""
     from pathlib import Path
 
     static = Path(__file__).resolve().parents[1] / "webui" / "static"
@@ -1401,18 +1530,14 @@ def test_the_page_has_no_developer_surface():
         name: (static / name).read_text(encoding="utf-8")
         for name in ("index.html", "app.css", "app.js")
     }
-    for forbidden in (
-        "api/config",
-        "Tùy chọn dịch",
-        "Chạy thử",
-        "API key",
-        "/api/inputs?config",
-        ".env",
-        "LLM_MOCK",
-        "EDITABLE",
-    ):
+    for forbidden in ("Tùy chọn dịch", "Chạy thử", "/api/inputs?config", "LLM_MOCK", "EDITABLE"):
         for name, text in shipped.items():
             assert forbidden not in text, (name, forbidden)
+    # The settings dialog exists, under the ids it is wired by.
+    for needed in ("settings-open", "settings-form", "openSettingsDialog", "dialog--settings"):
+        assert any(needed in text for text in shipped.values()), needed
+    # The key field shows a mask placeholder, never a stored key.
+    assert "••••••" in shipped["app.js"]
     # No inline markup built from server text, ever.
     assert "innerHTML" not in shipped["app.js"]
     assert "insertAdjacentHTML" not in shipped["app.js"]

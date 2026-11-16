@@ -45,6 +45,9 @@
  *   .chip[aria-pressed=true]            the filter in force
  *   .view-switch button[aria-pressed=true]   the layout in force
  *   .tab[aria-selected=true]            the detail tab in force
+ *   .settings-card[data-state=idle|testing|ok|fail]  one endpoint's test verdict
+ *   .settings-card--off                 a card the mode checkbox stands down
+ *   .settings-status[data-state=…]      the same verdict, on the dot itself
  *   .preloader--leaving                  the first paint on its way out
  */
 
@@ -779,6 +782,102 @@ code { font-family: var(--font-data); font-size: 0.92em; }
   color: var(--warn);
 }
 
+/* A row opens onto the chunk's own record: the numbers a reader compares across
+   chunks first, then the step timeline, then what only the server can serve —
+   the saved translation and the run's log lines naming this chunk. */
+.chunk-panel {
+  grid-column: 1 / -1;
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-2);
+  margin: var(--sp-2) 0 0;
+  padding: var(--sp-3);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: var(--surface);
+  font-size: var(--fs-xs);
+  cursor: auto;
+  text-align: left;
+}
+
+.chunk-facts {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(140px, 1fr));
+  gap: var(--sp-2) var(--sp-3);
+}
+
+.chunk-fact { display: flex; flex-direction: column; gap: 2px; }
+.chunk-fact-label { color: var(--muted); }
+.chunk-fact-value { color: var(--text); }
+.chunk-fact-value.chunk-metrics { font-family: var(--font-data); }
+
+.chunk-panel-title {
+  font-size: var(--fs-xs);
+  font-weight: 600;
+  letter-spacing: 0.03em;
+  text-transform: uppercase;
+  color: var(--muted);
+}
+
+.chunk-steps {
+  list-style: none;
+  margin: 0;
+  padding: 0 0 0 var(--sp-3);
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  border-left: 1px solid var(--border);
+}
+
+.chunk-step { display: flex; flex-wrap: wrap; align-items: baseline; gap: var(--sp-2); }
+.chunk-step-name { color: var(--text); }
+.chunk-step-model,
+.chunk-step-latency,
+.chunk-step-tokens { font-family: var(--font-data); color: var(--muted); }
+.chunk-step[data-state="fail"] .chunk-step-name { color: var(--danger); }
+.chunk-step[data-state="running"] .chunk-step-name { color: var(--accent); }
+.chunk-step-error {
+  flex-basis: 100%;
+  color: var(--danger);
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+.chunk-decisions {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.chunk-decision { display: flex; flex-wrap: wrap; gap: var(--sp-2); }
+.chunk-decision-kind { color: var(--soft); }
+.chunk-decision-why { color: var(--muted); }
+
+.chunk-detail { display: flex; flex-direction: column; gap: var(--sp-1); }
+
+.chunk-text,
+.chunk-log {
+  margin: 0;
+  padding: var(--sp-2);
+  max-height: 12rem;
+  overflow: auto;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: var(--sunken);
+  color: var(--soft);
+  font-family: var(--font-data);
+  font-size: var(--fs-xs);
+  line-height: 1.5;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+.chunk-log { color: var(--muted); }
+.chunk-panel-note { color: var(--muted); }
+
 /* Set just before the bar is made `hidden`; the stylesheet's reduced-motion
    rule drops the transition, so it disappears at once there. */
 .banner--leaving { opacity: 0; }
@@ -886,6 +985,38 @@ code { font-family: var(--font-data); font-size: 0.92em; }
   transition: max-height var(--dur-2) var(--ease), margin-bottom var(--dur-2) var(--ease),
     opacity var(--dur-1) var(--ease);
 }
+
+/* The library's search box: one line under the head, above the status chips,
+   so it narrows the same list the chips do. It folds away with them. */
+.rail-search {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-2);
+  height: 32px;
+  padding: 0 var(--sp-2);
+  margin-bottom: var(--sp-2);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: var(--surface);
+  max-height: 32px;
+  overflow: hidden;
+  transition: max-height var(--dur-2) var(--ease), margin-bottom var(--dur-2) var(--ease),
+    opacity var(--dur-1) var(--ease);
+}
+.rail-search:focus-within { border-color: var(--accent); }
+.rail-search > .icon { flex: none; width: 14px; height: 14px; color: var(--muted); }
+.rail-search input {
+  flex: 1;
+  min-width: 0;
+  border: 0;
+  padding: 0;
+  background: transparent;
+  color: var(--text);
+  font: inherit;
+  font-size: var(--fs-sm);
+}
+.rail-search input:focus { outline: none; }
+.rail-search input::placeholder { color: var(--muted); }
 
 .rail .chips {
   max-height: 64px;
@@ -1086,6 +1217,7 @@ code { font-family: var(--font-data); font-size: 0.92em; }
    being left there by a word that vanished in one frame. */
 .layout[data-rail="collapsed"] .rail-name { flex-basis: 0; opacity: 0; }
 .layout[data-rail="collapsed"] .rail-head,
+.layout[data-rail="collapsed"] .rail-search,
 .layout[data-rail="collapsed"] .chips {
   max-height: 0;
   margin-bottom: 0;
@@ -1699,6 +1831,46 @@ code { font-family: var(--font-data); font-size: 0.92em; }
    workspace takes the whole window. */
 .panes-tools { flex: none; display: flex; align-items: center; gap: var(--sp-2); }
 
+/* Finding a phrase in the translation: the field, how many matches it has and
+   the two arrows that walk them, in the same row as the layout switch. */
+.pane-find {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-1);
+  height: 32px;
+  padding: 0 var(--sp-2);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: var(--surface);
+}
+.pane-find:focus-within { border-color: var(--accent); }
+.pane-find > .icon { width: 14px; height: 14px; color: var(--muted); }
+.pane-find-input {
+  width: 13rem;
+  min-width: 0;
+  border: 0;
+  padding: 0;
+  background: transparent;
+  color: var(--text);
+  font: inherit;
+  font-size: var(--fs-sm);
+}
+.pane-find-input:focus { outline: none; }
+.pane-find-input::placeholder { color: var(--muted); }
+.pane-find-count {
+  min-width: 2.5rem;
+  text-align: right;
+  font-size: var(--fs-xs);
+  color: var(--muted);
+  font-variant-numeric: tabular-nums;
+}
+.pane-find-count:empty { display: none; }
+.pane-find .find-nav { width: 24px; height: 24px; font-size: var(--fs-sm); line-height: 1; }
+/* The reader's matches sit over the column's own text: quiet while they are
+   only found, the accent one the arrow has walked to. */
+.find-hit { background: var(--accent-weak); color: inherit; border-radius: 2px; }
+.find-hit--current { background: var(--accent); color: #FFFFFF; }
+
 .seg--toggle { display: inline-flex; align-items: center; gap: var(--sp-2); }
 .seg--toggle .icon { width: 14px; height: 14px; }
 /* The toggle in force is the accent one, the same way the layout button is. */
@@ -1882,6 +2054,151 @@ code { font-family: var(--font-data); font-size: 0.92em; }
 .dialog--confirm .dialog-form { gap: var(--sp-3); }
 .confirm-copy { font-size: var(--fs-sm); line-height: 1.5; color: var(--soft); }
 
+/* ------------------------------------------------------------ settings */
+
+/* Seven endpoint cards in two columns — wider than the other dialogs, since
+   the cards, not the prose, are the content. Everything else keeps the same
+   skin so the dialog reads as the same place. */
+.dialog--settings { width: min(880px, calc(100vw - 2 * var(--sp-5))); }
+
+.settings-note { font-size: var(--fs-sm); line-height: 1.55; color: var(--muted); }
+.settings-note strong { color: var(--soft); }
+.settings-note code { font-family: var(--font-data); font-size: var(--fs-sm); color: var(--soft); }
+
+.settings-toggle { align-self: flex-start; }
+.settings-toggle span { font-weight: 500; }
+
+.settings-cards {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: var(--sp-3);
+  align-items: start;
+}
+
+.settings-card {
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-2);
+  padding: var(--sp-3);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: var(--sunken);
+  transition: opacity var(--dur-1) var(--ease);
+}
+
+/* The mode the checkbox is not in: still showing what was typed — nothing is
+   lost when the reader flips back — but clearly out of the picture. */
+.settings-card--off { opacity: 0.45; }
+.settings-card--off .input { pointer-events: none; }
+
+.settings-card-head { display: flex; align-items: center; gap: var(--sp-2); }
+.settings-card-naming { flex: 1; min-width: 0; }
+.settings-card-title { font-size: var(--fs-md); font-weight: 600; }
+.settings-card-hint { font-size: var(--fs-xs); line-height: 1.4; color: var(--muted); }
+
+/* The card that has the reader's cursor in it says so, so a column of seven
+   look-alike outlines still answers "which one am I typing in?". */
+.settings-card:focus-within { border-color: var(--accent); }
+
+/* URL and model share one row — the two halves of an address — so a card is
+   two lines instead of three and the grid reads as a list, not a wall. */
+.settings-card-pair {
+  display: grid;
+  grid-template-columns: minmax(0, 1.2fr) minmax(0, 1fr);
+  gap: var(--sp-2);
+}
+
+.settings-card .input { font-size: var(--fs-sm); }
+
+.settings-clear { width: 28px; height: 28px; color: var(--muted); }
+.settings-clear:hover { color: var(--danger); }
+
+.settings-line { display: flex; flex-direction: column; gap: 2px; }
+.settings-line .label { font-size: var(--fs-xs); color: var(--muted); }
+
+/* The test's verdict, one glyph where the title names it exactly: a quiet dot
+   while nothing has been tried, a live dot while the probe runs, the tick and
+   the cross once it has answered. */
+.settings-status {
+  flex: none;
+  width: 18px;
+  height: 18px;
+  margin-top: 2px;
+  display: grid;
+  place-items: center;
+  font-size: 12px;
+  font-weight: 700;
+  line-height: 1;
+}
+
+.settings-status[data-state="idle"]::after {
+  content: "";
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: var(--border-strong);
+}
+.settings-status[data-state="testing"]::after {
+  content: "";
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: var(--warn);
+  animation: settings-pulse 0.9s ease-in-out infinite;
+}
+.settings-status[data-state="ok"]::after { content: "✓"; color: var(--ok); }
+.settings-status[data-state="fail"]::after { content: "✗"; color: var(--danger); }
+
+@keyframes settings-pulse {
+  50% { opacity: 0.3; }
+}
+
+.settings-card-note { font-size: var(--fs-xs); color: var(--muted); }
+.settings-card[data-state="ok"] .settings-card-note { color: var(--ok); }
+.settings-card[data-state="fail"] .settings-card-note { color: var(--danger); }
+
+.settings-hint { font-size: var(--fs-xs); color: var(--muted); }
+.settings-legend { line-height: 1.5; }
+.settings-legend .ok { color: var(--ok); }
+
+/* The numeric controls are one group — how a run spends the provider — so they
+   sit under a rule of their own rather than trailing the endpoint cards. */
+.settings-limits {
+  padding-top: var(--sp-3);
+  border-top: 1px solid var(--border);
+}
+
+.settings-section-title {
+  font-size: var(--fs-xs);
+  font-weight: 600;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  color: var(--muted);
+  margin-bottom: var(--sp-2);
+}
+
+.settings-limits-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: var(--sp-4);
+  align-items: start;
+}
+
+.settings-limits .settings-legend { margin-top: var(--sp-2); }
+
+/* The save row keeps its own edge, so the scrolling cards never touch it. */
+.dialog--settings .dialog-actions {
+  padding-top: var(--sp-3);
+  border-top: 1px solid var(--border);
+}
+
+@media (max-width: 719px) {
+  .settings-cards { grid-template-columns: 1fr; }
+  .settings-card-pair { grid-template-columns: 1fr; }
+  .settings-limits-grid { grid-template-columns: 1fr; gap: var(--sp-3); }
+}
+
+
 .grid-2 { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: var(--sp-4); }
 
 .field { display: flex; flex-direction: column; gap: var(--sp-1); }
@@ -2032,6 +2349,9 @@ code { font-family: var(--font-data); font-size: 0.92em; }
   .crumb-root, .crumb-sep, .panes-note-label { display: none; }
   .seg { padding: 8px 12px; }
   .icon-btn { width: 40px; height: 40px; }
+  /* The tools wrap on a phone, so the field gives back some of its width. */
+  .pane-find-input { width: 8rem; }
+  .pane-find .find-nav { width: 32px; height: 32px; }
   /* Nothing hovers on a touch screen: the row's own action is simply there. */
   .job-delete { opacity: 1; }
   .grid-2 { grid-template-columns: minmax(0, 1fr); }

@@ -16,7 +16,10 @@ def store(tmp_path):
 
 
 @pytest.fixture()
-def optimizer(store, mock_env):
+def optimizer(store, mock_env, monkeypatch):
+    # Three chunks are enough here: the gate itself is tested with its own
+    # values, and a 20-chunk run per test would only make the suite slower.
+    monkeypatch.setenv("SKILL_MIN_SAMPLES", "3")
     return SkillOptimizer(store, PlannerAgent(get_agent_config("PLANNER")))
 
 
@@ -25,42 +28,91 @@ def optimizer(store, mock_env):
 
 def test_skill_md_round_trip(store):
     path = store.save(
-        "en", "vi", instruction="Be terse.", few_shot=["a => b"], rationale="why", mean_score=8.42
+        instruction="Be terse.", few_shot=["a => b"], rationale="why", mean_score=8.42
     )
-    assert path == store.dir / "en-vi" / "skill.md"
-    loaded = store.load("en", "vi")
+    assert path == store.path
+    loaded = store.load()
     assert loaded["instruction"] == "Be terse."
     assert loaded["few_shot"] == ["a => b"]
     assert loaded["rationale"] == "why"
     assert loaded["mean_score"] == pytest.approx(8.42)
-    assert loaded["src_lang"] == "en" and loaded["tgt_lang"] == "vi"
+    assert loaded["scope"] == "system"
+    assert loaded["schema"] == 2 and loaded["version"] == 1
+    assert loaded["measured_runs"] == 1
+    assert len(loaded["skill_id"]) == 8
+    # A version is stored as it was promoted: overwriting must stay auditable.
+    assert (store.versions_dir / "v1.md").exists()
+
+
+def test_schema_one_file_still_loads(store):
+    """The old format (no schema/version lines) reads as a v1 baseline."""
+    folder = store.dir
+    folder.mkdir(parents=True)
+    (folder / "skill.md").write_text(
+        "---\nmean_score: 9.8\nscores: [8.0, 10.0]\nskill_id: old-format\n---\n"
+        "Instruction\nBe terse.\n\nFew-shot\na => b\n\nRationale\nwhy\n",
+        encoding="utf-8",
+    )
+    loaded = store.load()
+    assert loaded["schema"] == 1 and loaded["version"] == 1
+    assert loaded["baseline_mean"] == pytest.approx(9.8)
+    assert loaded["measured_runs"] == 0
+    assert loaded["instruction"] == "Be terse."
+
+
+def test_heading_levels_and_bullets_are_content_free(store):
+    folder = store.dir
+    folder.mkdir(parents=True)
+    (folder / "skill.md").write_text(
+        "---\nschema: 2\n---\n## Instruction\nKeep placeholders.\n"
+        "### Few-shot\n- a => b\n* c => d\n### Rationale\nbecause\n",
+        encoding="utf-8",
+    )
+    loaded = store.load()
+    assert loaded["instruction"] == "Keep placeholders."
+    assert loaded["few_shot"] == ["a => b", "c => d"]
+    assert loaded["rationale"] == "because"
+
+
+def test_save_flattens_and_caps_few_shot(store):
+    store.save(
+        instruction="x",
+        few_shot=["- a => b\nsecond line", "c => d", "e => f", "g => h"],
+        rationale="r",
+    )
+    loaded = store.load()
+    assert loaded["few_shot"] == ["a => b second line", "c => d", "e => f"]
+
+
+def test_save_refuses_empty_instruction(store):
+    with pytest.raises(ValueError):
+        store.save(instruction="  ", few_shot=[], rationale="r")
 
 
 def test_record_score_clips_to_50(store):
-    store.save("en", "vi", instruction="x", few_shot=[], rationale="r", mean_score=0.0)
+    store.save(instruction="x", few_shot=[], rationale="r", mean_score=0.0)
     for i in range(60):
-        store.record_score("en", "vi", float(i % 10))
-    assert len(store.load("en", "vi")["scores"]) == 50
+        store.record_score(float(i % 10))
+    assert len(store.load()["scores"]) == 50
 
 
 def test_mean_recent_uses_last_20(store):
-    store.save("en", "vi", instruction="x", few_shot=[], rationale="r", mean_score=0.0)
+    store.save(instruction="x", few_shot=[], rationale="r", mean_score=0.0)
     for i in range(25):
-        store.record_score("en", "vi", 1.0 if i < 5 else 9.0)
-    assert store.mean_recent("en", "vi") == pytest.approx(9.0)
-    assert store.mean_recent("en", "vi", n=50) == pytest.approx((5 * 1.0 + 20 * 9.0) / 25)
+        store.record_score(1.0 if i < 5 else 9.0)
+    assert store.mean_recent() == pytest.approx(9.0)
+    assert store.mean_recent(n=50) == pytest.approx((5 * 1.0 + 20 * 9.0) / 25)
 
 
 def test_mean_recent_drops_nan_and_missing(store):
-    store.save("en", "vi", instruction="x", few_shot=[], rationale="r", mean_score=0.0)
-    store.record_score("en", "vi", 8.0)
-    store.record_score("en", "vi", float("nan"))
-    assert store.mean_recent("en", "vi") == pytest.approx(8.0)
-    assert store.load("en", "fr") is None
+    store.save(instruction="x", few_shot=[], rationale="r", mean_score=0.0)
+    store.record_score(8.0)
+    store.record_score(float("nan"))
+    assert store.mean_recent() == pytest.approx(8.0)
 
 
 def test_save_writes_atomically_with_no_tmp_left(store):
-    store.save("en", "vi", instruction="x", few_shot=[], rationale="r", mean_score=1.0)
+    store.save(instruction="x", few_shot=[], rationale="r", mean_score=1.0)
     assert not list(store.dir.rglob("*.tmp"))
 
 
@@ -82,9 +134,11 @@ def test_a_locked_skill_is_replaced_after_a_brief_retry(store, monkeypatch):
         return original(self, target)
 
     monkeypatch.setattr(Path, "replace", flaky)
-    store.save("en", "vi", instruction="Be terse.", few_shot=[], rationale="r", mean_score=8.0)
-    assert calls["n"] == 3
-    assert store.load("en", "vi")["instruction"] == "Be terse."
+    store.save(instruction="Be terse.", few_shot=[], rationale="r", mean_score=8.0)
+    # The skill and its version snapshot both go through ``replace``: the
+    # retries belong to each write, not to the save as a whole.
+    assert calls["n"] >= 3
+    assert store.load()["instruction"] == "Be terse."
     assert not list(store.dir.rglob("*.tmp"))
 
 
@@ -97,36 +151,36 @@ def test_a_skill_held_open_is_still_written(store, monkeypatch):
 
     monkeypatch.setattr(Path, "replace", denied)
     path = store.save(
-        "en", "vi", instruction="Keep this.", few_shot=[], rationale="r", mean_score=8.0
+        instruction="Keep this.", few_shot=[], rationale="r", mean_score=8.0
     )
     assert "Keep this." in path.read_text(encoding="utf-8")
-    assert store.load("en", "vi")["instruction"] == "Keep this."
+    assert store.load()["instruction"] == "Keep this."
     assert not list(store.dir.rglob("*.tmp"))
 
 
 def test_load_corrupt_file_is_none(store):
-    path = store.dir / "en-vi"
+    path = store.dir
     path.mkdir(parents=True)
     (path / "skill.md").write_text("not a skill at all", encoding="utf-8")
-    assert store.load("en", "vi") is None
+    assert store.load() is None
 
 
 def test_record_score_before_first_promotion_keeps_scores(store):
-    store.record_score("en", "vi", 7.0)
-    store.record_score("en", "vi", 9.0)
-    assert store.load("en", "vi") is None  # no instruction => not a skill yet
-    assert store.mean_recent("en", "vi") == pytest.approx(8.0)
+    store.record_score(7.0)
+    store.record_score(9.0)
+    assert store.load() is None  # no instruction => not a skill yet
+    assert store.mean_recent() == pytest.approx(8.0)
 
 
 def test_save_and_record_score_do_not_clobber_each_other(store):
     store.save(
-        "en", "vi", instruction="Keep me.", few_shot=["a => b"], rationale="r", mean_score=5.0
+        instruction="Keep me.", few_shot=["a => b"], rationale="r", mean_score=5.0
     )
-    store.record_score("en", "vi", 9.0)
-    assert store.load("en", "vi")["instruction"] == "Keep me."
-    assert store.load("en", "vi")["scores"] == [9.0]
-    store.save("en", "vi", instruction="Replaced.", few_shot=[], rationale="r2", mean_score=6.0)
-    assert store.load("en", "vi")["scores"] == [9.0]  # scores survive a promotion
+    store.record_score(9.0)
+    assert store.load()["instruction"] == "Keep me."
+    assert store.load()["scores"] == [9.0]
+    store.save(instruction="Replaced.", few_shot=[], rationale="r2", mean_score=6.0)
+    assert store.load()["scores"] == [9.0]  # scores survive a promotion
 
 
 # ---------------------------- promotion logic ------------------------------
@@ -137,68 +191,153 @@ def test_first_promotion_when_no_skill(optimizer, store):
         optimizer.observe("en", "vi", "prompt", "output", s)
     skill = optimizer.maybe_promote("en", "vi")
     assert skill is not None
-    assert skill["mean_score"] == pytest.approx(6.5)
-    saved = store.load("en", "vi")
+    # The run was translated by the previous (absent) skill: the new version
+    # has no measurement of its own yet, and says so.
+    assert skill["mean_score"] is None
+    assert skill["measured_runs"] == 0
+    assert skill["baseline_mean"] == pytest.approx(0.0)
+    saved = store.load()
     assert saved is not None and saved["instruction"]
 
 
 def test_no_promotion_without_history(optimizer, store):
     assert optimizer.maybe_promote("en", "vi") is None
-    assert store.load("en", "vi") is None
+    assert store.load() is None
 
 
-def test_regression_not_promoted(optimizer, store):
-    # First promote a good skill.
+def test_a_new_version_is_measured_before_it_is_judged(optimizer, store):
     for s in (8.0, 8.5, 9.0):
         optimizer.observe("en", "vi", "p", "o", s)
     first = optimizer.maybe_promote("en", "vi")
-    assert first is not None
-    saved = store.load("en", "vi")
-    # Then worse scores -> the skill content must NOT be replaced (the score
-    # history legitimately grows in the same file).
+    assert first is not None and first["version"] == 1
+    # The next run uses v1 and measures it; no second promotion on that same
+    # measurement, however high it is.
     optimizer2 = SkillOptimizer(store, optimizer.planner)
-    for s in (3.0, 3.5, 4.0):
+    for s in (8.0, 8.5, 9.0):
         optimizer2.observe("en", "vi", "p", "o", s)
     assert optimizer2.maybe_promote("en", "vi") is None
-    later = store.load("en", "vi")
-    assert later["instruction"] == saved["instruction"]
-    assert later["few_shot"] == saved["few_shot"]
-    assert later["mean_score"] == saved["mean_score"]
+    measured = store.load()
+    assert measured["version"] == 1
+    assert measured["mean_score"] == pytest.approx(8.5)
+    assert measured["measured_runs"] == 1
+
+
+def test_regression_not_promoted(optimizer, store):
+    store.save(
+        instruction="Be terse.", few_shot=[], rationale="r", mean_score=8.5
+    )
+    for s in (3.0, 3.5, 4.0):
+        optimizer.observe("en", "vi", "p", "o", s)
+    assert optimizer.maybe_promote("en", "vi") is None
+    later = store.load()
+    assert later["instruction"] == "Be terse."
+    assert later["version"] == 1
+    # Measured, not promoted: the run still counts as evidence about v1.
+    assert later["mean_score"] == pytest.approx(3.5)
 
 
 def test_improvement_promotes_new_skill(optimizer, store):
-    for s in (4.0, 4.5):
+    store.save(
+        instruction="Be terse.", few_shot=[], rationale="r", mean_score=4.0
+    )
+    for s in (9.0, 9.5, 9.0):
         optimizer.observe("en", "vi", "p", "o", s)
-    first = optimizer.maybe_promote("en", "vi")
-    assert first is not None and first["mean_score"] < 5.0
-    optimizer2 = SkillOptimizer(store, optimizer.planner)
+    second = optimizer.maybe_promote("en", "vi")
+    assert second is not None and second["version"] == 2
+    assert second["baseline_mean"] == pytest.approx(4.0)
+    assert second["mean_score"] is None
+    assert store.load()["mean_score"] is None
+    assert (store.versions_dir / "v2.md").exists()
+
+
+def test_min_samples_blocks_promotion(optimizer, store, monkeypatch):
+    monkeypatch.setenv("SKILL_MIN_SAMPLES", "5")
     for s in (9.0, 9.5):
-        optimizer2.observe("en", "vi", "p", "o", s)
-    second = optimizer2.maybe_promote("en", "vi")
-    assert second is not None
-    assert second["mean_score"] > first["mean_score"]
-    assert store.load("en", "vi")["mean_score"] == second["mean_score"]
-
-
-def test_history_window_keeps_last_50(optimizer, store):
-    store.save("en", "vi", instruction="x", few_shot=[], rationale="r", mean_score=0.0)
-    for i in range(60):
-        optimizer.observe("en", "vi", "p", "o", float(i % 10))
-    assert len(store.load("en", "vi")["scores"]) == 50
-
-
-def test_mean_recent_excludes_sentinels(optimizer, store):
-    optimizer.observe("en", "vi", "p", "o", 8.0)
-    store.record_score("en", "vi", float("nan"))
-    assert store.mean_recent("en", "vi") == pytest.approx(8.0)
-
-
-def test_pairs_isolated(optimizer, store):
-    for s in (6.0, 6.5, 7.0):
         optimizer.observe("en", "vi", "p", "o", s)
-    optimizer.maybe_promote("en", "vi")
-    assert store.load("en", "vi") is not None
-    assert store.load("en", "de") is None
+    assert optimizer.maybe_promote("en", "vi") is None
+    assert store.load() is None
+    assert "chưa đủ mẫu" in store.history()[-1]["reason"]
+
+
+def test_min_gain_blocks_a_tie(optimizer, store, monkeypatch):
+    store.save(instruction="Be terse.", few_shot=[], rationale="r", mean_score=8.0)
+    monkeypatch.setenv("SKILL_MIN_GAIN", "0.5")
+    for s in (8.1, 8.2, 8.3):
+        optimizer.observe("en", "vi", "p", "o", s)
+    assert optimizer.maybe_promote("en", "vi") is None
+    assert store.load()["version"] == 1
+    assert "chưa vượt baseline" in store.history()[-1]["reason"]
+
+
+def test_observing_does_not_write_the_skill_file(store, mock_env, monkeypatch):
+    """One write per run, not one per chunk: 400 chunks must not mean 400 writes."""
+    optimizer = SkillOptimizer(store, PlannerAgent(get_agent_config("PLANNER")))
+    writes = {"n": 0}
+    original = store._write
+
+    def counting(path, meta, body):
+        writes["n"] += 1
+        return original(path, meta, body)
+
+    monkeypatch.setattr(store, "_write", counting)
+    for i in range(40):
+        optimizer.observe("en", "vi", "p", "o", 8.0)
+    assert writes["n"] == 0
+
+
+def test_record_scores_appends_in_one_write_and_keeps_last_50(store):
+    store.save(instruction="x", few_shot=[], rationale="r", mean_score=0.0)
+    store.record_scores([float(i % 10) for i in range(60)])
+    loaded = store.load()
+    assert len(loaded["scores"]) == 50
+    assert loaded["instruction"] == "x"  # body untouched by a score write
+
+
+def test_record_run_measures_and_logs(optimizer, store):
+    store.save(instruction="x", few_shot=[], rationale="r", mean_score=7.0)
+    skill = store.load()
+    row = store.record_run(
+        run_id="r1",
+        doc="d.pdf",
+        used_skill_id=skill["skill_id"],
+        used_version=1,
+        scores=[9.0, 9.5],
+        verify_fail_rate=0.25,
+        retranslate_rate=0.5,
+    )
+    assert row["mean"] == pytest.approx(9.25) and row["n"] == 2
+    assert store.load()["mean_score"] == pytest.approx(9.25)
+    logged = store.history()[-1]
+    assert logged["run_id"] == "r1" and logged["doc"] == "d.pdf"
+    assert logged["version"] == 1 and logged["verify_fail_rate"] == pytest.approx(0.25)
+
+
+def test_promoting_run_does_not_measure_the_new_version(store):
+    store.record_run(
+        run_id="r1",
+        used_skill_id="old",
+        used_version=1,
+        scores=[9.0, 10.0],
+        promoted=True,
+    )
+    assert store.load() is None  # no skill was written: only measured
+
+
+def test_restore_brings_a_version_back(store):
+    store.save(instruction="first", few_shot=[], rationale="r")
+    store.save(instruction="second", few_shot=[], rationale="r")
+    store.restore(1)
+    assert store.load()["instruction"] == "first"
+    assert store.history()[-1]["reason"] == "restored"
+    with pytest.raises(FileNotFoundError):
+        store.restore(9)
+
+
+def test_the_repository_skill_is_valid(store):
+    from pathlib import Path
+
+    repo_skills = SkillStore(Path(__file__).resolve().parents[1] / "skills")
+    assert repo_skills.validate() == []
 
 
 def test_gradient_uses_llm(optimizer):

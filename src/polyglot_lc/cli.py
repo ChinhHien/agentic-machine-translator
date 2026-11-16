@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import json
 import sys
+import time
 from pathlib import Path
 from typing import Annotated
 
@@ -17,8 +18,10 @@ import typer
 from rich.console import Console
 
 from polyglot_lc import __version__
+from polyglot_lc.config import get_app_config
 from polyglot_lc.llm.client import TokenUsage
 from polyglot_lc.llm.resilience import RetryStats
+from polyglot_lc.skillopt.skill_store import SKILL_SCHEMA, SkillStore
 
 app = typer.Typer(
     name="polyglot",
@@ -44,6 +47,22 @@ def _console_safe(text: str, encoding: str | None = None) -> str:
     except (UnicodeEncodeError, LookupError):
         return text.encode(codec, "replace").decode(codec, "replace")
     return text
+
+
+def _skill_summary(result: object, src: str, tgt: str) -> str:
+    """The skill the run used, what it measured, and whether it was replaced."""
+    if not getattr(result, "skill_applied", False):
+        return f"{src}-{tgt}: không dùng skill (SKILL_APPLY=off hoặc chưa có skill)"
+    mean = (
+        f"đo {result.skill_mean:.2f}/10 ({result.skill_samples} chunk)"
+        if getattr(result, "skill_samples", 0)
+        else "chưa đo"
+    )
+    promoted = "có" if getattr(result, "skill_promoted", False) else "không"
+    return (
+        f"{src}-{tgt} v{result.skill_version} ({result.skill_id}) · {mean}"
+        f" · promote: {promoted}"
+    )
 
 
 def _version_callback(value: bool) -> None:
@@ -239,6 +258,10 @@ def translate(
         # The verdict is on the deliverable: a chunk never got its translation,
         # or the run ended on an error.
         outcome = "Failed"
+    elif result.chunks_rejected:
+        # The document is complete; some chunks are kept as best effort and
+        # marked for review. That is a warning, not a missing deliverable.
+        outcome = "Completed with warnings"
     elif result.errors:
         # Everything asked for was delivered. The provider failures the run
         # waited out are listed below, but the file itself is complete.
@@ -250,10 +273,10 @@ def translate(
     console.print(f"{outcome}.", markup=False)
     console.print(
         f"  chunks: {result.chunks}  {critic_label}: {result.avg_critic:.2f}/10"
-        f"  retries: {result.retries}  traces: {result.traces_stored}"
-        f"  skill promoted: {result.skill_promoted}",
+        f"  retries: {result.retries}  traces: {result.traces_stored}",
         markup=False,
     )
+    console.print(f"  skill: {_skill_summary(result, src, tgt)}", markup=False)
     console.print(
         f"  routes: fast {result.fast_path_chunks} / standard "
         f"{result.standard_path_chunks} / deep {result.deep_path_chunks}"
@@ -277,13 +300,9 @@ def translate(
             markup=False,
         )
     if result.consistency_patch_budget:
-        # What the pass was allowed to cost. Each patch sends one chunk's whole
-        # translation (plus the glossary) and gets it back, so a document with
-        # hundreds of drifting chunks can spend a lot of tokens here; the
-        # ceiling belongs in the report, not only in the log.
         console.print(
-            f"  consistency patch budget: {result.consistency_patch_budget} request(s), "
-            f"{result.consistency_patches} used",
+            f"  consistency patch budget: {result.consistency_patch_budget} attempt(s), "
+            f"{result.consistency_patches} applied; semantic verification costs extra requests",
             markup=False,
         )
     if result.consistency_skipped or result.consistency_rejected:
@@ -317,12 +336,6 @@ def translate(
             "  consistency: no glossary term to compare - only labels were checked",
             markup=False,
         )
-    if result.verify_skipped:
-        console.print(
-            f"  verifier unavailable for {result.verify_skipped} chunk(s): "
-            "shipped without a verdict",
-            markup=False,
-        )
     if (
         resilience["fallbacks"]
         or resilience["rate_limit_retries"]
@@ -340,6 +353,14 @@ def translate(
         console.print("  errors:", markup=False)
         for err in result.errors[-5:]:
             console.print(f"    - {err}", markup=False)
+    for review in result.quality_review:
+        # The document stays clean: what a human reviewer needs is here and in
+        # the JSONL log, not inside the translation.
+        console.print(
+            f"  review {review.get('chunk', '')}: "
+            f"{review.get('severity', '')} — {review.get('reason', '')[:160]}",
+            markup=False,
+        )
 
     console.print("", markup=False)
     console.print(_token_report(), markup=False)
@@ -352,6 +373,14 @@ def translate(
         )
     if result.log_path:
         console.print(f"log file    : {result.log_path}", markup=False)
+    if result.chunks_failed:
+        console.print(
+            f"incomplete: {result.chunks_failed}/{result.chunks} chunk(s) missing; "
+            "use --resume to retry only unfinished chunks",
+            markup=False,
+        )
+    if result.chunks_failed or result.fatal_error:
+        raise typer.Exit(code=1)
 
 
 @app.command()
@@ -403,6 +432,88 @@ def trace(
         )
     else:
         console.print(_console_safe(view.as_text()), markup=False, soft_wrap=True)
+
+
+@app.command()
+def skills(
+    history: Annotated[
+        int,
+        typer.Option("--history", "-H", min=0, help="In N dòng lịch sử gần nhất (0 = không)."),
+    ] = 0,
+    validate: Annotated[
+        bool,
+        typer.Option("--validate", help="Kiểm tra schema và nội dung skill.md rồi thoát."),
+    ] = False,
+    restore: Annotated[
+        int | None,
+        typer.Option("--restore", min=1, help="Khôi phục phiên bản v<N> đã lưu."),
+    ] = None,
+) -> None:
+    """Skill duy nhất của hệ thống: nội dung, lần đo, lịch sử, khôi phục.
+
+    Không có skill nào thì nói vậy, không phải lỗi: SkillOpt chỉ ghi khi một
+    lượt dịch đã chạy đủ mẫu và vượt baseline.
+    """
+    store = SkillStore(get_app_config().skills_dir)
+    if restore is not None:
+        try:
+            path = store.restore(restore)
+        except (FileNotFoundError, ValueError) as exc:
+            console.print(f"Không khôi phục được: {exc}", markup=False)
+            raise typer.Exit(code=1) from exc
+        console.print(f"Đã khôi phục v{restore} -> {path}", markup=False)
+        return
+    if validate:
+        issues = store.validate()
+        if not issues:
+            console.print(f"skill.md hợp lệ (schema {SKILL_SCHEMA})", markup=False)
+            return
+        console.print(f"{len(issues)} vấn đề", markup=False)
+        for issue in issues:
+            console.print(f"  - {issue}", markup=False)
+        raise typer.Exit(code=1)
+
+    skill = store.load()
+    if skill is None:
+        console.print("chưa có skill (chưa promote hoặc file không đọc được)", markup=False)
+    else:
+        measured = (
+            f"đo {skill['mean_score']:.2f}/10 khai {skill['measured_runs']} lượt"
+            if skill.get("mean_score") is not None
+            else "chưa đo (lượt tới dùng skill này sẽ đo)"
+        )
+        promoted_at = time.strftime("%Y-%m-%d %H:%M", time.localtime(float(skill.get("promoted_at", 0) or 0)))
+        console.print(
+            f"system v{skill['version']} ({skill['skill_id']}) · scope {skill['scope']}",
+            markup=False,
+        )
+        console.print(
+            f"  {measured} · baseline {float(skill.get('baseline_mean', 0.0)):.2f}/10"
+            f" · {len(skill.get('few_shot') or [])} few-shot",
+            markup=False,
+        )
+        console.print(
+            f"  promote: {promoted_at} · từ run {skill.get('promoted_from_run') or '—'}",
+            markup=False,
+        )
+        console.print(f"  file: {store.path}", markup=False)
+
+    if history:
+        rows = store.history(limit=history)
+        if not rows:
+            console.print("  lịch sử: chưa có lượt nào ghi lại", markup=False)
+            return
+        console.print("  lịch sử (cũ → mới):", markup=False)
+        for row in rows:
+            when = time.strftime("%Y-%m-%d %H:%M", time.localtime(float(row.get("at", 0) or 0)))
+            mean = row.get("mean")
+            measured = f"{mean:.2f}" if isinstance(mean, (int, float)) else "—"
+            verdict = "promote" if row.get("promoted") else str(row.get("reason") or "giữ")
+            console.print(
+                f"    {when}  v{row.get('version') or '?'}  n={row.get('n')}  mean={measured}"
+                f"  {verdict}  {row.get('doc') or row.get('run_id') or ''}",
+                markup=False,
+            )
 
 
 if __name__ == "__main__":

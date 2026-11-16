@@ -41,6 +41,15 @@
     <span id="crumb-doc" class="crumb-doc">Chưa mở lượt dịch nào</span>
   </nav>
   <span id="crumb-meta" class="crumb-meta"></span>
+  <!-- The one control about the tool itself, not the document: the settings
+       dialog behind it holds the pipeline's endpoints. -->
+  <button id="settings-open" class="icon-btn" type="button"
+          aria-label="Cấu hình endpoint" title="Cấu hình endpoint">
+    <svg class="icon" viewBox="0 0 20 20" aria-hidden="true" focusable="false">
+      <circle cx="10" cy="10" r="2.6"/>
+      <path d="M10 2.2v2.2M10 15.6v2.2M2.2 10h2.2M15.6 10h2.2M4.5 4.5l1.6 1.6M13.9 13.9l1.6 1.6M15.5 4.5l-1.6 1.6M6.1 13.9l-1.6 1.6"/>
+    </svg>
+  </button>
 </header>
 
 <p id="banner" class="banner" role="status" aria-live="polite" hidden></p>
@@ -58,6 +67,18 @@
     <div class="rail-head">
       <h2 id="jobs-title" class="section-title">Tài liệu</h2>
       <span id="jobs-count" class="count"></span>
+    </div>
+    <!-- Finding one of the documents already brought in: the library holds
+         every file uploaded for translation, and a name is what a reader
+         remembers, not its position in the list. -->
+    <div class="rail-search" role="search">
+      <svg class="icon" viewBox="0 0 20 20" aria-hidden="true" focusable="false">
+        <circle cx="8.5" cy="8.5" r="5.5"/>
+        <path d="M12.8 12.8 17 17"/>
+      </svg>
+      <label class="visually-hidden" for="jobs-search">Tìm tài liệu đã tải lên</label>
+      <input id="jobs-search" type="search" placeholder="Tìm tài liệu đã tải lên"
+             autocomplete="off" spellcheck="false">
     </div>
     <div id="jobs-filter" class="chips" role="group" aria-label="Lọc theo trạng thái"></div>
     <ul id="jobs" class="jobs" aria-label="Các lượt dịch"></ul>
@@ -142,6 +163,22 @@
       <div class="panes-note">
         <span id="view-label" class="panes-note-label">Cách hiển thị</span>
         <div class="panes-tools">
+          <!-- Finding a phrase in the translation: the box, how many matches it
+               found, and the two arrows that walk them without a mouse. -->
+          <div class="pane-find" role="search">
+            <svg class="icon" viewBox="0 0 20 20" aria-hidden="true" focusable="false">
+              <circle cx="8.5" cy="8.5" r="5.5"/>
+              <path d="M12.8 12.8 17 17"/>
+            </svg>
+            <label class="visually-hidden" for="find-target">Tìm trong bản dịch</label>
+            <input id="find-target" class="pane-find-input" type="search"
+                   placeholder="Tìm trong bản dịch" autocomplete="off" spellcheck="false">
+            <span id="find-count" class="pane-find-count" aria-live="polite"></span>
+            <button id="find-prev" class="icon-btn find-nav" type="button"
+                    aria-label="Kết quả trước" title="Kết quả trước" hidden>↑</button>
+            <button id="find-next" class="icon-btn find-nav" type="button"
+                    aria-label="Kết quả sau" title="Kết quả sau" hidden>↓</button>
+          </div>
           <p class="view-switch" role="group" aria-labelledby="view-label">
             <button id="view-split" class="seg" type="button" aria-pressed="true">Hai cột</button>
             <button id="view-source" class="seg" type="button" aria-pressed="false">Chỉ bản gốc</button>
@@ -304,6 +341,52 @@
     <div class="dialog-actions">
       <button value="cancel" class="btn" type="submit">Hủy</button>
       <button value="delete" class="btn btn--danger" type="submit">Xóa</button>
+    </div>
+  </form>
+</dialog>
+
+<dialog id="settings" class="dialog dialog--settings" aria-labelledby="settings-title">
+  <form id="settings-form" class="dialog-form" method="dialog" novalidate>
+    <h2 id="settings-title" class="dialog-title">Cấu hình endpoint</h2>
+    <p id="settings-alert" class="alert" hidden></p>
+    <p class="settings-note">
+      Giá trị nhập ở đây <strong>ghi đè</strong> lên <code>.env</code> cho các lượt dịch mới.
+      Endpoint nào không kết nối được khi bắt đầu lượt dịch sẽ bị bỏ qua và pipeline dùng lại
+      giá trị gốc của <code>.env</code>.
+    </p>
+
+    <label class="seg seg--choice settings-toggle" for="settings-group">
+      <input id="settings-group" type="checkbox">
+      <span>Gom cụm Translator · Critic · Refiner vào chung một endpoint</span>
+    </label>
+
+    <div id="settings-cards" class="settings-cards"></div>
+
+    <!-- How the run spends the provider, kept apart from the endpoints it
+         spends it on: two numbers that multiply, and the key that explains
+         the dots above. -->
+    <section class="settings-limits" aria-labelledby="settings-limits-title">
+      <h3 id="settings-limits-title" class="settings-section-title">Hiệu năng</h3>
+      <div class="settings-limits-grid">
+        <p class="field">
+          <label class="label" for="settings-concurrency">MAX_CONCURRENCY</label>
+          <input id="settings-concurrency" class="input" type="number" min="1" max="16" step="1" value="1">
+          <span class="settings-hint">Số chunk dịch song song (1–16)</span>
+        </p>
+        <p class="field">
+          <label class="label" for="settings-provider-concurrency">LLM_PROVIDER_CONCURRENCY</label>
+          <input id="settings-provider-concurrency" class="input" type="number" min="1" max="32" step="1" value="1">
+          <span class="settings-hint">Request đồng thời tới mỗi endpoint (1–32)</span>
+        </p>
+      </div>
+      <p class="settings-hint settings-legend">
+        ✓ xanh — đã kết nối · ✗ đỏ — lỗi · chấm — chưa kiểm tra
+      </p>
+    </section>
+
+    <div class="dialog-actions">
+      <button id="settings-cancel" class="btn" type="button">Đóng</button>
+      <button id="settings-save" class="btn btn--primary" type="button">Lưu</button>
     </div>
   </form>
 </dialog>
