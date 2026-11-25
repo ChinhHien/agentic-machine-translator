@@ -75,8 +75,6 @@ def test_the_cli_says_how_much_drift_the_pass_left(mock_env, tmp_path, monkeypat
             return translations, report
 
     monkeypatch.setattr(coordinator, "ConsistencyChecker", _StubChecker)
-    glossary = tmp_path / "glossary.csv"
-    glossary.write_text("NMT,Dịch máy neural\n", encoding="utf-8")
     out = tmp_path / "drift.md"
 
     result = runner.invoke(
@@ -87,8 +85,6 @@ def test_the_cli_says_how_much_drift_the_pass_left(mock_env, tmp_path, monkeypat
             str(_doc(tmp_path)),
             "--out",
             str(out),
-            "--glossary",
-            str(glossary),
         ],
     )
     assert result.exit_code == 0, result.output
@@ -179,10 +175,42 @@ def test_the_cli_says_when_the_verifier_could_not_run(mock_env, tmp_path, monkey
         ["translate", "--file", str(_doc(tmp_path)), "--out", str(tmp_path / "v.md")],
     )
 
-    assert result.exit_code == 1, result.output
-    assert "Run failed: VerificationError" in result.output
+    assert result.exit_code == 2, result.output
+    assert "Incomplete" in result.output
+    assert "chunk chưa xong" in result.output
     assert "verification unavailable" in result.output
-    assert not (tmp_path / "v.md").exists()
+    # The draft is delivered and the outage is named; it is not a missing file,
+    # and it is not a finished translation either.
+    assert (tmp_path / "v.md").is_file()
+    assert (tmp_path / "v.md").read_text(encoding="utf-8").strip()
+
+
+def test_the_cli_reports_cumulative_cost_after_a_resume(mock_env, tmp_path, monkeypatch):
+    """A resumed translation reports the whole job, not just its last attempt."""
+    from polyglot_lc.pipeline import PipelineResult, TranslationPipeline
+
+    def fake_run(self, *args, **kwargs):
+        result = PipelineResult(chunks=2, output_path=str(tmp_path / "out.md"))
+        result.cumulative = {
+            "attempts": 2,
+            "tokens": {"sent": 120, "received": 40, "cached": 10},
+            "retries": 3,
+            "planner_calls": 1,
+            "duration_ms": 2500,
+            "skill": {"mean": 8.5, "samples": 2},
+        }
+        return result
+
+    monkeypatch.setattr(TranslationPipeline, "run", fake_run)
+    result = runner.invoke(
+        app, ["translate", "--file", str(_doc(tmp_path)), "--out", str(tmp_path / "out.md")]
+    )
+
+    assert result.exit_code == 0, result.output
+    output = " ".join(result.stdout.split())
+    assert "total after 2 attempts" in output
+    assert "planner requests 1" in output
+    assert "skill 8.50/10" in output
 
 
 def test_the_command_says_failed_when_a_chunk_has_no_translation(mock_env, tmp_path, monkeypatch):

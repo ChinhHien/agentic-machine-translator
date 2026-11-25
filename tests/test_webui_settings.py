@@ -202,6 +202,20 @@ def test_endpoint_ok_via_models(tmp_path, monkeypatch):
     assert result["method"] == "models"
 
 
+def test_endpoint_probe_identifies_as_a_browser(tmp_path, monkeypatch):
+    """Cloudflare 1010 rejects Python-urllib's default signature; send a UA."""
+    seen = []
+
+    def urlopen(request, timeout):
+        seen.append(request)
+        return _FakeResponse()
+
+    monkeypatch.setattr("webui.settings.urllib.request.urlopen", urlopen)
+    assert _probe("https://a.example/v1", "m", "sk")["ok"] is True
+    assert "Mozilla/5.0" in (seen[0].get_header("User-agent") or "")
+    assert seen[0].get_header("Accept") == "application/json"
+
+
 def test_endpoint_falls_back_to_chat(tmp_path, monkeypatch):
     # /models refuses; the one-token completion answers.
     monkeypatch.setattr(
@@ -307,7 +321,6 @@ def api(tmp_path):
         root=tmp_path,
         manager=RunManager(tmp_path, python="PY"),
         runs=RunsStore(tmp_path / "logs" / "webui"),
-        glossaries=None,
         port=8787,
     )
 
@@ -436,7 +449,7 @@ def test_launch_injects_passed_overrides_only(tmp_path, monkeypatch):
     monkeypatch.setattr(
         RunManager,
         "plan",
-        lambda self, file, max_tokens: {"chunks": 1, "output_path": "/out/x.md", "title": "d"},
+        lambda self, file: {"chunks": 1, "output_path": "/out/x.md", "title": "d"},
     )
     made = []
 
@@ -445,7 +458,7 @@ def test_launch_injects_passed_overrides_only(tmp_path, monkeypatch):
         return _FakeProc(argv, **kw)
 
     manager = RunManager(tmp_path, python="PY", popen=popen)
-    manager.start(file="doc.pdf", src="en", tgt="vi", glossary=None, max_tokens=None, mock=False)
+    manager.start(file="doc.pdf", mock=False)
 
 
     env = made[0]["env"]

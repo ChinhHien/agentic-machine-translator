@@ -79,8 +79,13 @@ def test_gate_thresholds_follow_configuration(mock_env, monkeypatch):
 
 # ------------------------------ end to end ----------------------------------
 def _run(path, out, **kw):
+    import os
+
     from polyglot_lc.pipeline import TranslationPipeline
 
+    budget = kw.pop("max_tokens", None)
+    if budget is not None:
+        os.environ["CHUNK_MAX_TOKENS"] = str(budget)
     return TranslationPipeline(quiet=True).run(path, src="en", tgt="vi", out=str(out), **kw)
 
 

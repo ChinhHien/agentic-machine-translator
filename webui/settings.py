@@ -58,9 +58,14 @@ TEST_TIMEOUT = 10.0
 #: moment probing the document, but a launch should not hang on a dead host.
 LAUNCH_TEST_TIMEOUT = 5.0
 
-#: A key that is stored but never echoed back. The dialog shows the mask as a
-#: placeholder; an empty field on save means "keep the stored key".
-KEY_MASK = "••••••"
+#: Cloudflare's ``1010`` response is a browser-integrity check, not an auth
+#: error. Python's default ``Python-urllib/x.y`` signature is one of the
+#: clients that check rejects, so the probe identifies itself as a browser
+#: (the same request works when made by the OpenAI SDK).
+USER_AGENT = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
+)
 
 
 class SettingsError(ValueError):
@@ -78,11 +83,13 @@ def _format_validation_error(err: ValidationError, ctx: str) -> str:
 
 
 class EndpointOverride(BaseModel):
-    """One agent's endpoint, exactly the three fields the dialog collects."""
+    """One agent's endpoint and its optional per-agent knobs."""
 
     base_url: str
     model: str
     api_key: str = ""
+    temperature: float | None = Field(default=None, ge=0, le=2)
+    timeout: float | None = Field(default=None, gt=0)
 
     @field_validator("base_url")
     @classmethod
@@ -146,7 +153,11 @@ def test_endpoint(
     if not base or not model_name:
         return {"ok": False, "latency_ms": 0, "method": "", "error": "thiếu base_url hoặc model"}
 
-    headers = {"Content-Type": "application/json"}
+    headers = {
+        "Content-Type": "application/json",
+        "Accept": "application/json",
+        "User-Agent": USER_AGENT,
+    }
     if api_key:
         headers["Authorization"] = f"Bearer {api_key}"
 
@@ -157,7 +168,13 @@ def test_endpoint(
     try:
         request = urllib.request.Request(f"{base}/models", headers=headers)
         with urllib.request.urlopen(request, timeout=timeout):
-            return {"ok": True, "latency_ms": _elapsed(), "method": "models", "error": ""}
+            return {
+                "ok": True,
+                "latency_ms": _elapsed(),
+                "method": "models",
+                "error": "",
+                "token_param": "",
+            }
     except Exception:  # noqa: BLE001, S110 - any failure just falls through to the chat probe
         pass
 
@@ -178,7 +195,16 @@ def test_endpoint(
                 f"{base}/chat/completions", data=body, headers=headers, method="POST"
             )
             with urllib.request.urlopen(request, timeout=timeout):
-                return {"ok": True, "latency_ms": _elapsed(), "method": "chat", "error": ""}
+                return {
+                    "ok": True,
+                    "latency_ms": _elapsed(),
+                    "method": "chat",
+                    "error": "",
+                    # Which spelling of the output cap this endpoint accepted.
+                    # Discovering it here and throwing it away meant paying for
+                    # a 400 on the first real call of every run.
+                    "token_param": field,
+                }
         except urllib.error.HTTPError as exc:
             detail = ""
             try:
@@ -188,7 +214,13 @@ def test_endpoint(
             error = f"HTTP {exc.code}: {detail}".strip()
         except Exception as exc:  # noqa: BLE001 - any transport failure is a probe failure
             error = str(exc) or exc.__class__.__name__
-    return {"ok": False, "latency_ms": _elapsed(), "method": "", "error": error}
+    return {
+        "ok": False,
+        "latency_ms": _elapsed(),
+        "method": "",
+        "error": error,
+        "token_param": "",
+    }
 
 
 class SettingsStore:
@@ -255,11 +287,15 @@ class SettingsStore:
                 key = str(entry.get("api_key") or "").strip()
                 if not key:
                     key = current.agents[name].api_key if name in current.agents else ""
+                temperature = _optional_float(entry.get("temperature"), name, "temperature")
+                timeout = _optional_float(entry.get("timeout"), name, "timeout")
                 try:
                     merged[name] = EndpointOverride(
                         base_url=str(entry.get("base_url") or ""),
                         model=str(entry.get("model") or ""),
                         api_key=key,
+                        temperature=temperature,
+                        timeout=timeout,
                     )
                 except ValidationError as exc:
                     raise SettingsError(_format_validation_error(exc, f"agent {name}")) from exc
@@ -308,20 +344,35 @@ class SettingsStore:
     def public(self) -> dict[str, Any]:
         """The settings as the dialog may see them: keys masked, tests included."""
         settings = self.load()
+        agents: dict[str, Any] = {}
+        for name, endpoint in settings.agents.items():
+            entry: dict[str, Any] = {
+                "base_url": endpoint.base_url,
+                "model": endpoint.model,
+                "has_key": bool(endpoint.api_key),
+            }
+            if endpoint.temperature is not None:
+                entry["temperature"] = endpoint.temperature
+            if endpoint.timeout is not None:
+                entry["timeout"] = endpoint.timeout
+            agents[name] = entry
         return {
             "use_source_group": settings.use_source_group,
             "max_concurrency": settings.max_concurrency,
             "provider_concurrency": settings.provider_concurrency,
-            "agents": {
-                name: {
-                    "base_url": endpoint.base_url,
-                    "model": endpoint.model,
-                    "has_key": bool(endpoint.api_key),
-                }
-                for name, endpoint in settings.agents.items()
-            },
+            "agents": agents,
             "tests": self._read_tests(),
         }
+
+
+def _optional_float(value: Any, agent: str, field: str) -> float | None:
+    """One optional numeric field from the dialog, or ``None`` when blank."""
+    if value is None or value == "":
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError) as exc:
+        raise SettingsError(f"agent {agent}: {field} must be a number") from exc
 
 
 def child_env(settings: Settings, ok: dict[str, bool]) -> tuple[dict[str, str], list[str]]:
@@ -347,16 +398,25 @@ def child_env(settings: Settings, ok: dict[str, bool]) -> tuple[dict[str, str], 
         additions[f"{prefix}MODEL"] = endpoint.model
         if endpoint.api_key:
             additions[f"{prefix}API_KEY"] = endpoint.api_key
+        if endpoint.temperature is not None:
+            additions[f"{prefix}TEMPERATURE"] = str(endpoint.temperature)
+        if endpoint.timeout is not None:
+            additions[f"{prefix}TIMEOUT"] = str(endpoint.timeout)
     if settings.max_concurrency:
         additions["MAX_CONCURRENCY"] = str(settings.max_concurrency)
     if settings.provider_concurrency:
         additions["LLM_PROVIDER_CONCURRENCY"] = str(settings.provider_concurrency)
-
     removals: list[str] = []
     group_ok = settings.use_source_group and bool(ok.get("SOURCE_GROUP"))
     if group_ok:
         for agent in SOURCE_GROUP_AGENTS:
-            for suffix in ("BASE_URL", "MODEL", "API_KEY"):
+            for suffix in (
+                "BASE_URL",
+                "MODEL",
+                "API_KEY",
+                "TEMPERATURE",
+                "TIMEOUT",
+            ):
                 removals.append(f"{AGENT_ENV_PREFIXES[agent]}{suffix}")
         group = settings.agents.get("SOURCE_GROUP")
         if group is not None:
@@ -366,4 +426,8 @@ def child_env(settings: Settings, ok: dict[str, bool]) -> tuple[dict[str, str], 
                 additions[f"{prefix}MODEL"] = group.model
                 if group.api_key:
                     additions[f"{prefix}API_KEY"] = group.api_key
+                if group.temperature is not None:
+                    additions[f"{prefix}TEMPERATURE"] = str(group.temperature)
+                if group.timeout is not None:
+                    additions[f"{prefix}TIMEOUT"] = str(group.timeout)
     return additions, removals

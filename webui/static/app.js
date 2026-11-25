@@ -20,8 +20,11 @@
 "use strict";
 
 const POLL_MS = 700;
+/* A failed poll is not the end of the watch: the run is still going, so the next
+   attempt comes on a slower beat (the server may be busy, not gone). */
+const POLL_FAIL_MS = 2500;
 const LIST_MS = 5000;
-const FINAL_STATUSES = ["done", "failed", "stopped"];
+const FINAL_STATUSES = ["done", "incomplete", "failed", "stopped"];
 
 /*: The folded library has room for one mark per document and no words, so the
    state is a shape first and a colour second: a running run is a dot, a
@@ -30,6 +33,8 @@ const FINAL_STATUSES = ["done", "failed", "stopped"];
 const STATE_MARKS = {
   running: "●",
   done: "✓",
+  done_with_warnings: "✓",
+  incomplete: "!",
   failed: "!",
   stopped: "‖",
 };
@@ -38,6 +43,8 @@ const STATUS_WORDS = {
   empty: "chưa mở",
   running: "đang dịch",
   done: "xong",
+  done_with_warnings: "xong (có cảnh báo)",
+  incomplete: "chưa đầy đủ",
   failed: "lỗi",
   stopped: "đã dừng",
 };
@@ -66,6 +73,7 @@ const STEP_WORDS = {
   glossary: "áp từ điển",
   summary_tree: "tóm tắt",
   plan: "lập kế hoạch",
+  preflight: "thử endpoint",
   analyse_chunks: "phân tích chunk",
   translate: "dịch",
   critic: "phản biện",
@@ -146,8 +154,6 @@ const LOG_DETAIL_WORDS = {
   sha256: "sha256",
   bytes: "kích thước",
   pages: "số trang",
-  src: "ngôn ngữ nguồn",
-  tgt: "ngôn ngữ đích",
   flags: "cờ",
   agents: "agent",
 };
@@ -170,6 +176,7 @@ const state = {
   detail: null,
   events: [], // every event seen for the open run, in order
   seenStatus: null,
+  lastNote: "", // the run note already announced, so polling does not repeat it
   next: 0,
   timer: null,
   listTimer: null,
@@ -196,6 +203,12 @@ const state = {
      event carries — from being drawn twice. */
   logged: 0,
   loggedProblems: new Set(),
+  /* Whether the log shows only its failures. A 76-chunk run writes hundreds of
+     "xong" lines around the few that explain a bad run. */
+  logFails: false,
+  /* The conclusion block's signature: the log redraws its ending only when the
+     verdict or its figures changed, so a poll does not move the reader's view. */
+  conclusionKey: "",
   /* Whether the chunk list is still following the run: scrolling anywhere else
      is the reader claiming their place, and it is theirs until they come back
      to the run's edge. */
@@ -304,17 +317,6 @@ function fill(node, values) {
   return node;
 }
 
-function formatSize(bytes) {
-  const value = Number(bytes) || 0;
-  if (value < 1024) {
-    return `${value} B`;
-  }
-  if (value < 1024 * 1024) {
-    return `${(value / 1024).toFixed(1)} kB`;
-  }
-  return `${(value / (1024 * 1024)).toFixed(1)} MB`;
-}
-
 function formatCount(value) {
   return Number(value).toLocaleString("vi-VN");
 }
@@ -405,7 +407,7 @@ function noteRunStatus(runId, status) {
   if (previous === undefined || previous === status || isFinal(previous)) {
     return;
   }
-  if (status === "done" || status === "failed") {
+  if (status === "done" || status === "incomplete" || status === "failed") {
     playChime(status);
   }
 }
@@ -647,12 +649,21 @@ function renderJobs() {
     button.append(element("span", "job-row-name", run.file || run.run_id));
     button.append(element("span", "job-row-time", formatTime(run.started)));
     const sub = element("span", "job-row-sub");
-    /* The pair, the size and the state. */
-    sub.append(element("span", null, `${run.src || "?"} → ${run.tgt || "?"}`));
+    /* The size and the state. */
     if (run.chunks) {
       sub.append(element("span", null, `${formatCount(run.chunks)} chunk`));
     }
     sub.append(element("span", null, STATUS_WORDS[run.status] || run.status));
+    /* Why it is not simply "xong", in one phrase: the library is where a run
+       is picked by its outcome, not only by its name. */
+    const completion = run.completion || {};
+    if (Number(completion.incomplete)) {
+      sub.append(
+        element("span", "job-row-why", `còn ${formatCount(completion.incomplete)} chunk`),
+      );
+    } else if (run.status === "failed" && run.note) {
+      sub.append(element("span", "job-row-why", displayChunkText(String(run.note)).slice(0, 80)));
+    }
     button.append(sub);
     button.addEventListener("click", () => {
       /* A row picked from the drawer is a choice made: the drawer has done its
@@ -752,15 +763,6 @@ async function loadRuns() {
 
 /* --------------------------------------------------------------- one job */
 
-function actionLink(route, label, extra) {
-  const link = element("a", "btn", label);
-  link.href = route;
-  if (extra) {
-    link.title = extra;
-  }
-  return link;
-}
-
 /* The mark a control gives way to when the pointer arrives: a pause for the
    button that ends a run, a play for the one that continues it. Static shapes,
    so they are built node by node like the trash glyph — the page never splices
@@ -821,37 +823,262 @@ function swapButton(label, mark, extraClass) {
 /*: Which mark each run control swaps to. */
 const CONTROL_MARKS = { stop: "pause", resume: "play" };
 
+const SVG_NS = "http://www.w3.org/2000/svg";
+
+/*: The marks the job's tools wear: a download arrow into a tray, an eye for the
+   preview, and three dots for the actions that are not files. Drawn from
+   shapes rather than an HTML string, like every other mark on this page. */
+const TOOL_MARKS = {
+  download: [
+    ["path", { d: "M10 3.5v9M10 12.5 6.8 9.3M10 12.5l3.2-3.2" }],
+    ["path", { d: "M3.5 14.5v1.2c0 .44.36.8.8.8h11.4c.44 0 .8-.36.8-.8v-1.2" }],
+  ],
+  preview: [
+    ["path", { d: "M1.8 10S4.7 4.8 10 4.8 18.2 10 18.2 10 15.3 15.2 10 15.2 1.8 10 1.8 10z" }],
+    ["circle", { cx: "10", cy: "10", r: "2.4" }],
+  ],
+  more: [
+    ["circle", { cx: "4.5", cy: "10", r: "1.2", fill: "currentColor", stroke: "none" }],
+    ["circle", { cx: "10", cy: "10", r: "1.2", fill: "currentColor", stroke: "none" }],
+    ["circle", { cx: "15.5", cy: "10", r: "1.2", fill: "currentColor", stroke: "none" }],
+  ],
+};
+
+function toolIcon(name) {
+  const svg = document.createElementNS(SVG_NS, "svg");
+  svg.setAttribute("viewBox", "0 0 20 20");
+  svg.setAttribute("class", "icon");
+  svg.setAttribute("aria-hidden", "true");
+  svg.setAttribute("focusable", "false");
+  for (const [tag, attrs] of TOOL_MARKS[name] || []) {
+    const node = document.createElementNS(SVG_NS, tag);
+    for (const key of Object.keys(attrs)) {
+      node.setAttribute(key, attrs[key]);
+    }
+    svg.append(node);
+  }
+  return svg;
+}
+
+/* One menu open at a time, anywhere in the header. */
+function closeJobMenu() {
+  const open = document.querySelector(".job-tools .menu:not([hidden])");
+  if (!open) {
+    return;
+  }
+  open.hidden = true;
+  const button = open.parentElement.querySelector("button[aria-expanded]");
+  if (button) {
+    button.setAttribute("aria-expanded", "false");
+  }
+}
+
+document.addEventListener("click", closeJobMenu);
+document.addEventListener("keydown", (event) => {
+  if (event.key === "Escape") {
+    closeJobMenu();
+  }
+});
+
+/* A tool button plus the list it opens; the list is folded into the button's
+   own corner of the header, so the row never grows a second line. */
+function toolMenu(button, menu) {
+  const wrap = element("div", "tool");
+  button.setAttribute("aria-haspopup", "menu");
+  button.setAttribute("aria-expanded", "false");
+  button.addEventListener("click", (event) => {
+    event.stopPropagation();
+    const wasHidden = menu.hidden;
+    closeJobMenu();
+    if (wasHidden) {
+      menu.hidden = false;
+      button.setAttribute("aria-expanded", "true");
+    }
+  });
+  menu.addEventListener("click", (event) => {
+    if (event.target.closest("[role='menuitem']")) {
+      closeJobMenu();
+    }
+  });
+  wrap.append(button, menu);
+  return wrap;
+}
+
+function menuItem(label, options) {
+  const item = options.href ? element("a", "menu-item", label) : element("button", "menu-item", label);
+  item.setAttribute("role", "menuitem");
+  if (options.href) {
+    item.href = options.href;
+    item.setAttribute("download", "");
+  } else {
+    item.type = "button";
+  }
+  if (options.hint) {
+    item.title = options.hint;
+  }
+  if (options.danger) {
+    item.classList.add("menu-item--danger");
+  }
+  if (options.disabled) {
+    item.setAttribute("aria-disabled", "true");
+    item.tabIndex = -1;
+    if (item.tagName === "BUTTON") {
+      item.disabled = true;
+    } else {
+      item.addEventListener("click", (event) => event.preventDefault());
+    }
+  }
+  if (options.onPick && !options.disabled) {
+    item.addEventListener("click", options.onPick);
+  }
+  return item;
+}
+
+function toolButton(label, mark) {
+  const button = element("button", "icon-btn");
+  button.type = "button";
+  button.setAttribute("aria-label", label);
+  button.title = label;
+  button.append(toolIcon(mark));
+  return button;
+}
+
+/* The three files a run can give — the extraction, the translation, the rebuilt
+   PDF — behind one download mark, in the order a reader asks for them. A file
+   the run has not written is listed but not offered, so the list does not
+   change shape from run to run. */
+function downloadMenu(detail, base) {
+  const menu = element("div", "menu");
+  menu.setAttribute("role", "menu");
+  menu.hidden = true;
+  menu.append(
+    menuItem("Bản gốc trích xuất (.md)", {
+      href: `${base}/source?download=1&markers=strip`,
+      hint: "Tải văn bản trích xuất từ PDF",
+    }),
+    menuItem("Bản dịch (.md)", {
+      href: `${base}/output?download=1`,
+      hint: detail.md
+        ? ""
+        : "Lượt dịch chưa ghi ra bản Markdown",
+      disabled: !detail.md,
+    }),
+    menuItem("Bản PDF (.pdf)", {
+      href: `${base}/pdf?download=1`,
+      hint: detail.pdf
+        ? "Tải bản dịch của lượt này với định dạng PDF"
+        : "Lượt dịch chưa ghép PDF",
+      disabled: !detail.pdf,
+    }),
+  );
+  return menu;
+}
+
+/* Ghép lại: re-assemble this run's own finished chunks — no chunk is translated
+   again — and write the PDF beside the Markdown. */
+async function rebuildRun(runId) {
+  try {
+    await post(`/api/runs/${encodeURIComponent(runId)}/rebuild`);
+  } catch (error) {
+    toast(`Không ghép lại được PDF: ${error.message}`, "error", 8000);
+    return;
+  }
+  await loadRuns();
+  await openJob(runId);
+}
+
+/* Dịch nốt & ghép PDF: finish a run that stopped short and merge its PDF in
+   the same attempt. Finished chunks are replayed from their checkpoints, so
+   only the missing work is translated. */
+async function finishRun(runId) {
+  try {
+    await post(`/api/runs/${encodeURIComponent(runId)}/finish`);
+  } catch (error) {
+    toast(`Không chạy tiếp được: ${error.message}`, "error", 8000);
+    return;
+  }
+  await loadRuns();
+  await openJob(runId);
+}
+
 function renderActions(detail) {
-  const box = clear(byId("job-actions"));
-  /* Starting and stopping are not downloads: "Dừng" and "Tiếp tục" live at the
-     top-right of the panel, on the same line as the badge that says what the
-     run is doing, so the control that changes that state is not two rows below
-     the state it changes. */
-  const control = clear(byId("job-control"));
+  /* Everything about the run that acts on it lives on the header line, beside
+     the badge that names its state: the files it produced, the preview, and the
+     two actions that change them. There is no second row of links below. */
   const run = detail.run;
   const base = `/api/runs/${encodeURIComponent(run.run_id)}`;
-  for (const artifact of detail.artifacts || []) {
-    const route = artifact.kind === "pdf" ? `${base}/pdf` : `${base}/output`;
-    const label = artifact.kind === "pdf" ? "Tải PDF" : "Tải Markdown";
-    const link = actionLink(
-      `${route}?download=1`,
-      `${label} (${formatSize(artifact.size)})`,
-      artifact.name,
+  const tools = byId("job-tools");
+  /* Rebuilt only when what they offer has changed: a poll redraws the panel
+     every second, and replacing these buttons under an open menu (or under a
+     reader's focus) would close the list they are reading. */
+  const signature = [
+    run.run_id,
+    run.status,
+    detail.md ? 1 : 0,
+    detail.pdf ? 1 : 0,
+    detail.rebuildable ? 1 : 0,
+    Number(detail.missing_chunks) || 0,
+    Number(run.retry_at) > 0 ? 1 : 0,
+  ].join("|");
+  if (tools.dataset.signature !== signature) {
+    clear(tools);
+
+    const download = toolButton("Tải về", "download");
+    tools.append(toolMenu(download, downloadMenu(detail, base)));
+
+    if (detail.pdf) {
+      const preview = element("a", "icon-btn");
+      preview.href = `${base}/pdf`;
+      preview.target = "_blank";
+      preview.rel = "noreferrer";
+      preview.setAttribute("aria-label", "Preview PDF");
+      preview.title = "Preview PDF";
+      preview.append(toolIcon("preview"));
+      tools.append(preview);
+    }
+
+    const more = toolButton("Thao tác khác", "more");
+    const menu = element("div", "menu");
+    menu.setAttribute("role", "menu");
+    menu.hidden = true;
+    const missing = Number(detail.missing_chunks) || 0;
+    /* Only a run that has actually stopped can be finished by hand. While
+       chunks are still in flight the gap is just work in progress, and
+       offering to "finish" it invites a second child on the same run. */
+    const halted =
+      run.status !== "running" &&
+      run.status !== "empty" &&
+      Number(run.retry_at) <= 0;
+    if (missing && halted) {
+      menu.append(
+        menuItem(`Dịch nốt ${formatCount(missing)} chunk`, {
+          hint: "Chạy tiếp lượt này; các chunk đã có checkpoint không bị dịch lại",
+          onPick: () => finishRun(run.run_id),
+        }),
+      );
+    }
+    menu.append(
+      menuItem("Ghép lại PDF", {
+        hint: detail.rebuildable
+          ? "Ghép lại PDF từ các chunk đã dịch, không gọi lại model"
+          : "Lượt này còn chunk chưa xác minh — dịch nốt rồi ghép lại",
+        disabled:
+          !detail.rebuildable || run.status === "running" || Number(run.retry_at) > 0,
+        onPick: () => rebuildRun(run.run_id),
+      }),
+      element("div", "menu-sep"),
+      menuItem("Xóa bản dịch", {
+        danger: true,
+        hint: "Xóa lượt dịch này và bản dịch của nó",
+        onPick: () => deleteRun(run.run_id),
+      }),
     );
-    link.setAttribute("download", "");
-    box.append(link);
+    tools.append(toolMenu(more, menu));
+    tools.dataset.signature = signature;
   }
-  if ((detail.artifacts || []).length > 1) {
-    const bundle = actionLink(`${base}/bundle`, "Tải tất cả (.zip)");
-    bundle.setAttribute("download", "");
-    box.append(bundle);
-  }
-  if (detail.pdf) {
-    const view = actionLink(`${base}/pdf`, "Mở bản PDF");
-    view.target = "_blank";
-    view.rel = "noreferrer";
-    box.append(view);
-  }
+
+  const control = clear(byId("job-control"));
+
   /* "Dừng" also covers a run waiting between two automatic attempts: it has no
      child to signal, and the server answers by calling the retry off, so the
      reader is never left watching a wait they cannot end. */
@@ -869,6 +1096,29 @@ function renderActions(detail) {
     resume.addEventListener("click", () => resumeRun(run.run_id));
     control.append(resume);
   }
+  /* A finished run can still be short of chunks (an old run, or one whose
+     last chunks never verified). It gets one visible way forward instead of
+     an action buried in the menu: finish the gaps and merge the PDF. */
+  const missing = Number(detail.missing_chunks) || 0;
+  if (run.status === "done" && !waiting) {
+    if (missing) {
+      const finish = element(
+        "button",
+        "btn btn--resume",
+        "Dịch nốt & ghép PDF",
+      );
+      finish.type = "button";
+      finish.title = `Dịch ${formatCount(missing)} chunk còn thiếu rồi ghép PDF; các chunk đã xong được dùng lại`;
+      finish.addEventListener("click", () => finishRun(run.run_id));
+      control.append(finish);
+    } else if (detail.rebuildable && !detail.pdf) {
+      const rebuild = element("button", "btn", "Ghép lại PDF");
+      rebuild.type = "button";
+      rebuild.title = "Ghép PDF từ các chunk đã dịch, không gọi lại model";
+      rebuild.addEventListener("click", () => rebuildRun(run.run_id));
+      control.append(rebuild);
+    }
+  }
 }
 
 function renderJob(detail) {
@@ -876,16 +1126,11 @@ function renderJob(detail) {
   const job = byId("job");
   job.dataset.state = run.status;
   setText(byId("job-title"), run.file || run.run_id);
-  /* The header names the document and says what it is: the pair of languages
-     and where the run has got to. The name is the only part allowed to be
+  /* The header names the document; the name is the only part allowed to be
      long, so it is the only part that elides. */
   setText(byId("crumb-doc"), run.file || run.run_id);
-  setText(
-    byId("crumb-meta"),
-    `${run.src || "?"} → ${run.tgt || "?"} · ${STATUS_WORDS[run.status] || run.status}`,
-  );
-  /* What the run was asked to do — the language pair, the chunk
-     count, when it started — is not a headline under the title: those are facts
+  /* What the run was asked to do — the chunk count, when it started — is
+     not a headline under the title: those are facts
      about the translation, and they are listed with the rest of them in the
      report tab. The heading keeps the document's name and the badge that says
      what the run is doing. */
@@ -895,14 +1140,15 @@ function renderJob(detail) {
   badge.dataset.state = run.status;
   setText(badge, STATUS_WORDS[run.status] || run.status);
   renderActions(detail);
-  if (run.note) {
-    const alert = byId("job-alert");
-    alert.dataset.kind = run.status === "failed" ? "error" : "warn";
-    setText(alert, run.note);
-    show(alert, true);
-  } else {
-    show(byId("job-alert"), false);
+  /* A run's failure is announced at the top of the window, not inside the
+     panel the reader is watching. The same note is not repeated on every
+     poll; a new one is. */
+  const noteKey = `${run.run_id}:${run.note || ""}`;
+  if (run.note && noteKey !== state.lastNote) {
+    toast(run.note, run.status === "failed" ? "error" : "warn", 9000);
   }
+  state.lastNote = run.note ? noteKey : "";
+  show(byId("job-alert"), false);
 }
 
 function renderEmptyJob() {
@@ -910,7 +1156,6 @@ function renderEmptyJob() {
   job.dataset.state = "empty";
   setText(byId("job-title"), "Chưa mở lượt dịch nào");
   setText(byId("crumb-doc"), "Chưa mở lượt dịch nào");
-  setText(byId("crumb-meta"), "");
   setText(
     byId("job-meta"),
     "Chọn một lượt ở cột bên trái, hoặc bắt đầu một lượt mới.",
@@ -920,7 +1165,8 @@ function renderEmptyJob() {
   const badge = show(byId("job-status"), false);
   badge.dataset.state = "empty";
   setText(badge, "");
-  clear(byId("job-actions"));
+  const tools = clear(byId("job-tools"));
+  tools.dataset.signature = "";
   clear(byId("job-control"));
   show(byId("job-alert"), false);
   show(byId("progress"), false);
@@ -940,10 +1186,6 @@ function renderEmptyJob() {
     "",
     "",
   );
-  /* The downloads belonged to the run that was open: with no run there is no
-     text behind them, and a link to the run that was just deleted would only
-     fail. */
-  renderSourceGets("", "empty");
   paintPane(
     "pane-target",
     "target-text",
@@ -1745,6 +1987,9 @@ function resumeInfo(events) {
       return {
         requested: Boolean(event.resume_requested),
         resumed: Number(event.resumed_chunks) || 0,
+        /* Chunks whose text this job had no checkpoint for, but the content
+           bank did: they were translated under another model or endpoint. */
+        foreign: Number(event.reused_foreign) || 0,
         usable: Boolean(event.checkpoint_usable),
         /* When this attempt was continued. The notice belongs to that moment,
            so a page can tell a notice it has already raised from one it has
@@ -1756,16 +2001,11 @@ function resumeInfo(events) {
   return null;
 }
 
-/* When the attempt the reader is watching began.
+/* When the newest attempt in this log began.
 
-   A run's own start time is the day the run was created, and a run that was
-   continued keeps it: the time it spent failed — waiting for a reader, for a
-   provider, for a free slot — is not time it spent translating. Counting from
-   the run's start made a run that had just been continued report the whole
-   wait as running time, and a healthy run read as one that had been stuck for
-   an hour. The clock measures the attempt, so it starts again with every
-   attempt; when the log has no attempt to point at, the run's start is the
-   best answer there is. */
+   Kept for the rare legacy log with no usable attempt boundaries; the clock
+   itself is built by `attemptTotals`, which sums each attempt's recorded
+   duration instead of measuring from a date the run was created. */
 function attemptStart(events, run) {
   for (let i = events.length - 1; i >= 0; i -= 1) {
     const event = events[i];
@@ -1776,12 +2016,61 @@ function attemptStart(events, run) {
   return Number(run && run.started) || 0;
 }
 
+/* The time actually spent translating, summed attempt by attempt.
+
+   A run keeps the clock it was created with, and a run continued days later
+   still carries that date. Measuring from it would count the days it sat idle
+   as running time, and re-assembling an old PDF would report dozens of hours
+   for a few minutes of work. Each attempt therefore contributes its own
+   `run_end.duration_ms`; an attempt still in flight contributes only the time
+   since its own `run_start`. Old attempts without that field fall back to the
+   distance between their start and end records.
+
+   `hasSegments` separates "no attempt has been seen yet" from "an attempt took
+   zero seconds": a page that has just opened a running run must show nothing
+   rather than measure the old run from its creation date. */
+function attemptTotals(events, run) {
+  let ms = 0;
+  let attempts = 0;
+  let start = 0;
+  let last = 0;
+  for (const event of events) {
+    if (!event) continue;
+    const ts = Number(event.ts) || 0;
+    if (ts) last = ts;
+    if (event.type === "run_start" && ts) {
+      start = ts;
+    } else if (event.type === "run_end") {
+      const reported = Number(event.duration_ms) || 0;
+      if (reported > 0) {
+        ms += reported;
+      } else if (start && ts > start) {
+        ms += (ts - start) * 1000;
+      }
+      attempts += 1;
+      start = 0;
+    }
+  }
+  if (start) {
+    const until = run.status === "running" ? Date.now() / 1000 : last;
+    if (until > start) {
+      ms += (until - start) * 1000;
+    }
+    attempts += 1;
+  }
+  return { ms: Math.max(0, ms), attempts: attempts, hasSegments: attempts > 0 };
+}
+
 /* What to say about a resume that replayed nothing. `checkpoint_usable` only
    means checkpointing is switched on — it is not evidence that a model or file
    changed. A previous attempt that was stopped before finishing a single chunk
    produces the exact same reading, so claiming a mismatch every time is wrong.
    Say only what is certain: no checkpoint was reused. */
 function resumeNotice(info) {
+  if (info.foreign) {
+    /* Not a warning: the work was kept, it just came from another model. */
+    return `dùng lại ${formatCount(info.foreign)} chunk đã dịch bằng model khác — các chunk đó không bị dịch lại.`;
+  }
   return info.usable
     ? "Không dùng lại được checkpoint nào cho lượt này — các chunk sẽ dịch từ đầu."
     : "Chưa có checkpoint để dùng — các chunk sẽ dịch từ đầu.";
@@ -1873,9 +2162,19 @@ function renderProgress(detail) {
         ? Number(last.ts)
         : null;
   const began = attemptStart(state.events, run);
+  const totals = attemptTotals(state.events, run);
+  /* Until this attempt has written its own run_start, there is no honest
+     duration to show: the run's creation date belongs to a previous session. */
+  const elapsedSeconds = totals.hasSegments
+    ? totals.ms / 1000
+    : run.status === "running"
+      ? 0
+      : until && began
+        ? until - began
+        : 0;
   setText(
     byId("progress-elapsed"),
-    until && began ? `đã chạy ${formatClock(until - began)}` : "",
+    elapsedSeconds > 0 ? `đã chạy ${formatClock(elapsedSeconds)}` : "",
   );
 
   setText(byId("progress-speed"), speedLine(run));
@@ -1932,6 +2231,9 @@ function progressWord(run, last, info) {
   if (run.status === "done") {
     return "Đã dịch xong.";
   }
+  if (run.status === "incomplete") {
+    return "Đã dịch xong nhưng còn chunk chưa được xác minh.";
+  }
   if (run.status === "failed") {
     return run.exit_code === null || run.exit_code === undefined
       ? "Lượt dịch đã lỗi."
@@ -1956,6 +2258,85 @@ const LOG_STATUS_WORDS = {
   info: "ghi chú",
   note: "tiếp tục",
 };
+
+/*: A glyph beside the word, so a column of log lines can be scanned without
+   reading it: the shape says what the word says, for a reader in a hurry. */
+const LOG_STATUS_GLYPHS = {
+  start: "▶",
+  ok: "✓",
+  fail: "✕",
+  retry: "↻",
+  patched: "✎",
+  info: "•",
+  note: "•",
+};
+
+/*: What a provider's HTTP status means, in the reader's words. The pipeline's
+   own message carries the code and — for a CDN — its whole JSON body; the log
+   line says what happened and leaves the body a click away in the fold. */
+const HTTP_WORDS = {
+  400: "yêu cầu không hợp lệ",
+  401: "sai hoặc thiếu khoá API",
+  403: "không có quyền truy cập",
+  404: "không tìm thấy model hoặc đường dẫn",
+  408: "quá thời gian chờ",
+  409: "xung đột yêu cầu",
+  413: "yêu cầu quá lớn",
+  422: "dữ liệu gửi lên không hợp lệ",
+  429: "hết hạn mức gọi API",
+  500: "máy chủ nhà cung cấp lỗi",
+  502: "cổng kết nối nhà cung cấp lỗi",
+  503: "nhà cung cấp tạm không phục vụ",
+  504: "nhà cung cấp trả lời quá chậm",
+  520: "nhà cung cấp trả lời không hợp lệ (Cloudflare 520)",
+  521: "nhà cung cấp từ chối kết nối (Cloudflare 521)",
+  522: "kết nối tới nhà cung cấp quá hạn (Cloudflare 522)",
+  523: "không tới được nhà cung cấp (Cloudflare 523)",
+  524: "nhà cung cấp quá tải, quá 120 giây không trả lời (Cloudflare 524)",
+  525: "bắt tay TLS thất bại (Cloudflare 525)",
+  527: "kết nối tới nhà cung cấp lỗi (Cloudflare 527)",
+  529: "nhà cung cấp quá tải (Cloudflare 529)",
+};
+
+/* A provider failure, said in one readable sentence.
+
+   The raw text names Python classes (``PermanentError: InternalServerError:``)
+   and, for Cloudflare, pastes a JSON object with a support URL into the line.
+   None of that answers "what went wrong?" — the status code does, and the
+   provider's own short reason when it gives one. The untouched message stays in
+   the row's fold, so nothing is hidden, only summarised. */
+function humanError(text) {
+  let message = String(text || "").trim();
+  if (!message) {
+    return "";
+  }
+  message = message.replace(
+    /\b(?:Permanent|Transient|NoBackup|RateLimit|Truncated|Verification|LLM)Error:\s*/g,
+    "",
+  );
+  message = message.replace(/^InternalServerError:\s*/i, "");
+  const code = message.match(/(?:Error code:|HTTP|status)\s*:?\s*(\d{3})\b/i);
+  const word = code ? HTTP_WORDS[Number(code[1])] : "";
+  if (word) {
+    const detail = message.match(
+      /['"](?:message|detail|title)['"]\s*:\s*['"]([^'"]{3,140})['"]/,
+    );
+    const reason = detail && !/^error \d/i.test(detail[1]) ? detail[1] : "";
+    return reason ? `${word} — ${reason}` : word;
+  }
+  if (/timed out|timeout/i.test(message)) {
+    return "quá thời gian chờ";
+  }
+  /* No known shape: the first sentence, whitespace folded so a JSON body does
+     not arrive as a single unreadable line. */
+  const flat = message.replace(/\s+/g, " ");
+  return flat.length > 200 ? `${flat.slice(0, 199)}…` : flat;
+}
+
+function sentenceCase(text) {
+  const value = String(text || "");
+  return value ? value.charAt(0).toUpperCase() + value.slice(1) : value;
+}
 
 /* When a log line happened, to the second: a log is read in order, and the gaps
    between its lines are part of what it says. A line the pipeline itself never
@@ -1990,11 +2371,19 @@ function logEntry(event, index) {
   const message = String(event.error || event.message || "");
   const entry = {
     ts: event.ts,
+    kind: kind,
     status: status,
-    where: STEP_WORDS[step] || step,
+    where: sentenceCase(STEP_WORDS[step] || step),
     chunk: displayChunkId(event.chunk_id),
+    /* A provider failure is translated into words here; every other message is
+       the pipeline's own and already reads as one. */
     text: displayChunkText(
-      [CAUSE_WORDS[cause] || cause, message].filter(Boolean).join(" · "),
+      [
+        CAUSE_WORDS[cause] || cause,
+        status === "fail" || status === "retry" ? humanError(message) : message,
+      ]
+        .filter(Boolean)
+        .join(" · "),
     ),
     /* The event itself, so a row can be opened onto everything it carries —
        the full message and the fields the one line leaves out. Its index is
@@ -2004,36 +2393,23 @@ function logEntry(event, index) {
   };
   if (kind === "run_start") {
     entry.status = "ok";
-    entry.where = "Bắt đầu";
+    entry.where = "Bắt đầu lượt chạy";
     entry.text = [
       event.file ? String(event.file) : "",
       event.chunks ? `${formatCount(event.chunks)} chunk` : "",
-      event.src || event.tgt ? `${event.src || "?"} → ${event.tgt || "?"}` : "",
+      event.pages ? `${formatCount(event.pages)} trang` : "",
+      event.src && event.tgt ? `${event.src} → ${event.tgt}` : "",
     ]
       .filter(Boolean)
       .join(" · ");
   } else if (kind === "run_end") {
-    entry.status = status === "failed" ? "fail" : "ok";
+    /* The timeline's last word is a verdict, not a tally: did it finish, and if
+       not, what stopped it. The counts it used to carry live in the conclusion
+       block right below, with the reason spelled out. */
+    entry.status =
+      status === "done" ? "ok" : status === "incomplete" ? "note" : "fail";
     entry.where = "Kết thúc";
-    const calls = Number(event.active_api_calls);
-    const peak = Number(event.max_active_api_calls);
-    const callWords = [];
-    if (Number.isFinite(calls) && calls >= 0) {
-      callWords.push(`${formatCount(calls)} luồng`);
-    }
-    if (Number.isFinite(peak) && peak > 0) {
-      callWords.push(`cao nhất ${formatCount(peak)}`);
-    }
-    entry.text = [
-      event.chunks
-        ? `đã dịch ${formatCount(event.chunks_done || 0)}/${formatCount(event.chunks)} chunk`
-        : "",
-      event.chunks_failed ? `${formatCount(event.chunks_failed)} chunk lỗi` : "",
-      callWords.length ? callWords.join(" · ") : "",
-      event.duration_ms ? formatClock(Number(event.duration_ms) / 1000) : "",
-    ]
-      .filter(Boolean)
-      .join(" · ");
+    entry.text = runEndSentence(event);
   } else if (kind === "resume") {
     /* Only the log carries this. Which chunks a resume replayed says what the
        run's past was, not what it is doing now, so it is not pinned under the
@@ -2048,13 +2424,50 @@ function logEntry(event, index) {
     }
     entry.status = "note";
     entry.where = "Tiếp tục";
-    entry.text = Number(event.resumed_chunks)
-      ? `dùng lại ${formatCount(event.resumed_chunks)} chunk đã dịch trước đó`
-      : resumeNotice({ usable: Boolean(event.checkpoint_usable) });
+    const foreign = Number(event.reused_foreign) || 0;
+    entry.text = Number(event.resumed_chunks) || foreign
+      ? `dùng lại ${formatCount(event.resumed_chunks || foreign)} chunk đã dịch trước đó` +
+        (foreign ? ` (${formatCount(foreign)} từ model khác)` : "")
+      : resumeNotice({ usable: Boolean(event.checkpoint_usable), foreign });
   } else if (!entry.text && (event.duration_ms || event.latency)) {
-    entry.text = formatDuration(Number(event.duration_ms || event.latency));
+    const spent = formatDuration(Number(event.duration_ms || event.latency));
+    entry.text = status === "ok" ? `mất ${spent}` : spent;
   }
   return entry;
+}
+
+/* One sentence for the run's last record: how it ended and, when it did not
+   finish, the reason it names of its own. */
+function runEndSentence(event) {
+  const status = String(event.status || "");
+  const done = Number(event.chunks_done) || 0;
+  const total = Number(event.chunks) || 0;
+  const failed = Number(event.chunks_failed) || 0;
+  const holes = Number(event.chunks_permanently_failed) || 0;
+  const parts = [];
+  if (status === "done") {
+    parts.push(
+      total
+        ? `hoàn tất ${formatCount(done)}/${formatCount(total)} chunk`
+        : "hoàn tất",
+    );
+  } else if (status === "incomplete") {
+    parts.push(
+      total ? `chưa đủ: ${formatCount(done)}/${formatCount(total)} chunk xong` : "chưa đủ",
+    );
+  } else {
+    parts.push("thất bại");
+  }
+  const fatal = humanError(String(event.fatal_error || ""));
+  if (fatal) {
+    parts.push(fatal);
+  } else if (failed || holes) {
+    parts.push(`${formatCount(failed + holes)} chunk còn thiếu`);
+  }
+  if (event.duration_ms) {
+    parts.push(`sau ${formatClock(Number(event.duration_ms) / 1000)}`);
+  }
+  return parts.join(" · ");
 }
 
 /* The chevron a log line folds behind: a static shape, built node by node like
@@ -2174,6 +2587,14 @@ function logRow(entry) {
   const word = LOG_STATUS_WORDS[entry.status] || entry.status;
   row.dataset.status = entry.status;
   row.dataset.expanded = "false";
+  /* A new attempt of the same run (a resume) starts a fresh page of the log:
+     the separator says the lines below belong to that attempt, not to the
+     stopped one that wrote the lines above. */
+  if (entry.kind === "run_start") {
+    row.dataset.attempt = "true";
+  }
+  /* Which chunk this line is about, so the conclusion's table can point at it. */
+  row.dataset.chunk = entry.chunk || "";
   row.title = [entry.where, entry.chunk, word, entry.text].filter(Boolean).join(" · ");
   const fields = entry.event ? logDetailRows(entry.event, entry.index) : [];
   /* A line with nothing to open — no message, no fields — stays a plain row
@@ -2189,7 +2610,14 @@ function logRow(entry) {
     toggle.tabIndex = -1;
   }
   row.append(toggle);
-  row.append(element("span", "log-time", logClock(entry.ts)));
+  const clock = element("span", "log-time", logClock(entry.ts));
+  if (entry.gap) {
+    clock.append(element("span", "log-gap", `+${gapWords(entry.gap)}`));
+  }
+  row.append(clock);
+  row.append(
+    element("span", "log-badge", `${LOG_STATUS_GLYPHS[entry.status] || "•"} ${word}`),
+  );
   row.append(
     element(
       "span",
@@ -2197,7 +2625,6 @@ function logRow(entry) {
       entry.chunk ? `${entry.where} · ${entry.chunk}` : entry.where || "—",
     ),
   );
-  row.append(element("span", "log-word", word));
   row.append(element("span", "log-text", entry.text));
   const detail = element("div", "log-detail");
   detail.hidden = true;
@@ -2238,7 +2665,335 @@ function loggedProblemKeys() {
 function resetLog() {
   state.logged = 0;
   state.loggedProblems = new Set();
+  state.conclusionKey = "";
   clear(byId("history"));
+}
+
+/* A wait in the unit the log has room for: seconds under a minute, a clock
+   above it. */
+function gapWords(seconds) {
+  const value = Math.round(Number(seconds) || 0);
+  return value < 60 ? `${value}s` : formatClock(value);
+}
+
+/* ------------------------------------------------------- the log's ending */
+
+/* What a finished run's ending says, derived from the run's own records.
+
+   The log is a timeline: it says what happened, in order, and its final line is
+   one more step. A reader who opens a finished run wants the answer first —
+   did it finish, if not why, and what is left to do — so the end of the log is
+   a verdict with a reason and a next move, not a tally of calls. */
+function exitWords(code) {
+  if (code === null || code === undefined || code === "") {
+    return "không rõ";
+  }
+  const value = Number(code);
+  if (value === 0) {
+    return "0 — hoàn tất";
+  }
+  if (value === 2) {
+    return "2 — chưa đủ, file đã ghi";
+  }
+  if (value === 1) {
+    return "1 — lượt chạy lỗi";
+  }
+  return `${value} — lỗi`;
+}
+
+/* Why a run that did not finish stopped, in the words of whoever knew: the
+   run's own fatal error, the last failing step, the server's tail of a child
+   that died before it could log, or the note the server wrote itself. */
+function runFailureWords(detail, end) {
+  const problems = (detail && detail.problems) || [];
+  let last = null;
+  for (let i = state.events.length - 1; i >= 0; i -= 1) {
+    const event = state.events[i];
+    if (event && String(event.status) === "fail" && (event.error || event.message)) {
+      last = event;
+      break;
+    }
+  }
+  const failure = problems.length ? problems[0] : null;
+  const candidates = [
+    end && end.fatal_error,
+    last && (last.error || last.message),
+    failure && failure.message,
+    detail && detail.run && detail.run.note,
+  ];
+  for (const candidate of candidates) {
+    const words = humanError(String(candidate || ""));
+    if (!words) {
+      continue;
+    }
+    const where = last
+      ? [
+          sentenceCase(STEP_WORDS[last.step] || last.step || ""),
+          displayChunkId(last.chunk_id),
+        ]
+          .filter(Boolean)
+          .join(" · ")
+      : failure
+        ? sentenceCase(STEP_WORDS[failure.step] || failure.step || "")
+        : "";
+    return { words: words, where: where };
+  }
+  return { words: "tiến trình kết thúc mà không ghi lý do", where: "" };
+}
+
+/*: The reasons a run left chunks unfinished, grouped so fifty holes do not
+   print fifty near-identical lines: the three most common causes, with counts. */
+function reasonGroups(items) {
+  const groups = new Map();
+  for (const item of items) {
+    let reason = displayChunkText(String(item.reason || "chưa xác minh"));
+    if (/^translation failed permanently/i.test(reason)) {
+      reason = "lỗi vĩnh viễn khi dịch (không retry được)";
+    }
+    const short = reason.length > 90 ? `${reason.slice(0, 89)}…` : reason;
+    groups.set(short, (groups.get(short) || 0) + 1);
+  }
+  return Array.from(groups.entries())
+    .sort((a, b) => b[1] - a[1])
+    .slice(0, 3);
+}
+
+function conclusionFor(detail) {
+  const run = (detail && detail.run) || {};
+  if (!isFinal(run.status)) {
+    return null;
+  }
+  const end = lastOfType(state.events, "run_end");
+  const completion =
+    detail.completion && Number(detail.completion.expected)
+      ? detail.completion
+      : (end && end.completion) || {};
+  const expected = Number(completion.expected || run.chunks || 0);
+  const verified = Number(completion.verified || 0);
+  const done = Number((end && end.chunks_done) || verified || 0);
+  const holes = Number((end && end.chunks_permanently_failed) || 0);
+  const incomplete = detail.incomplete_chunks || completion.incomplete || [];
+  const tone =
+    run.status === "done"
+      ? "ok"
+      : run.status === "failed"
+        ? "fail"
+        : run.status === "stopped"
+          ? "stopped"
+          : "incomplete";
+  const of = expected
+    ? `${formatCount(done)}/${formatCount(expected)}`
+    : formatCount(done);
+  let title = "Kết thúc";
+  let mark = "•";
+  let reason = "";
+  let next = "";
+  if (tone === "ok") {
+    title = "Hoàn tất";
+    mark = "✓";
+    reason = expected
+      ? `Đã dịch và xác minh đủ ${formatCount(verified || expected)}/${formatCount(expected)} chunk.`
+      : "Đã dịch xong toàn bộ tài liệu.";
+    next = "Mở tab Bản dịch để đọc hoặc tải file.";
+  } else if (tone === "incomplete") {
+    title = "Chưa xong";
+    mark = "!";
+    reason = [
+      expected
+        ? `Còn ${formatCount(incomplete.length)}/${formatCount(expected)} chunk chưa có bản dịch đã xác minh (${of} chunk xong).`
+        : `Còn ${formatCount(incomplete.length)} chunk chưa xong.`,
+      holes
+        ? `${formatCount(holes)} trong số đó là lỗi vĩnh viễn, không retry được.`
+        : "",
+    ]
+      .filter(Boolean)
+      .join(" ");
+    next =
+      "File hiện tại vẫn dùng được. Bấm Tiếp tục để dịch nốt phần thiếu — các chunk đã xong giữ nguyên.";
+  } else if (tone === "stopped") {
+    title = "Đã dừng";
+    mark = "‖";
+    reason = `Lượt chạy được dừng theo yêu cầu ở ${of} chunk.`;
+    next = "Bấm Tiếp tục để dịch tiếp từ phần còn lại.";
+  } else {
+    const failure = runFailureWords(detail, end);
+    title = "Thất bại";
+    mark = "✕";
+    reason = failure.where
+      ? `Dừng ở ${failure.where} vì ${failure.words}.`
+      : `Dừng vì ${failure.words}.`;
+    next =
+      "Các chunk đã dịch vẫn nằm trong checkpoint. Sửa nguyên nhân rồi bấm Tiếp tục để chỉ dịch phần còn thiếu.";
+  }
+  const rows = incomplete
+    .slice(0, 6)
+    .map((item) => [
+      displayChunkId(item.chunk || ""),
+      displayChunkText(item.reason || "chưa xác minh"),
+    ]);
+  const facts = [
+    ["Mã thoát", exitWords(run.exit_code != null ? run.exit_code : end && end.exit_code)],
+  ];
+  if (end && Number(end.duration_ms)) {
+    facts.push(["Thời gian chạy", formatClock(Number(end.duration_ms) / 1000)]);
+  }
+  const tokens = end && end.tokens;
+  if (tokens && (Number(tokens.sent) || Number(tokens.received))) {
+    facts.push([
+      "Token",
+      `gửi ${formatCount(tokens.sent || 0)} · nhận ${formatCount(tokens.received || 0)}`,
+    ]);
+  }
+  if (tokens && Number(tokens.cache_unknown) && !Number(tokens.cache_hits)) {
+    /* Honest wording: the page cannot claim caching works when the provider
+       never reports it, and that is exactly what a 0-hit run needs to say. */
+    facts.push([
+      "Prompt cache",
+      `${formatCount(tokens.cache_unknown)} call lớn không được nhà cung cấp báo cache`,
+    ]);
+  } else if (tokens && (Number(tokens.cache_hits) || Number(tokens.cache_misses))) {
+    facts.push([
+      "Prompt cache",
+      `${formatCount(tokens.cache_hits || 0)} hit · ${formatCount(tokens.cache_misses || 0)} miss`,
+    ]);
+  }
+  if (end && (Number(end.retries) || Number(end.fallbacks))) {
+    facts.push([
+      "Thử lại",
+      `${formatCount(Number(end.retries) || 0)} lần · ${formatCount(Number(end.fallbacks) || 0)} lần chuyển sang backup`,
+    ]);
+  }
+  if (run.translator_model) {
+    facts.push(["Model", String(run.translator_model)]);
+  }
+  return {
+    tone: tone,
+    title: title,
+    mark: mark,
+    reason: reason,
+    next: next,
+    rows: rows,
+    more: Math.max(0, incomplete.length - rows.length),
+    reasons: incomplete.length > 1 ? reasonGroups(incomplete) : [],
+    facts: facts,
+  };
+}
+
+function conclusionNode(verdict) {
+  const item = element("li", "log-conclusion");
+  item.dataset.tone = verdict.tone;
+  const head = element("div", "conclusion-head");
+  head.append(element("span", "conclusion-mark", verdict.mark));
+  head.append(element("h3", "conclusion-title", verdict.title));
+  item.append(head);
+  item.append(element("p", "conclusion-reason", verdict.reason));
+  if (verdict.next) {
+    item.append(element("p", "conclusion-next", verdict.next));
+  }
+  if (verdict.reasons.length) {
+    const list = element("ul", "conclusion-reasons");
+    for (const [reason, count] of verdict.reasons) {
+      const row = element("li");
+      row.append(element("span", "conclusion-count", formatCount(count)));
+      row.append(element("span", "conclusion-reason-text", reason));
+      list.append(row);
+    }
+    item.append(list);
+  }
+  if (verdict.rows.length) {
+    const table = element("table", "conclusion-table");
+    const head = element("tr");
+    for (const heading of ["Chunk", "Lý do"]) {
+      head.append(element("th", "", heading));
+    }
+    table.append(head);
+    for (const cells of verdict.rows) {
+      const row = element("tr");
+      row.append(element("td", "conclusion-chunk", cells[0]));
+      row.append(element("td", "", cells[1]));
+      table.append(row);
+    }
+    item.append(table);
+    if (verdict.more) {
+      item.append(
+        element(
+          "p",
+          "conclusion-more",
+          `… và ${formatCount(verdict.more)} chunk khác — xem tab Báo cáo.`,
+        ),
+      );
+    }
+  }
+  const facts = element("dl", "conclusion-facts");
+  for (const [key, value] of verdict.facts) {
+    facts.append(element("dt", "", key));
+    facts.append(element("dd", "", value));
+  }
+  item.append(facts);
+  return item;
+}
+
+/* Show only the lines that explain a bad run, when the reader asks for that:
+   the row's own status is the filter, so a new line is filtered as it arrives. */
+function applyLogFilter() {
+  const list = byId("history");
+  const button = byId("log-fails");
+  if (!list || !button) {
+    return;
+  }
+  button.setAttribute("aria-pressed", state.logFails ? "true" : "false");
+  for (const row of list.querySelectorAll(".log-line")) {
+    row.hidden = state.logFails && row.dataset.status !== "fail";
+  }
+}
+
+/* The first failing line, wherever the reader is: a log is read backwards from
+   a verdict, and this is the one jump that is always needed. */
+function jumpToFirstFailure() {
+  const list = byId("history");
+  if (!list) {
+    return;
+  }
+  const row = list.querySelector('.log-line[data-status="fail"]');
+  if (row) {
+    row.scrollIntoView({ block: "center" });
+  }
+}
+
+/* Draw the ending under the log, and only redraw it when its content changed:
+   a poll that re-created the block on every tick would throw away the reader's
+   place in the list while a long run writes lines above it. */
+function renderConclusion(added) {
+  const list = byId("history");
+  const old = list.querySelector(".log-conclusion");
+  const verdict = conclusionFor(state.detail);
+  if (!verdict) {
+    if (old) {
+      old.remove();
+    }
+    state.conclusionKey = "";
+    return;
+  }
+  const key = JSON.stringify([
+    verdict.tone,
+    verdict.title,
+    verdict.reason,
+    verdict.next,
+    verdict.reasons,
+    verdict.rows,
+    verdict.facts,
+  ]);
+  if (old && state.conclusionKey === key) {
+    if (added) {
+      list.append(old); /* new lines above it: the ending moves to the bottom */
+    }
+    return;
+  }
+  if (old) {
+    old.remove();
+  }
+  state.conclusionKey = key;
+  list.append(conclusionNode(verdict));
 }
 
 /* The run's log, one line per event, appended a poll at a time: what each chunk
@@ -2248,12 +3003,20 @@ function resetLog() {
 function renderLog() {
   const list = byId("history");
   const atEnd = list.scrollHeight - list.scrollTop - list.clientHeight < 40;
+  let added = 0;
   for (let i = state.logged; i < state.events.length; i += 1) {
     const entry = logEntry(state.events[i], i);
     state.logged = i + 1;
-    if (entry) {
-      list.append(logRow(entry));
+    if (!entry) {
+      continue;
     }
+    /* The wait between two lines is part of what a log says: a minute of
+       silence before a retry is a slow provider, not a missing event. */
+    const before = i > 0 ? Number(state.events[i - 1].ts) || 0 : 0;
+    const gap = entry.ts && before ? Number(entry.ts) - before : 0;
+    entry.gap = gap >= 5 ? gap : 0;
+    list.append(logRow(entry));
+    added += 1;
   }
   /* The child's own last words, when it died before writing any event: the
      server reports them and nothing in the feed carries them. */
@@ -2279,6 +3042,8 @@ function renderLog() {
       }),
     );
   }
+  renderConclusion(added);
+  applyLogFilter();
   /* Only a reader already at the end wants to be carried along; someone
      scrolling back through the log is left where they are. */
   if (atEnd) {
@@ -2332,10 +3097,68 @@ function chunkTotals(events) {
   return byChunk;
 }
 
+/* Totals for every attempt of this translation, not just the newest one.
+
+   New runs carry `run_end.cumulative`; logs written before that field existed
+   still have every attempt's own `run_end` in the event stream, so the fallback
+   adds those. Scores are weighted by their sample counts because the backend
+   keeps the authoritative per-chunk map; a retried chunk would otherwise be
+   counted once per attempt. */
+function cumulativeTotals(events, end) {
+  if (end && end.cumulative && typeof end.cumulative === "object") {
+    return end.cumulative;
+  }
+  const total = {
+    attempts: 0,
+    tokens: { sent: 0, received: 0, cached: 0 },
+    calls: 0,
+    retries: 0,
+    chunk_retries: 0,
+    fallbacks: 0,
+    duration_ms: 0,
+    planner_calls: 0,
+    chunks_done: 0,
+    chunks_rejected: 0,
+    verify_skipped: 0,
+    skill: { mean: 0, samples: 0 },
+  };
+  let scoreSum = 0;
+  let samples = 0;
+  for (const event of events) {
+    if (!event || event.type !== "run_end") {
+      continue;
+    }
+    total.attempts += 1;
+    const tokens = event.tokens || {};
+    total.tokens.sent += Number(tokens.sent) || 0;
+    total.tokens.received += Number(tokens.received) || 0;
+    total.tokens.cached += Number(tokens.cached) || 0;
+    total.calls += Number(event.calls) || 0;
+    total.retries += Number(event.retries) || 0;
+    total.chunk_retries += Number(event.chunk_retries) || 0;
+    total.fallbacks += Number(event.fallbacks) || 0;
+    total.duration_ms += Number(event.duration_ms) || 0;
+    total.planner_calls += Number(event.planner_calls) || 0;
+    total.chunks_done = Math.max(total.chunks_done, Number(event.chunks_done) || 0);
+    if (event.chunks_rejected != null) {
+      total.chunks_rejected = Number(event.chunks_rejected) || 0;
+    }
+    if (event.verify_skipped != null) {
+      total.verify_skipped = Number(event.verify_skipped) || 0;
+    }
+    const skill = event.skill || {};
+    if (Number(skill.samples)) {
+      scoreSum += (Number(skill.mean) || 0) * Number(skill.samples);
+      samples += Number(skill.samples);
+    }
+  }
+  total.skill = { mean: samples ? scoreSum / samples : 0, samples: samples };
+  return total;
+}
+
 /* The end-of-run report, built from the events the page already polls: no route
    of its own, and a run that is still going gets working figures rather than a
-   blank page. `run_end` is the pipeline's own tally, so it wins where it
-   exists; everything per chunk is counted here. */
+   blank page. */
 function reportFor(detail) {
   const run = detail.run;
   const events = state.events;
@@ -2344,9 +3167,10 @@ function reportFor(detail) {
   for (const cell of cells) {
     counts[cell.state] += 1;
   }
-  const totals = Array.from(chunkTotals(events).values());
-  const retried = totals.filter((entry) => entry.retranslated > 0);
+  const chunkStats = Array.from(chunkTotals(events).values());
+  const retried = chunkStats.filter((entry) => entry.retranslated > 0);
   const end = lastOfType(events, "run_end");
+  const cumulative = cumulativeTotals(events, end);
   /* The skill the run started with: recorded on `run_start` so the report can
      name what shaped these translations, not just how they scored. */
   const start = events.find((event) => event && event.type === "run_start") || null;
@@ -2355,6 +3179,7 @@ function reportFor(detail) {
      it was created, and the time it spent failed is not time it spent
      translating. */
   const started = attemptStart(events, run);
+  const measured = attemptTotals(events, run);
   /* Actual in-flight API calls at the newest observation, plus the peak seen in
      this run. Older events without the field leave both null: the UI says
      "not measured" instead of inventing a zero. */
@@ -2394,17 +3219,20 @@ function reportFor(detail) {
     maxActiveApiCalls: maxActiveApiCalls,
     /* Only the slowest few: a table of every chunk's timing is the chunk list
        again, and no one reads it. */
-    slowest: totals
+    cumulative: cumulative,
+    slowest: chunkStats
       .filter((entry) => entry.ms > 0)
       .sort((a, b) => b.ms - a.ms)
       .slice(0, 8),
     resumed: (resumeInfo(events) || {}).resumed || 0,
-    elapsed:
-      end && end.duration_ms
-        ? Number(end.duration_ms)
-        : started && last
-          ? Math.max(0, (last - started) * 1000)
-          : 0,
+    /* Summed attempts are authoritative; `cumulative` may predate the logs it
+       should have counted (an old run rebuilt today starts its total at zero),
+       so take the larger of the two rather than letting it hide the old time. */
+    elapsed: measured.hasSegments
+      ? Math.max(Number(cumulative.duration_ms) || 0, measured.ms)
+      : Number(cumulative.duration_ms) ||
+          (end && end.duration_ms) ||
+          (started && last ? Math.max(0, (last - started) * 1000) : 0),
   };
 }
 
@@ -2439,6 +3267,9 @@ function consistencyText(end) {
 
 function reportFacts(report) {
   const { counts, run, end, activeApiCalls, maxActiveApiCalls } = report;
+  const cumulative = report.cumulative || {};
+  const attempts = Number(cumulative.attempts) || 0;
+  const suffix = attempts > 1 ? ` · tổng ${formatCount(attempts)} lượt` : "";
   const total = counts.wait + counts.running + counts.ok + counts.fail;
   const facts = [];
   facts.push([
@@ -2448,6 +3279,22 @@ function reportFacts(report) {
       (counts.wait ? ` · ${formatCount(counts.wait)} chưa dịch` : "") +
       (counts.running ? ` · ${formatCount(counts.running)} đang dịch` : ""),
   ]);
+  if (Number(cumulative.verify_skipped)) {
+    facts.push([
+      "Kiểm định ngữ nghĩa",
+      `${formatCount(cumulative.verify_skipped)} chunk chưa kiểm định · giữ bản dịch, không checkpoint`,
+    ]);
+  }
+  const completion = end && end.completion;
+  if (completion && Number(completion.expected)) {
+    const missing = (completion.incomplete || []).length;
+    facts.push([
+      "Hoàn tất",
+      missing
+        ? `${formatCount(completion.verified)}/${formatCount(completion.expected)} chunk có checkpoint xác minh · còn ${formatCount(missing)} chưa xong`
+        : `${formatCount(completion.verified)}/${formatCount(completion.expected)} chunk có checkpoint xác minh`,
+    ]);
+  }
   /* A finished run has no "currently": its last sample is always zero, so the
      peak is the only number that means anything and the answer says so. */
   facts.push([
@@ -2465,7 +3312,10 @@ function reportFacts(report) {
             : ""),
   ]);
   if (report.elapsed) {
-    facts.push(["Thời gian chạy", formatClock(report.elapsed / 1000)]);
+    facts.push(["Thời gian chạy", formatClock(report.elapsed / 1000) + suffix]);
+  }
+  if (attempts > 1) {
+    facts.push(["Số lượt chạy", formatCount(attempts)]);
   }
   facts.push([
     "Phải dịch lại",
@@ -2480,37 +3330,21 @@ function reportFacts(report) {
   if (consistency) {
     facts.push(["Nhất quán thuật ngữ", consistency]);
   }
-  if (end && Number(end.retries)) {
-    facts.push(["Lượt thử lại của nhà cung cấp", formatCount(end.retries)]);
+  if (Number(cumulative.retries)) {
+    facts.push(["Lượt thử lại của nhà cung cấp", formatCount(cumulative.retries) + suffix]);
   }
-  const tokens = (end && end.tokens) || null;
+  const tokens = cumulative.tokens || null;
   if (tokens && (tokens.sent || tokens.received)) {
     facts.push([
       "Token",
       `Input: ${formatCount(tokens.sent || 0)} tokens - Output: ${formatCount(tokens.received || 0)} tokens` +
-        (tokens.cached ? ` - Cached input ${formatCount(tokens.cached)} tokens` : ""),
+        (tokens.cached ? ` - Cached input ${formatCount(tokens.cached)} tokens` : "") +
+        suffix,
     ]);
   }
-  /* What this run was asked to do: the language pair, how the
-     document was split and when it started. These used to sit in a row of tags
-     under the title; they belong with the rest of the run's figures. */
-  facts.push(["Cặp ngôn ngữ", `${run.src || "?"} → ${run.tgt || "?"}`]);
-  /* Which skill wrote this document, and what it measured on these chunks. An
-     old run has no `skill` on its start record: it says nothing rather than
-     guessing. */
-  const skill = report.skill;
-  if (skill) {
-    const measured = end && end.skill && Number(end.skill.samples)
-      ? ` · đo ${(Number(end.skill.mean) || 0).toFixed(2)}/10 (${formatCount(end.skill.samples)} chunk)`
-      : "";
-    const promoted = end && end.skill && end.skill.promoted ? " · đã promote bản mới" : "";
-    facts.push([
-      "Skill đang dùng",
-      skill.applied
-        ? `v${skill.version || "?"} (${skill.id || "?"})${measured}${promoted}`
-        : "không dùng (SKILL_APPLY off hoặc chưa có skill)",
-    ]);
-  }
+  /* What this run was asked to do: how the document was split and when it
+     started. These used to sit in a row of tags under the title; they belong
+     with the rest of the run's figures. */
   if (run.chunks) {
     facts.push(["Số chunk", formatCount(run.chunks)]);
   }
@@ -2522,7 +3356,9 @@ function reportFacts(report) {
     end
       ? Number(end.exit_code) === 0
         ? "thành công"
-        : `lỗi (mã thoát ${end.exit_code})`
+        : Number(end.exit_code) === 2
+          ? "chưa đầy đủ (mã thoát 2)"
+          : `lỗi (mã thoát ${end.exit_code})`
       : STATUS_WORDS[run.status] || run.status,
   ]);
   return facts;
@@ -2573,6 +3409,21 @@ function renderReport(detail) {
     facts.append(row);
   }
   box.append(facts);
+  const incomplete =
+    (report.end && report.end.completion && report.end.completion.incomplete) || [];
+  if (incomplete.length) {
+    box.append(
+      reportTable(
+        "Chunk chưa hoàn tất",
+        ["Chunk", "Lý do"],
+        incomplete.map((item) => [
+          displayChunkId(item.chunk || ""),
+          displayChunkText(item.reason || "chưa xác minh"),
+        ]),
+        "",
+      ),
+    );
+  }
   box.append(
     reportTable(
       "Chunk lỗi",
@@ -2746,43 +3597,9 @@ function moveFind(step) {
   scrollToFind();
 }
 
-/* The two files the source column can give: the extraction as the pipeline
-   wrote it — ⟦CODE_n⟧ and the emphasis tokens intact — and the same text with
-   the emphasis written as Markdown and the code markers gone. Built once per
-   run: a poll redraws the panes every second, and rebuilding two links under a
-   reader's focus would take it away for nothing. */
-function renderSourceGets(base, sourceState) {
-  const box = byId("source-gets");
-  show(box, sourceState === "done");
-  if (sourceState !== "done" || box.dataset.base === base) {
-    return;
-  }
-  clear(box);
-  for (const item of [
-    {
-      label: "Tải bản trích xuất",
-      title: "Bản gốc trích xuất, giữ nguyên marker (⟦CODE_n⟧, ⟦BOLD⟧, ⟦ITALIC⟧)",
-      markers: "keep",
-    },
-    {
-      label: "Tải bản gốc",
-      title: "Tải văn bản phía dưới",
-      markers: "strip",
-    },
-  ]) {
-    const link = element("a", "", item.label);
-    link.href = `${base}/source?download=1&markers=${item.markers}`;
-    link.title = item.title;
-    link.setAttribute("download", "");
-    box.append(link);
-  }
-  box.dataset.base = base;
-}
-
 function renderPanes() {
   const detail = state.detail;
   if (!detail) {
-    renderSourceGets("", "empty");
     return;
   }
   const run = detail.run;
@@ -2809,7 +3626,6 @@ function renderPanes() {
     source.body,
     source.meta,
   );
-  renderSourceGets(base, source.state);
 
   const target = { state: "empty", note: "", body: "", meta: "" };
   if (!detail.md) {
@@ -3234,6 +4050,12 @@ async function pollRun(runId) {
   } catch (error) {
     if (state.open === runId) {
       renderBanner("error", `Không theo dõi được lượt dịch: ${error.message}`);
+      /* One failed request must not end the tracking. Returning here without a
+         new timer is what left the page frozen at its last log line while the
+         chunk it was waiting for finished minutes later — the run kept going,
+         only the watch died. Keep the warning up and try again on a slower
+         beat; the run's own state is still on the server. */
+      state.timer = setTimeout(() => pollRun(runId), POLL_FAIL_MS);
     }
     return;
   }
@@ -3550,8 +4372,6 @@ async function startRun(event) {
       : "md";
   const body = {
     file: file,
-    src: byId("src").value || "auto",
-    tgt: byId("tgt").value || "vi",
     format: format,
   };
   const button = byId("new-job-start");
@@ -3578,13 +4398,13 @@ async function startRun(event) {
    their cards grey out while the checkbox is ticked; `groupOnly` marks the
    group endpoint itself, which greys out while it is not. */
 const SETTINGS_AGENTS = [
-  { id: "PLANNER", title: "Planner", hint: "Chiến lược & thuật ngữ, chạy một lần ở đầu pipeline" },
-  { id: "TRANSLATOR", title: "Translator", hint: "Dịch từng chunk", grouped: true },
-  { id: "CRITIC", title: "Critic", hint: "Chấm điểm bản nháp", grouped: true },
-  { id: "REFINER", title: "Refiner", hint: "Viết lại theo nhận xét của Critic", grouped: true },
-  { id: "VERIFIER", title: "Verifier", hint: "Kiểm tra bản dịch cuối cùng" },
-  { id: "SOURCE_GROUP", title: "Gom cụm (Source Group)", hint: "Endpoint chung cho Translator · Critic · Refiner", groupOnly: true },
-  { id: "BACKUP", title: "Backup", hint: "Endpoint dự phòng dùng chung cho cả pipeline" },
+  { id: "PLANNER", title: "Planner" },
+  { id: "SOURCE_GROUP", title: "Gom cụm (Source Group)", groupOnly: true },
+  { id: "TRANSLATOR", title: "Translator", grouped: true },
+  { id: "CRITIC", title: "Critic", grouped: true },
+  { id: "REFINER", title: "Refiner", grouped: true },
+  { id: "VERIFIER", title: "Verifier" },
+  { id: "BACKUP", title: "Backup" },
 ];
 
 const SETTINGS_TEST_DEBOUNCE_MS = 700;
@@ -3595,6 +4415,7 @@ const SETTINGS_TEST_DEBOUNCE_MS = 700;
    cannot overwrite the verdict of a newer one. */
 const settingsState = {
   agents: {},
+  drafts: {},
   timers: {},
   tests: {},
 };
@@ -3625,10 +4446,18 @@ function settingsValues(agentId) {
     const input = card && card.querySelector(`input[data-field="${field}"]`);
     return String((input && input.value) || "").trim();
   };
-  return { base_url: value("base_url"), model: value("model"), api_key: value("api_key") };
+  const values = { base_url: value("base_url"), model: value("model"), api_key: value("api_key") };
+  const draft = settingsState.drafts[agentId] || {};
+  for (const field of ["temperature", "timeout"]) {
+    const raw = String(draft[field] || "").trim();
+    if (raw !== "") {
+      values[field] = raw;
+    }
+  }
+  return values;
 }
 
-function settingsField(labelText, field, type, value, placeholder) {
+function settingsField(labelText, field, type, value, placeholder, attrs) {
   const line = element("label", "settings-line");
   line.append(element("span", "label", labelText));
   const input = document.createElement("input");
@@ -3639,24 +4468,114 @@ function settingsField(labelText, field, type, value, placeholder) {
   input.placeholder = placeholder;
   input.autocomplete = "off";
   input.spellcheck = false;
+  for (const [key, val] of Object.entries(attrs || {})) {
+    input.setAttribute(key, val);
+  }
   line.append(input);
   return line;
 }
 
-/* One agent's card: the three fields, a status dot that turns with each test,
-   and the one button that erases the saved override. */
+/* Backup is a normal card. Its fold lives outside the card, so the panel itself
+   keeps the same identity / fields / status anatomy as every other agent. */
+function backupPanel(card) {
+  const panel = element("div", "settings-backup");
+  panel.dataset.collapsed = "true";
+  const toggle = element("button", "settings-backup-toggle", "▸ Mở rộng Backup");
+  toggle.type = "button";
+  toggle.setAttribute("aria-expanded", "false");
+  toggle.addEventListener("click", () => {
+    const folded = panel.dataset.collapsed !== "true";
+    panel.dataset.collapsed = String(folded);
+    toggle.setAttribute("aria-expanded", String(!folded));
+    setText(toggle, folded ? "▸ Mở rộng Backup" : "▾ Thu gọn Backup");
+  });
+  panel.append(toggle, card);
+  return panel;
+}
+
+function gearIcon() {
+  const NS = "http://www.w3.org/2000/svg";
+  const svg = document.createElementNS(NS, "svg");
+  svg.setAttribute("viewBox", "0 0 20 20");
+  svg.setAttribute("width", "16");
+  svg.setAttribute("height", "16");
+  svg.setAttribute("fill", "none");
+  svg.setAttribute("stroke", "currentColor");
+  svg.setAttribute("stroke-width", "1.5");
+  svg.setAttribute("stroke-linejoin", "round");
+  svg.setAttribute("aria-hidden", "true");
+  const outline = document.createElementNS(NS, "path");
+  outline.setAttribute(
+    "d",
+    "M8.6 2.6h2.8l.4 1.9 1.5.7 1.7-.9 2 2-.9 1.7.7 1.5 1.9.4v2.8l-1.9.4-.7 1.5.9 1.7-2 2-1.7-.9-1.5.7-.4 1.9H8.6l-.4-1.9-1.5-.7-1.7.9-2-2 .9-1.7-.7-1.5-1.9-.4V8.6l1.9-.4.7-1.5-.9-1.7 2-2 1.7.9 1.5-.7.4-1.9z",
+  );
+  const hole = document.createElementNS(NS, "circle");
+  hole.setAttribute("cx", "10");
+  hole.setAttribute("cy", "10");
+  hole.setAttribute("r", "2.6");
+  svg.append(outline, hole);
+  return svg;
+}
+
+function openAgentConfig(agentId) {
+  const dialog = byId("agent-config");
+  const agent = SETTINGS_AGENTS.find((entry) => entry.id === agentId);
+  if (!dialog || typeof dialog.showModal !== "function" || !agent) {
+    return;
+  }
+  const draft = settingsState.drafts[agentId] || {};
+  dialog.dataset.agent = agentId;
+  setText(byId("agent-config-title"), `Cấu hình ${agent.title}`);
+  byId("agent-config-temperature").value = draft.temperature || "";
+  byId("agent-config-timeout").value = draft.timeout || "";
+  dialog.showModal();
+}
+
+function applyAgentConfig() {
+  const dialog = byId("agent-config");
+  const agentId = dialog.dataset.agent;
+  if (!agentId) {
+    return;
+  }
+  const draft = settingsState.drafts[agentId] || (settingsState.drafts[agentId] = {});
+  draft.temperature = byId("agent-config-temperature").value.trim();
+  draft.timeout = byId("agent-config-timeout").value.trim();
+  dialog.close();
+}
+
+function closeAgentConfig() {
+  const dialog = byId("agent-config");
+  if (typeof dialog.close === "function") {
+    dialog.close();
+  } else {
+    dialog.removeAttribute("open");
+  }
+}
+
+/* One agent, one panel: identity, gear and connection status on the left;
+   Base URL, API key and Model on the right. */
 function settingsCard(agent, test) {
   const saved = settingsState.agents[agent.id] || {};
+  const draft =
+    settingsState.drafts[agent.id] || (settingsState.drafts[agent.id] = settingsDraft(agent.id));
   const card = element("section", "settings-card");
   card.dataset.agent = agent.id;
   card.dataset.state = "idle";
 
-  const head = element("header", "settings-card-head");
-  const naming = element("div", "settings-card-naming");
-  naming.append(element("h3", "settings-card-title", agent.title));
-  naming.append(element("p", "settings-card-hint", agent.hint));
-  head.append(naming);
+  const side = element("div", "settings-card-side");
+  const heading = element("div", "settings-card-heading");
+  heading.append(element("h3", "settings-card-title", agent.title));
 
+  const gear = element("button", "icon-btn settings-gear");
+  gear.type = "button";
+  gear.setAttribute("aria-label", `Cấu hình ${agent.title}`);
+  gear.title = `Cấu hình ${agent.title}`;
+  gear.append(gearIcon());
+  gear.addEventListener("click", () => openAgentConfig(agent.id));
+  heading.append(gear);
+  side.append(heading);
+
+  const footer = element("div", "settings-card-footer");
   const status = element("span", "settings-status");
   status.dataset.state = test ? (test.ok ? "ok" : "fail") : "idle";
   if (test && test.ok) {
@@ -3666,35 +4585,7 @@ function settingsCard(agent, test) {
   } else {
     status.title = "Chưa kiểm tra";
   }
-  head.append(status);
-
-  const remove = element("button", "icon-btn settings-clear");
-  remove.type = "button";
-  remove.setAttribute("aria-label", `Xóa cấu hình ${agent.title}`);
-  remove.title = "Xóa cấu hình đã lưu — agent quay lại dùng .env";
-  remove.append(trashIcon());
-  remove.addEventListener("click", () => deleteSetting(agent.id));
-  head.append(remove);
-  card.append(head);
-
-  /* URL and model name are one row: the two halves of an address, not two
-     subjects. The key stays on a line of its own, where it has room for the
-     "already stored" placeholder. */
-  const pair = element("div", "settings-card-pair");
-  pair.append(
-    settingsField("Base URL", "base_url", "url", saved.base_url || "", "https://api.openai.com/v1"),
-    settingsField("Model", "model", "text", saved.model || "", "gpt-4o-mini"),
-  );
-  const key = settingsField(
-    "API Key",
-    "api_key",
-    "password",
-    "",
-    saved.has_key ? "•••••• (đã lưu — để trống để giữ)" : "sk-…",
-  );
-  card.append(pair, key);
-
-  const note = element("p", "settings-card-note");
+  const note = element("span", "settings-card-note");
   if (test && test.ok) {
     setText(note, `Đã kết nối · ${test.latency_ms} ms`);
   } else if (test && !test.ok) {
@@ -3704,11 +4595,43 @@ function settingsCard(agent, test) {
   } else {
     setText(note, "Dùng giá trị .env");
   }
-  card.append(note);
-  card.dataset.state = test ? (test.ok ? "ok" : "fail") : "idle";
+  footer.append(status, note);
+  side.append(footer);
+  card.append(side);
 
-  /* Typing schedules one test, not one per keystroke; editing clears the old
-     verdict first, so a card never shows a green tick it no longer earned. */
+  const fields = element("div", "settings-fields");
+  const baseLine = settingsField(
+    "Base URL",
+    "base_url",
+    "url",
+    saved.base_url || "",
+    "https://api.openai.com/v1",
+  );
+  const keyLine = settingsField(
+    "API Key",
+    "api_key",
+    "password",
+    "",
+    saved.has_key ? "•••••• (đã lưu — để trống để giữ)" : "sk-…",
+  );
+  const modelLine = settingsField("Model", "model", "text", saved.model || "", "gpt-4o-mini");
+  fields.append(baseLine, keyLine, modelLine);
+  card.append(fields);
+
+  /* The knobs describe one endpoint: changing the address drops them. */
+  for (const line of [baseLine, modelLine]) {
+    const input = line.querySelector("input");
+    input.addEventListener("input", () => {
+      draft.temperature = "";
+      draft.timeout = "";
+      const dialog = byId("agent-config");
+      if (dialog && dialog.dataset.agent === agent.id) {
+        byId("agent-config-temperature").value = "";
+        byId("agent-config-timeout").value = "";
+      }
+    });
+  }
+
   const scheduleTest = () => {
     setSettingsStatus(agent.id, "idle", "Đang soạn…");
     clearTimeout(settingsState.timers[agent.id]);
@@ -3721,9 +4644,22 @@ function settingsCard(agent, test) {
 }
 
 function renderSettingsCards(tests) {
-  const wrap = clear(byId("settings-cards"));
+  const wrap = byId("settings-cards");
+  /* The group switch is page markup so its id always resolves; it is
+     lifted out before the cards are cleared and put back after the Source
+     Group card, before the three agents it groups. */
+  const group = byId("settings-group-choice");
+  if (group) {
+    group.remove();
+  }
+  clear(wrap);
   for (const agent of SETTINGS_AGENTS) {
-    wrap.append(settingsCard(agent, tests[agent.id]));
+    const card = settingsCard(agent, tests[agent.id]);
+    wrap.append(agent.id === "BACKUP" ? backupPanel(card) : card);
+    if (agent.id === "SOURCE_GROUP" && group) {
+      group.hidden = false;
+      wrap.append(group);
+    }
   }
 }
 
@@ -3794,8 +4730,17 @@ function readSettingsForm() {
   };
 }
 
+function settingsDraft(agentId) {
+  const entry = settingsState.agents[agentId] || {};
+  return {
+    temperature: entry.temperature != null ? String(entry.temperature) : "",
+    timeout: entry.timeout != null ? String(entry.timeout) : "",
+  };
+}
+
 function adoptSettings(saved) {
   settingsState.agents = {};
+  settingsState.drafts = {};
   for (const [id, entry] of Object.entries((saved && saved.agents) || {})) {
     settingsState.agents[id] = entry;
   }
@@ -3809,38 +4754,59 @@ async function saveSettings() {
   try {
     const saved = await request("PUT", "/api/settings", readSettingsForm());
     adoptSettings(saved);
-    settingsAlert("Đã lưu cấu hình.", "ok");
-    renderBanner("ok", "Đã lưu cấu hình endpoint — áp dụng cho các lượt dịch mới.");
+    closeSettingsDialog();
+    toast("Đã lưu cấu hình endpoint — áp dụng cho các lượt dịch mới.", "ok");
   } catch (error) {
-    settingsAlert(`Không lưu được: ${error.message}`, "error");
+    toast(`Không lưu được: ${error.message}`, "error", 8000);
   } finally {
     button.disabled = false;
   }
 }
 
-async function deleteSetting(agentId) {
-  let saved;
-  try {
-    saved = await request("DELETE", `/api/settings/${encodeURIComponent(agentId)}`);
-  } catch (error) {
-    settingsAlert(`Không xóa được cấu hình: ${error.message}`, "error");
+function toast(message, kind = "ok", timeoutMs = 6000) {
+  const wrap = byId("toasts");
+  if (!wrap || !message) {
     return;
   }
-  adoptSettings(saved && saved.settings);
-  const agent = SETTINGS_AGENTS.find((entry) => entry.id === agentId);
-  settingsAlert(`Đã xóa cấu hình ${agent ? agent.title : agentId} — quay lại dùng .env.`, "ok");
+  const node = element("div", "toast", String(message));
+  node.dataset.kind = kind;
+  node.tabIndex = 0;
+  node.setAttribute("role", "status");
+  const dismiss = () => {
+    node.remove();
+    syncToasts();
+  };
+  node.addEventListener("click", dismiss);
+  wrap.append(node);
+  if (typeof wrap.showPopover === "function") {
+    try {
+      wrap.showPopover();
+    } catch (_) {
+      /* already open */
+    }
+  }
+  setTimeout(dismiss, timeoutMs);
 }
 
+function syncToasts() {
+  const wrap = byId("toasts");
+  if (
+    wrap &&
+    !wrap.childElementCount &&
+    typeof wrap.hidePopover === "function" &&
+    wrap.matches(":popover-open")
+  ) {
+    wrap.hidePopover();
+  }
+}
+
+/* A message about the tool, not about the document: it arrives from the
+   top of the window, above every panel and dialog. */
 function settingsAlert(message, kind) {
-  const alert = byId("settings-alert");
   if (!message) {
-    show(alert, false);
-    setText(alert, "");
     return;
   }
-  alert.dataset.kind = kind || "error";
-  setText(alert, message);
-  show(alert, true);
+  toast(message, kind || "error", 8000);
 }
 
 function openSettingsDialog() {
@@ -3851,11 +4817,13 @@ function openSettingsDialog() {
   settingsAlert("");
   api("/api/settings")
     .then((data) => {
-      byId("settings-group").checked = !!(data && data.use_source_group);
       byId("settings-concurrency").value = (data && data.max_concurrency) || 1;
       byId("settings-provider-concurrency").value =
         (data && data.provider_concurrency) || 1;
       adoptSettings(data);
+      /* The group switch is drawn among the cards, so it exists only now. */
+      byId("settings-group").checked = !!(data && data.use_source_group);
+      renderGroupMode();
       dialog.showModal();
     })
     .catch((error) => renderBanner("error", `Không đọc được cấu hình: ${error.message}`));
@@ -3892,6 +4860,8 @@ function wire() {
   byId("settings-save").addEventListener("click", saveSettings);
   byId("settings-group").addEventListener("change", renderGroupMode);
   byId("settings-form").addEventListener("submit", (event) => event.preventDefault());
+  byId("agent-config-cancel").addEventListener("click", closeAgentConfig);
+  byId("agent-config-save").addEventListener("click", applyAgentConfig);
 
   const drop = byId("drop");
   const input = byId("file-input");
@@ -4029,6 +4999,25 @@ function wire() {
     /* Switching to the grid draws it at once, not at the next poll: the reader
        asked to see it now. */
     renderChunks(state.detail);
+  });
+  byId("log-fails").addEventListener("click", () => {
+    state.logFails = !state.logFails;
+    applyLogFilter();
+  });
+  byId("log-first-fail").addEventListener("click", () => jumpToFirstFailure());
+  /* A chunk named in the conclusion's table is a pointer into the log: clicking
+     it walks the reader to that chunk's lines instead of making them search. */
+  byId("history").addEventListener("click", (event) => {
+    const cell = event.target.closest ? event.target.closest(".conclusion-chunk") : null;
+    if (!cell) {
+      return;
+    }
+    const row = byId("history").querySelector(
+      `.log-line[data-chunk="${cell.textContent.trim()}"]`,
+    );
+    if (row) {
+      row.scrollIntoView({ block: "center" });
+    }
   });
   byId("tab-history").addEventListener("click", () => {
     state.tab = "history";

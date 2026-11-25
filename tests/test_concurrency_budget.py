@@ -59,6 +59,8 @@ def _run(mock_env, monkeypatch, path, *, concurrency=None, replies=None, out=Non
             register_mock_reply(marker, reply)
     if concurrency is not None:
         monkeypatch.setenv("MAX_CONCURRENCY", str(concurrency))
+    # The chunk budget is configuration, not a per-run argument.
+    monkeypatch.setenv("CHUNK_MAX_TOKENS", str(MAX_TOKENS))
     # Measure each run independently.
     TokenUsage.reset()
     RetryStats.reset()
@@ -68,7 +70,6 @@ def _run(mock_env, monkeypatch, path, *, concurrency=None, replies=None, out=Non
         path,
         src="en",
         tgt="vi",
-        max_tokens=MAX_TOKENS,
         out=out or str(path.with_suffix(".vi.md")),
     )
     return result, TokenUsage.snapshot(), TokenUsage.snapshot_by_agent()
@@ -178,8 +179,12 @@ def test_request_budget_semantic_retry(mock_env, tmp_path, monkeypatch):
     # rather than a hole; the run still reports the rejection.
     assert result.chunks_failed == 0
     assert result.chunks_rejected == EXPECTED_CHUNKS
-    assert _calls(by, "TRANSLATOR") == 2 * EXPECTED_CHUNKS
-    assert _calls(by, "VERIFIER") == 2 * EXPECTED_CHUNKS
+    # Two tries in the chunk graph, plus the completion sweep's one final try
+    # before the rejection is taken as final.
+    assert _calls(by, "TRANSLATOR") == 3 * EXPECTED_CHUNKS
+    # The sweep re-verifies the kept draft before retranslating it, so it sees
+    # one more verdict than it asks for a translation.
+    assert _calls(by, "VERIFIER") == 4 * EXPECTED_CHUNKS
     assert _calls(by, "CRITIC") == 0
     assert _calls(by, "REFINER") == 0
 
@@ -320,6 +325,51 @@ def test_the_run_end_record_carries_the_api_call_concurrency(mock_env, tmp_path,
 # provider). Worker pool (MAX_CONCURRENCY) and provider queue (LLM_PROVIDER_
 # CONCURRENCY) stay separate by design: the queue bounds how many requests are
 # in flight at the provider; the worker pool may run more workers in parallel.
+
+
+def test_chunk_workers_hold_one_chunk_slot_until_it_finishes(mock_env, monkeypatch):
+    """No worker may take a second chunk while its first is still running."""
+    import threading
+    from types import SimpleNamespace
+
+    from polyglot_lc.pipeline import TranslationPipeline
+    from polyglot_lc.segment.chunker import Chunk
+
+    monkeypatch.setenv("MAX_CONCURRENCY", "3")
+    chunks = [
+        Chunk(id=f"c{i}", text=f"Source {i}.", token_count=3, section_path=[], index=i)
+        for i in range(9)
+    ]
+    lock = threading.Lock()
+    active = 0
+    peak = 0
+
+    def invoke(state, **kwargs):
+        nonlocal active, peak
+        with lock:
+            active += 1
+            peak = max(peak, active)
+        try:
+            time.sleep(0.03)
+            return {"translated": "Bản dịch.", "chunk": state["chunk"]}
+        finally:
+            with lock:
+                active -= 1
+
+    ui = SimpleNamespace(
+        advance=lambda: None,
+        add_error=lambda *_a, **_k: None,
+        retry=lambda *_a, **_k: None,
+    )
+    states = TranslationPipeline(quiet=True)._run_chunks(
+        SimpleNamespace(invoke=invoke),
+        chunks,
+        {},
+        ui,
+    )
+
+    assert len(states) == len(chunks)
+    assert peak == 3, f"{peak} chunk workers ran at once; configured MAX_CONCURRENCY=3"
 
 
 def test_provider_concurrency_respects_configured_limit(mock_env, monkeypatch):
@@ -535,7 +585,7 @@ def test_promoted_skill_reaches_every_translator_prompt(mock_env, tmp_path, monk
     replies = {"translation QA verifier": '{"pass": false, "reasons": ["dropped"]}'}
     result, _snap, _by = _run(mock_env, monkeypatch, path, concurrency=1, replies=replies)
     assert result.chunks_rejected == EXPECTED_CHUNKS
-    assert len(seen) == 2 * EXPECTED_CHUNKS
+    assert len(seen) == 3 * EXPECTED_CHUNKS
     assert all(s == "Never invent names." for s in seen), seen
     # The skill's few-shot is merged into every prompt's examples too
     # (acceptance criterion 2, second half).
@@ -553,13 +603,13 @@ def test_corrupt_skill_md_does_not_fail_the_run(mock_env, tmp_path, monkeypatch)
 
 
 # --------------------------- glossary context bound -------------------------
-def test_render_user_glossary_is_capped():
-    from polyglot_lc.segment.glossary import MAX_USER_GLOSSARY_TERMS, render_user_glossary
+def test_render_glossary_mapping_is_capped():
+    from polyglot_lc.segment.glossary import MAX_GLOSSARY_TERMS, render_glossary_mapping
 
-    mapping = {f"term{i}": f"value{i}" for i in range(MAX_USER_GLOSSARY_TERMS + 50)}
-    rendered = render_user_glossary(mapping)
-    assert rendered.count("\n") + 1 == MAX_USER_GLOSSARY_TERMS
-    assert "term0" in rendered and f"term{MAX_USER_GLOSSARY_TERMS}" not in rendered
+    mapping = {f"term{i}": f"value{i}" for i in range(MAX_GLOSSARY_TERMS + 50)}
+    rendered = render_glossary_mapping(mapping)
+    assert rendered.count("\n") + 1 == MAX_GLOSSARY_TERMS
+    assert "term0" in rendered and f"term{MAX_GLOSSARY_TERMS}" not in rendered
 
 
 # --------------------------- cache fingerprint ------------------------------

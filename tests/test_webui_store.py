@@ -1,4 +1,4 @@
-"""Tests for webui.store: the run, skill and glossary stores.
+"""Tests for webui.store: the run and skill stores.
 
 There is no configuration store to test: the web application has no view of
 `.env`, and `tests/test_webui_server.py` asserts that no route exposes one.
@@ -8,9 +8,7 @@ from __future__ import annotations
 
 import json
 
-import pytest
-
-from webui.store import GlossaryStore, RunRecord, RunsStore
+from webui.store import RunRecord, RunsStore
 
 
 def _record(run_id: str = "r1", **over) -> RunRecord:
@@ -148,19 +146,3 @@ def test_tail_output_falls_back_to_stdout_and_tolerates_absence(tmp_path):
     assert s.tail_output("r1") == "Configuration error: missing key"
     assert s.tail_output("nope") == ""
     assert s.tail_output("../escape") == ""
-
-
-# ------------------------------ glossary store ------------------------------
-def test_glossary_round_trip_with_bom(tmp_path):
-    (tmp_path / "g.csv").write_bytes("\ufeffsource,target\nNMT, dịch máy\n".encode("utf-8"))
-    st = GlossaryStore(tmp_path)
-    assert st.read("g.csv")[1] == ["NMT", "dịch máy"]
-    st.write("h.csv", [["a", "b"]])
-    assert st.read("h.csv") == [["a", "b"]]
-    assert {f["name"] for f in st.list_files()} == {"g.csv", "h.csv"}
-
-
-def test_glossary_rejects_a_name_that_escapes(tmp_path):
-    st = GlossaryStore(tmp_path)
-    with pytest.raises(ValueError):
-        st.read("../secrets.csv")

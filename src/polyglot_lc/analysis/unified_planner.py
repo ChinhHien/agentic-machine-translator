@@ -21,7 +21,7 @@ from polyglot_lc.segment.glossary import (
     GlossaryTerm,
     glossary_budget,
     glossary_to_md,
-    render_user_glossary,
+    render_glossary_mapping,
 )
 from polyglot_lc.segment.summary_tree import build_sections, preview_text
 
@@ -42,6 +42,10 @@ OUTLINE_MAX_CHARS = 20_000
 MAX_PLANNER_TERMS = 40
 
 DEFAULT_STRATEGY = "literal, terminology-consistent"
+
+#: Version of the serialized plan stored in a checkpoint. Bump when a field's
+#: meaning changes; an old cache is ignored and the plan is rebuilt.
+PLAN_CACHE_SCHEMA = 1
 
 
 @dataclass(frozen=True)
@@ -69,6 +73,25 @@ class DocumentPlan:
     used_llm: bool = False
     section_count: int = 0
 
+    def to_dict(self) -> dict[str, Any]:
+        """Plain JSON-ready form, for keeping the plan beside its checkpoints."""
+        return {
+            "summary": self.summary,
+            "strategy": self.strategy,
+            "few_shot": list(self.few_shot),
+            "pitfalls": list(self.pitfalls),
+            "glossary_pairs": [
+                {"term": pair.term, "translation": pair.translation, "reason": pair.reason}
+                for pair in self.glossary_pairs
+            ],
+            "glossary_md": self.glossary_md,
+            "complexity": float(self.complexity),
+            "section_notes": dict(self.section_notes),
+            "notes": self.notes,
+            "used_llm": bool(self.used_llm),
+            "section_count": int(self.section_count),
+        }
+
     def note_for(self, section_path: str) -> str:
         """Planner note for a chunk's section ('' when it has none)."""
         if not section_path or not self.section_notes:
@@ -78,6 +101,56 @@ class DocumentPlan:
         # Section paths are "Parent > Child"; fall back to the parent heading.
         parent = section_path.split(" > ")[0].strip()
         return self.section_notes.get(parent, "")
+
+
+def plan_to_dict(plan: DocumentPlan) -> dict[str, Any]:
+    """Serialize a plan for the checkpoint without exposing dataclass internals."""
+    return plan.to_dict()
+
+
+def plan_from_dict(data: Any) -> DocumentPlan | None:
+    """Rebuild a cached plan, or ``None`` when the payload is not usable.
+
+    A cache written by an older or hand-edited version must never break a
+    resume: a malformed plan is treated exactly like a missing one.
+    """
+    if not isinstance(data, dict):
+        return None
+    try:
+        pairs: list[GlossaryPair] = []
+        for raw in data.get("glossary_pairs") or []:
+            if not isinstance(raw, dict):
+                continue
+            term = str(raw.get("term", "")).strip()
+            translation = str(raw.get("translation", "")).strip()
+            if not term or not translation:
+                continue
+            pairs.append(
+                GlossaryPair(term=term, translation=translation, reason=str(raw.get("reason", "planner")))
+            )
+        notes = data.get("section_notes")
+        section_notes = (
+            {str(key): str(value) for key, value in notes.items() if key is not None}
+            if isinstance(notes, dict)
+            else {}
+        )
+        few_shot = data.get("few_shot")
+        pitfalls = data.get("pitfalls")
+        return DocumentPlan(
+            summary=str(data.get("summary", "")),
+            strategy=str(data.get("strategy", "") or DEFAULT_STRATEGY),
+            few_shot=[str(item) for item in few_shot] if isinstance(few_shot, list) else [],
+            pitfalls=[str(item) for item in pitfalls] if isinstance(pitfalls, list) else [],
+            glossary_pairs=pairs,
+            glossary_md=str(data.get("glossary_md", "(none)") or "(none)"),
+            complexity=float(data.get("complexity", 0.0) or 0.0),
+            section_notes=section_notes,
+            notes=str(data.get("notes", "")),
+            used_llm=bool(data.get("used_llm", False)),
+            section_count=int(data.get("section_count", 0) or 0),
+        )
+    except (TypeError, ValueError, AttributeError):
+        return None
 
 
 def build_outline(chunks: list[Chunk]) -> dict[str, str]:
@@ -187,19 +260,20 @@ def merge_glossary_md(
     *,
     planner_pairs: list[GlossaryPair],
     heuristic_terms: list[GlossaryTerm],
-    user_glossary: dict[str, str] | None = None,
+    core_glossary: dict[str, str] | None = None,
     extra_md: str = "",
     limit: int | None = None,
 ) -> str:
     """Render the glossary block, most authoritative entry first.
 
     Order is deliberate: pre-rendered text supplied by the caller, then the
-    user's CSV, then the Planner's translated terms, then whatever terminology
-    heuristics found (which have no target form and are only hints).
+    core pairs the run starts from, then the Planner's translated terms, then
+    whatever terminology heuristics found (which have no target form and are
+    only hints).
 
-    *limit* caps the Planner's and the heuristics' entries only. The user's own
-    CSV is never truncated: their dictionary outranks anything the machine
-    guessed, and keeping that one rule is what makes a growing budget safe.
+    *limit* caps the Planner's and the heuristics' entries only. The core
+    pairs are never truncated: they outrank anything the machine guessed, and
+    keeping that one rule is what makes a growing budget safe.
     """
     covered: set[str] = set()
     blocks: list[str] = []
@@ -207,10 +281,10 @@ def merge_glossary_md(
     if extra_md.strip():
         blocks.append(extra_md.strip())
 
-    user = render_user_glossary(user_glossary or {})
-    if user:
-        blocks.append(user)
-        covered.update(k.casefold() for k in (user_glossary or {}))
+    core = render_glossary_mapping(core_glossary or {})
+    if core:
+        blocks.append(core)
+        covered.update(k.casefold() for k in (core_glossary or {}))
 
     pairs = [
         p
@@ -241,7 +315,7 @@ def _planner_prompt(
     src_lang: str,
     tgt_lang: str,
     glossary_candidates: str,
-    user_glossary_md: str,
+    core_glossary_md: str,
     trace_lines: list[str],
     max_terms: int = MAX_PLANNER_TERMS,
 ) -> str:
@@ -256,8 +330,8 @@ def _planner_prompt(
         + ("\n".join(trace_lines) if trace_lines else "(none)")
         + "\n\nTerminology candidates found by heuristics (keep, correct or drop):\n"
         + (glossary_candidates or "(none)")
-        + "\n\nAuthoritative glossary supplied by the user (must be used verbatim):\n"
-        + (user_glossary_md or "(none)")
+        + "\n\nAuthoritative glossary (must be used verbatim, over the candidates above):\n"
+        + (core_glossary_md or "(none)")
         + "\n\nDocument body (sampled across the whole document; "
         "'[...]' marks text that was skipped):\n" + f"{excerpt}\n\n"
         "Decide ONE translation strategy for this document, extract the domain "
@@ -288,7 +362,7 @@ def _fallback_plan(
     doc_text: str,
     outline: dict[str, str],
     heuristic_terms: list[GlossaryTerm],
-    user_glossary: dict[str, str] | None,
+    core_glossary: dict[str, str] | None,
 ) -> DocumentPlan:
     """Plan built locally when the Planner request fails or is disabled."""
     return DocumentPlan(
@@ -298,7 +372,7 @@ def _fallback_plan(
         glossary_md=merge_glossary_md(
             planner_pairs=[],
             heuristic_terms=heuristic_terms,
-            user_glossary=user_glossary,
+            core_glossary=core_glossary,
         ),
         complexity=heuristic_document_complexity(doc_text),
         section_count=len(outline),
@@ -312,7 +386,7 @@ def _canonical_translation(text: str) -> str:
     The planner sometimes answers ``"bảo mật / an toàn thông tin"``: two
     acceptable renderings joined by a slash. Prompts and the deterministic
     glossary check need one form, so the first is kept; the check itself still
-    accepts the alternatives when they come from a user glossary.
+    accepts the alternatives the glossary block itself carries.
     """
     first = text.split(" / ")[0].strip()
     return first or text
@@ -377,7 +451,7 @@ def analyze_document(
     doc_summary: str = "",
     doc_title: str = "Document",
     heuristic_terms: list[GlossaryTerm] | None = None,
-    user_glossary: dict[str, str] | None = None,
+    core_glossary: dict[str, str] | None = None,
     rb_traces: list[Any] | None = None,
     extra_glossary_md: str = "",
 ) -> DocumentPlan:
@@ -388,11 +462,11 @@ def analyze_document(
     """
     heuristic_terms = list(heuristic_terms or [])
     # One number cannot fit both a memo and a 1000-page book: the budget grows
-    # with the document, floored at the Planner's old 40 and capped at the user
-    # glossary's 200 (see glossary_budget).
+    # with the document, floored at the Planner's old 40 and capped at
+    # MAX_GLOSSARY_TERMS (see glossary_budget).
     limit = glossary_budget(len(doc_text)) if doc_text else MAX_PLANNER_TERMS
     outline = build_outline(chunks)
-    user_glossary_md = render_user_glossary(user_glossary or {})
+    core_glossary_md = render_glossary_mapping(core_glossary or {})
     trace_lines = [
         f"- {t.strategy} | pitfalls: {'; '.join(t.pitfalls) or '-'}" for t in (rb_traces or [])
     ]
@@ -404,7 +478,7 @@ def analyze_document(
         src_lang=src_lang,
         tgt_lang=tgt_lang,
         glossary_candidates=glossary_to_md(heuristic_terms),
-        user_glossary_md=user_glossary_md,
+        core_glossary_md=core_glossary_md,
         trace_lines=trace_lines,
         max_terms=limit,
     )
@@ -418,13 +492,13 @@ def analyze_document(
             doc_text=doc_text,
             outline=outline,
             heuristic_terms=heuristic_terms,
-            user_glossary=user_glossary,
+            core_glossary=core_glossary,
         )
         if extra_glossary_md.strip():
             plan.glossary_md = merge_glossary_md(
                 planner_pairs=[],
                 heuristic_terms=heuristic_terms,
-                user_glossary=user_glossary,
+                core_glossary=core_glossary,
                 extra_md=extra_glossary_md,
                 limit=limit,
             )
@@ -445,7 +519,7 @@ def analyze_document(
         glossary_md=merge_glossary_md(
             planner_pairs=pairs,
             heuristic_terms=heuristic_terms,
-            user_glossary=user_glossary,
+            core_glossary=core_glossary,
             extra_md=extra_glossary_md,
             limit=limit,
         ),

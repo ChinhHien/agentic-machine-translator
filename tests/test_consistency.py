@@ -198,6 +198,24 @@ def test_a_patch_that_does_not_fix_anything_is_rejected():
     assert patched["chunk-001"] == "NMT rất chậm."
     # …and the refusal reaches the run's tally, not just the log.
     assert report.as_run_fields()["consistency_rejected"] == 1
+    # …and says why: a pass that applied 0 of 21 patches used to be silent.
+    assert report.refusals and report.refusals[0].startswith("chunk-001: ")
+
+
+def test_refusals_are_summarised_once_with_their_reason():
+    chunks = [_chunk("chunk-000", "NMT is fast."), _chunk("chunk-001", "NMT is slow.")]
+    translations = {"chunk-000": "Dịch máy neural rất nhanh.", "chunk-001": "NMT rất chậm."}
+    events = []
+    sink = SimpleNamespace(info=lambda *args: events.append(args))
+    editor = _StubEditor(lambda translation, fixes: "hoàn toàn không liên quan")
+
+    _, report = ConsistencyChecker(editor, _StubVerifier(), max_patches=5, sink=sink).run(
+        chunks, translations, {"NMT": "Dịch máy neural"}
+    )
+    assert len(report.refusals) == 1
+    summaries = [event for event in events if "refused" in str(event[-1])]
+    assert summaries, events
+    assert "chunk-001" in summaries[-1][-1]
 
 
 def test_a_patch_that_loses_the_bulk_of_the_translation_is_rejected():

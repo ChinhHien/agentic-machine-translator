@@ -12,6 +12,7 @@ over to the backup endpoint the whole pipeline shares (``LLM_BACKUP_*``).
 
 from __future__ import annotations
 
+import contextlib
 import hashlib
 import json
 import os
@@ -19,7 +20,7 @@ import re
 import threading
 import time
 from dataclasses import dataclass
-from typing import Any, ClassVar
+from typing import Any, ClassVar, Self
 
 from loguru import logger
 from openai import OpenAI
@@ -30,6 +31,7 @@ from polyglot_lc.config import (
     get_cache_config,
     get_retry_config,
 )
+from polyglot_lc.llm.capabilities import EffectiveCaps, resolve
 from polyglot_lc.llm.resilience import (
     LLMError,
     TruncatedError,
@@ -53,13 +55,97 @@ _DEADLINE_GRACE_SECONDS = 10.0
 #: provider's concurrency slot.
 _DEADLINE_DRAIN_SECONDS = 30.0
 
-#: One queue per provider base_url: at most ``LLM_PROVIDER_CONCURRENCY`` calls
-#: may be in flight at a time. A free tier that serves a single request answers
-#: the second one with 429 ``concurrency_limit_exceeded``, and retrying that is
-#: worse than queueing, because the request it collided with is still running.
-#: The queue is acquired *before* the wall-clock deadline starts, so time spent
-#: waiting a turn is never charged against a call's own deadline.
-_GATES: dict[str, threading.BoundedSemaphore] = {}
+#: One queue per provider ``base_url``: every agent and every model behind that
+#: endpoint shares the same slots. Keying by model as well let Translator, Critic
+#: and Verifier each admit the global limit at once, so a provider dashboard
+#: could see two or three times the configured number. The queue is acquired
+#: *before* the wall-clock deadline starts, so waiting a turn is never charged
+#: against a call's own deadline.
+
+#: Consecutive successes that earn one more provider slot, when adaptive.
+_GROW_AFTER = 6
+
+
+class _ProviderGate:
+    """The request queue for one ``base_url``; static unless a ceiling is set.
+
+    Static by default (the ceiling equals the configured limit), which is what
+    a free tier that serves one request needs. Naming a higher
+    ``LLM_PROVIDER_CONCURRENCY_MAX`` makes the limit additive-increase /
+    multiplicative-decrease: one more slot per :data:`_GROW_AFTER` consecutive
+    successes, halved — never below one — by each "another request still holds
+    the slot" rejection. That finds a paid account's real limit by probing it,
+    and the halving is what keeps the probe from becoming a 429 storm.
+    """
+
+    def __init__(self, start: int, ceiling: int) -> None:
+        self._cond = threading.Condition()
+        self._start = max(1, start)
+        self._ceiling = max(self._start, int(ceiling or 0))
+        self._limit = self._start
+        self._active = 0
+        self._peak = 0
+        self._successes = 0
+        self._grows = 0
+        self._throttles = 0
+
+    @property
+    def adaptive(self) -> bool:
+        return self._ceiling > self._start
+
+    def __enter__(self) -> Self:
+        with self._cond:
+            while self._active >= self._limit:
+                self._cond.wait()
+            self._active += 1
+            self._peak = max(self._peak, self._active)
+        return self
+
+    def __exit__(self, *exc: object) -> None:
+        with self._cond:
+            self._active -= 1
+            self._cond.notify()
+
+    def observe_success(self) -> None:
+        """One request came back: enough of them in a row widen the queue."""
+        if not self.adaptive:
+            return
+        with self._cond:
+            self._successes += 1
+            if self._successes < _GROW_AFTER or self._limit >= self._ceiling:
+                return
+            self._successes = 0
+            self._limit += 1
+            self._grows += 1
+            self._cond.notify_all()
+
+    def observe_throttle(self) -> None:
+        """The provider refused a slot: halve the limit, never below one."""
+        if not self.adaptive:
+            return
+        with self._cond:
+            self._throttles += 1
+            self._successes = 0
+            self._limit = max(1, self._limit // 2)
+
+    def snapshot(self) -> dict[str, Any]:
+        with self._cond:
+            return {
+                "start": self._start,
+                "limit": self._limit,
+                "ceiling": self._ceiling,
+                "adaptive": self._ceiling > self._start,
+                "in_flight": self._active,
+                "peak": self._peak,
+                "grows": self._grows,
+                "throttles": self._throttles,
+            }
+
+
+_GATES: dict[str, _ProviderGate] = {}
+#: Planner is deliberately serialised: its calls shape the whole document and
+#: are never worth running two at a time.
+_PLANNER_GATES: dict[str, threading.BoundedSemaphore] = {}
 _GATES_LOCK = threading.Lock()
 
 
@@ -98,21 +184,66 @@ def active_api_calls() -> dict[str, int]:
     return _ActiveCalls.snapshot()
 
 
-def _provider_gate(base_url: str) -> threading.BoundedSemaphore:
-    """The queue for *base_url*, created on first use (see ``_GATES``)."""
+def _planner_gate(config: Any) -> threading.BoundedSemaphore | None:
+    """Planner calls are serialised; every other agent uses the provider queue."""
+    if str(getattr(config, "name", "")).upper() != "PLANNER":
+        return None
+    key = str(getattr(config, "base_url", ""))
     with _GATES_LOCK:
-        gate = _GATES.get(base_url)
+        gate = _PLANNER_GATES.get(key)
         if gate is None:
-            limit = max(1, get_retry_config().provider_concurrency)
-            gate = threading.BoundedSemaphore(limit)
-            _GATES[base_url] = gate
+            gate = threading.BoundedSemaphore(1)
+            _PLANNER_GATES[key] = gate
         return gate
+
+
+def _provider_gate(base_url: str, model: str = "") -> _ProviderGate:
+    """The queue for this provider, shared by every model behind it."""
+    key = base_url
+    with _GATES_LOCK:
+        gate = _GATES.get(key)
+        if gate is None:
+            cfg = get_retry_config()
+            caps = resolve(
+                base_url,
+                model,
+                provider_concurrency=cfg.provider_concurrency,
+            )
+            gate = _ProviderGate(caps.concurrency, cfg.provider_concurrency_max)
+            _GATES[key] = gate
+        return gate
+
+
+def provider_gate_stats() -> dict[str, dict[str, Any]]:
+    """Per-provider queue limits and what they observed: ``{base_url: ...}``."""
+    with _GATES_LOCK:
+        gates = dict(_GATES)
+    return {key: gate.snapshot() for key, gate in gates.items()}
+
+
+def _budget_kwargs(kw: dict[str, Any], caps: EffectiveCaps) -> dict[str, Any]:
+    """Send the cap under the name this endpoint accepts.
+
+    A caller that sent no cap still sends none: the Translator's first ask is
+    deliberately uncapped, because the endpoint's own default is what let a
+    reasoning model think ~6000 tokens and still answer ~2600. Inventing a cap
+    here would cut those replies.
+    """
+    out = dict(kw)
+    cap = out.pop("max_tokens", None)
+    if cap is None:
+        cap = out.pop("max_completion_tokens", None)
+    if cap is None:
+        return out
+    out[caps.token_param] = cap
+    return out
 
 
 def reset_provider_gates() -> None:
     """Forget the per-provider queues (tests and config reloads)."""
     with _GATES_LOCK:
         _GATES.clear()
+        _PLANNER_GATES.clear()
     _ActiveCalls.reset()
 
 
@@ -196,6 +327,8 @@ class TokenUsage:
                         "thinking": 0,
                         "answer": 0,
                         "calls": 0,
+                        "cache_hits": 0,
+                        "cache_misses": 0,
                     },
                 )
                 bucket["sent"] += prompt
@@ -204,6 +337,10 @@ class TokenUsage:
                 bucket["thinking"] += thinking
                 bucket["answer"] += answer
                 bucket["calls"] += 1
+                if status == "HIT":
+                    bucket["cache_hits"] += 1
+                elif status == "MISS":
+                    bucket["cache_misses"] += 1
 
     @classmethod
     def snapshot(cls) -> dict[str, int]:
@@ -223,7 +360,12 @@ class TokenUsage:
 
     @classmethod
     def snapshot_by_agent(cls) -> dict[str, dict[str, int]]:
-        """Per-agent breakdown: ``{name: {sent, received, cached, calls}}``."""
+        """Per-agent breakdown, with its own cache hit/miss counts.
+
+        The hits are what says *which* agent's stable prefix the provider is
+        actually caching: a Translator that scores zero there has a prefix that
+        changes every chunk, however well the Critic's does.
+        """
         with cls._lock:
             return {name: dict(bucket) for name, bucket in cls._by_agent.items()}
 
@@ -353,6 +495,9 @@ class LLMClient:
         """
         if not is_concurrency_limit(err_text):
             return
+        # The provider is telling us its real limit is below ours; back off the
+        # whole queue, not only this request (see ``_ProviderGate``).
+        _provider_gate(self.config.base_url, self.config.model).observe_throttle()
         self._slot_rejects += 1
         threshold = get_retry_config().slot_rebuild_after
         if self._slot_rejects < threshold:
@@ -377,10 +522,15 @@ class LLMClient:
             self._client = OpenAI(
                 base_url=self.config.base_url,
                 api_key=self.config.api_key or "sk-mock",
-                timeout=getattr(self.config, "timeout", 120.0),
+                timeout=self._timeout(),
                 max_retries=0,  # resilience layer handles retries
             )
         return self._client
+
+    def _timeout(self) -> float:
+        """This model's timeout: what it is known to need, else the agent's own."""
+        configured = float(getattr(self.config, "timeout", _HARD_DEADLINE_DEFAULT))
+        return resolve(self.config.base_url, self.config.model, agent_timeout=configured).timeout
 
     def _backup_client(self) -> LLMClient | None:
         """Lazy backup client (primary config only; backups never nest)."""
@@ -394,7 +544,14 @@ class LLMClient:
                         model=cfg.backup_model,
                         api_key=cfg.backup_api_key,
                         temperature=cfg.temperature,
-                        timeout=cfg.timeout,
+                        # The backup is a DIFFERENT model: inheriting the
+                        # primary's timeout gave a fast backup the primary's
+                        # minutes-long budget and a slow one too little.
+                        timeout=resolve(
+                            cfg.backup_base_url,
+                            cfg.backup_model,
+                            agent_timeout=cfg.timeout,
+                        ).timeout,
                     )
                 )
         return self._backup
@@ -423,7 +580,7 @@ class LLMClient:
         The SDK timeout plus :data:`_DEADLINE_GRACE_SECONDS`: the SDK should
         normally fire first, so the deadline stays a backstop.
         """
-        base = float(getattr(self.config, "timeout", _HARD_DEADLINE_DEFAULT))
+        base = self._timeout()
         return base + _DEADLINE_GRACE_SECONDS
 
     def _with_deadline(self, call: Any) -> Any:
@@ -465,6 +622,12 @@ class LLMClient:
     def _raw_chat(self, messages: list[dict[str, Any]], **kw: Any) -> LLMResponse:
         """Single un-retried chat call; raises normalized resilience errors."""
         start = time.monotonic()
+        caps = resolve(
+            self.config.base_url,
+            self.config.model,
+            agent_timeout=float(getattr(self.config, "timeout", _HARD_DEADLINE_DEFAULT)),
+        )
+        kw = _budget_kwargs(kw, caps)
         if VERBOSE_LLM:
             logger.debug(
                 "LLM request | model={} base_url={} msgs={}",
@@ -472,18 +635,21 @@ class LLMClient:
                 self.config.base_url,
                 len(messages),
             )
+        planner_gate = _planner_gate(self.config)
         try:
-            with _provider_gate(self.config.base_url):
+            with (
+                planner_gate or contextlib.nullcontext()
+            ), _provider_gate(self.config.base_url, self.config.model):
                 _ActiveCalls.enter()
                 try:
                     resp = self._with_deadline(
                         lambda: self._sdk().chat.completions.create(
-                        model=self.config.model,
-                        messages=messages,  # type: ignore[arg-type]
-                        temperature=getattr(self.config, "temperature", 0.3),
-                        **kw,
+                            model=self.config.model,
+                            messages=messages,  # type: ignore[arg-type]
+                            temperature=getattr(self.config, "temperature", 0.3),
+                            **kw,
+                        )
                     )
-                )
                 finally:
                     _ActiveCalls.exit()
         except Exception as exc:
@@ -559,6 +725,7 @@ class LLMClient:
                 cached_tokens,
                 estimated,
             )
+        _provider_gate(self.config.base_url, self.config.model).observe_success()
         return LLMResponse(
             text=text,
             model=self.config.model,
@@ -687,15 +854,18 @@ class LLMClient:
         start = time.monotonic()
         try:
             # Embeddings share the provider's concurrency slot with chat calls.
-            with _provider_gate(self.config.base_url):
+            planner_gate = _planner_gate(self.config)
+            with (
+                planner_gate or contextlib.nullcontext()
+            ), _provider_gate(self.config.base_url, self.config.model):
                 _ActiveCalls.enter()
                 try:
                     resp = self._with_deadline(
                         lambda: self._sdk().embeddings.create(
-                        model=self.config.model,
-                        input=inputs,
+                            model=self.config.model,
+                            input=inputs,
+                        )
                     )
-                )
                 finally:
                     _ActiveCalls.exit()
         except Exception as exc:

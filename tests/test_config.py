@@ -103,6 +103,29 @@ def test_without_a_backup_no_agent_has_one(mock_env):
         assert get_agent_config(name).has_backup is False, name
 
 
+def test_a_backup_that_is_the_primary_is_not_a_backup(mock_env, monkeypatch):
+    """Same endpoint and model is the same request, not a fallback.
+
+    Counting it as one keeps ``NoBackupError`` from firing, so the chunk layer
+    retries a sick endpoint forever (a real run spent 5 hours this way).
+    """
+    primary = get_agent_config("TRANSLATOR")
+    monkeypatch.setenv("LLM_BACKUP_BASE_URL", primary.base_url)
+    monkeypatch.setenv("LLM_BACKUP_MODEL", primary.model)
+    for name in AGENT_NAMES:
+        assert get_agent_config(name).has_backup is False, name
+
+
+def test_a_backup_on_the_same_endpoint_with_another_model_is_still_a_backup(
+    mock_env, monkeypatch
+):
+    """A different model behind the same gateway is a different deployment."""
+    primary = get_agent_config("TRANSLATOR")
+    monkeypatch.setenv("LLM_BACKUP_BASE_URL", primary.base_url)
+    monkeypatch.setenv("LLM_BACKUP_MODEL", "another-model")
+    assert get_agent_config("TRANSLATOR").has_backup is True
+
+
 def test_a_half_set_backup_is_a_config_error(mock_env, monkeypatch):
     """A base url without a model is a typo, and the check says so."""
     monkeypatch.setenv("LLM_BACKUP_BASE_URL", "http://backup.test/v1")
@@ -165,7 +188,8 @@ def test_workflow_defaults(mock_env):
     assert cfg.fast_path_min_score == 9.0
     assert cfg.fast_path_skip_llm_verify is False
     assert cfg.resume is False
-    assert cfg.partial_output is False
+    assert cfg.partial_output is True
+    assert cfg.chunk_max_attempts == 6
     assert cfg.consistency_check is True
     assert cfg.consistency_max_patches == 5
     assert cfg.checkpoint_dir is not None
@@ -191,6 +215,17 @@ def test_workflow_overrides(mock_env, monkeypatch):
     assert cfg.consistency_max_patches == 2
 
 
+def test_partial_output_can_be_turned_off(mock_env, monkeypatch):
+    """The default writes as it goes; a caller that wants one final file can say so."""
+    monkeypatch.setenv("PARTIAL_OUTPUT", "0")
+    assert get_app_config().partial_output is False
+
+
+def test_chunk_attempt_budget_is_configurable(mock_env, monkeypatch):
+    monkeypatch.setenv("CHUNK_MAX_ATTEMPTS", "3")
+    assert get_app_config().chunk_max_attempts == 3
+
+
 def test_checkpoint_dir_can_be_disabled(mock_env, monkeypatch):
     monkeypatch.setenv("CHECKPOINT_DIR", "off")
     assert get_app_config().checkpoint_dir is None
@@ -210,7 +245,7 @@ def test_fast_path_complexity_out_of_range(mock_env, monkeypatch):
 def test_output_format_defaults_to_markdown(mock_env):
     cfg = get_app_config()
     assert cfg.output_format == "md"
-    assert cfg.partial_output is False
+    assert cfg.partial_output is True
 
 
 def test_output_format_does_not_depend_on_partial_output(mock_env, monkeypatch):
@@ -222,7 +257,7 @@ def test_output_format_does_not_depend_on_partial_output(mock_env, monkeypatch):
     monkeypatch.setenv("OUTPUT_FORMAT", "both")
     cfg = get_app_config()
     assert cfg.output_format == "both"
-    assert cfg.partial_output is False
+    assert cfg.partial_output is True
 
 
 def test_an_unknown_output_format_is_rejected(mock_env, monkeypatch):

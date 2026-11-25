@@ -239,18 +239,18 @@ def test_bare_string_few_shot_is_wrapped_not_iterated():
 
 
 # ------------------------------ glossary merge ------------------------------
-def test_glossary_precedence_user_then_planner_then_heuristics():
+def test_glossary_precedence_core_then_planner_then_heuristics():
     md = merge_glossary_md(
         planner_pairs=[GlossaryPair("NMT", "dịch máy neural")],
         heuristic_terms=[
             GlossaryTerm("NMT", 3, "proper_noun"),
             GlossaryTerm("Berlin", 2, "capitalized"),
         ],
-        user_glossary={"NMT": "MT neural (của người dùng)"},
+        core_glossary={"NMT": "MT neural (thuật ngữ lõi)"},
     )
     lines = md.splitlines()
-    # The user's entry wins and the planner's conflicting one is dropped.
-    assert any("người dùng" in line for line in lines)
+    # The core entry wins and the planner's conflicting one is dropped.
+    assert any("thuật ngữ lõi" in line for line in lines)
     assert not any("dịch máy neural" in line for line in lines)
     # Heuristic terms survive only when nothing authoritative covered them.
     assert any("Berlin" in line for line in lines)
@@ -369,7 +369,7 @@ def test_the_glossary_budget_grows_with_the_document():
     assert glossary_budget(0) == 40
     assert glossary_budget(200_000) == 65
     assert glossary_budget(1_020_000) == 167
-    assert glossary_budget(10_000_000) == 200  # never past the user glossary's cap
+    assert glossary_budget(10_000_000) == 200  # never past MAX_GLOSSARY_TERMS
 
 
 def test_the_planner_accepts_more_terms_from_a_long_document():
@@ -404,19 +404,19 @@ def test_a_short_document_keeps_the_planners_old_ceiling():
     assert len(plan.glossary_pairs) == 40
 
 
-def test_the_user_glossary_is_never_truncated_by_the_budget():
-    """The budget bounds what the machine adds, never what the user supplied."""
-    user = {f"term {i}": f"thuật ngữ người dùng {i}" for i in range(5)}
+def test_the_core_glossary_is_never_truncated_by_the_budget():
+    """The budget bounds what the machine adds, never the pairs a run starts from."""
+    core = {f"term {i}": f"thuật ngữ lõi {i}" for i in range(5)}
 
     md = merge_glossary_md(
         planner_pairs=[GlossaryPair(f"p{i}", f"dạng máy {i}") for i in range(3)],
         heuristic_terms=[GlossaryTerm(f"h{i}", 3, "repeated") for i in range(3)],
-        user_glossary=user,
+        core_glossary=core,
         limit=2,
     )
 
     lines = md.splitlines()
-    assert sum(1 for line in lines if "thuật ngữ người dùng" in line) == 5
+    assert sum(1 for line in lines if "thuật ngữ lõi" in line) == 5
     assert not any("dạng máy" in line for line in lines)  # no room left for machine terms
 
 

@@ -110,6 +110,9 @@ class GraphContext:
         self.fast_path_rejections = 0
         self.fast_path_reasons: Counter[str] = Counter()
         self.verify_skips = 0
+        #: Chunk ids already counted as "never verified", so a retry of the same
+        #: chunk does not inflate the run's warning count.
+        self.verify_skip_ids: set[str] = set()
         # What each chunk has to show for itself if its graph has to be run
         # again: the newest draft it produced, and the step it was last on.
         self.drafts: dict[str, str] = {}
@@ -175,10 +178,21 @@ class GraphContext:
             return
         self.sink.record(type="chunk_stats", chunk_id=chunk_id, **fields)
 
-    def note_verify_skip(self) -> None:
-        """Count an unavailable verification (thread-safe)."""
+    def note_verify_skip(self, chunk_id: str = "") -> None:
+        """Count an unavailable verification once per chunk (thread-safe)."""
         with self.decision_lock:
+            if chunk_id and chunk_id in self.verify_skip_ids:
+                return
+            if chunk_id:
+                self.verify_skip_ids.add(chunk_id)
             self.verify_skips += 1
+
+    def clear_verify_skip(self, chunk_id: str) -> None:
+        """A later attempt verified the chunk: withdraw its warning."""
+        with self.decision_lock:
+            if chunk_id in self.verify_skip_ids:
+                self.verify_skip_ids.discard(chunk_id)
+                self.verify_skips = max(0, self.verify_skips - 1)
 
     def record_error(
         self, *, cause: str, step: str = "", chunk_id: str = "", message: str = ""
@@ -221,7 +235,7 @@ def make_document_plan(
     doc_summary: str = "",
     doc_title: str = "Document",
     heuristic_terms: list[Any] | None = None,
-    user_glossary: dict[str, str] | None = None,
+    core_glossary: dict[str, str] | None = None,
     extra_glossary_md: str = "",
 ) -> DocumentPlan:
     """Document-level planning (runs once): RB lookup + ONE Planner request."""
@@ -236,7 +250,7 @@ def make_document_plan(
             doc_summary=doc_summary,
             doc_title=doc_title,
             heuristic_terms=heuristic_terms,
-            user_glossary=user_glossary,
+            core_glossary=core_glossary,
             rb_traces=traces,
             extra_glossary_md=extra_glossary_md,
         )
@@ -484,9 +498,16 @@ def make_chunk_graph(ctx: GraphContext):
                         reasons=[raw[:800]],
                     )
             except VerificationError as exc:
-                ctx.note_verify_skip()
                 ctx.record_error(step="verify", chunk_id=chunk.id, cause="verify", message=str(exc))
-                raise
+                # An unavailable Verifier is not a bad translation. Keep the
+                # draft for the reader and mark it: one dead verifier must not
+                # throw away a document the Translator already finished.
+                reason = f"verification unavailable: {exc}"
+                return {
+                    "draft": draft,
+                    "verify_result": VerifyResult(ok=True, reasons=[reason], skipped=True),
+                    "verify_unavailable": True,
+                }
             return {"draft": draft, "verify_result": vr}
 
     def retranslate_node(state: ChunkState) -> dict[str, Any]:
@@ -583,7 +604,12 @@ def make_chunk_graph(ctx: GraphContext):
                 message="emphasis tokens dropped: counts do not match the source",
             )
         verdict = state.get("verify_result")
-        rejected = bool(verdict is not None and not bool(verdict))
+        skipped = bool(getattr(verdict, "skipped", False)) if verdict is not None else False
+        if skipped:
+            # One count per chunk, recorded here rather than in ``verifier_node``:
+            # the coordinator's fallback for a graph that raises counts its own.
+            ctx.note_verify_skip(state["chunk"].id)
+        rejected = verdict is not None and not bool(verdict) and not skipped
         # One record per finished chunk, so the chunk list can show what the
         # chunk cost (characters, retries, route) without opening it.
         ctx.record_chunk_stats(
@@ -593,8 +619,8 @@ def make_chunk_graph(ctx: GraphContext):
             path=path,
             retranslates=int(state.get("retranslate_count", 0) or 0),
             repaired=bool(state.get("repair_used")),
-            verify_ok=verdict is None or bool(verdict),
-            verify_skipped=bool(getattr(verdict, "skipped", False)) if verdict is not None else False,
+            verify_ok=verdict is None or bool(verdict) or skipped,
+            verify_skipped=skipped,
             score=round(float(state.get("draft_score", 0.0) or 0.0), 2),
         )
         return {
@@ -604,6 +630,7 @@ def make_chunk_graph(ctx: GraphContext):
             "rejection_reason": (
                 "; ".join(getattr(verdict, "reasons", [])) if rejected else ""
             ),
+            "verify_unavailable": bool(state.get("verify_unavailable", False)),
         }
 
     def save_trace_node(state: ChunkState) -> dict[str, Any]:
@@ -685,8 +712,23 @@ def make_chunk_graph(ctx: GraphContext):
 
     def verifier_edge(state: ChunkState) -> str:
         """Route after the Verifier, recording the verdict and any abandonment."""
-        route = after_verifier(state, max_retries=1)
         verdict = state["verify_result"]
+        if getattr(verdict, "skipped", False):
+            # No verdict exists: there is nothing to reject and nothing to ask
+            # again. Collect the draft, flagged, and let the run finish.
+            ctx.record_decision(
+                chunk_id=state["chunk"].id,
+                kind="retranslate",
+                chosen=False,
+                reasons=["verification unavailable; kept draft unverified"],
+                numbers={
+                    "ok": True,
+                    "skipped": True,
+                    "retranslate_count": int(state.get("retranslate_count", 0) or 0),
+                },
+            )
+            return "next"
+        route = after_verifier(state, max_retries=1)
         ok = bool(verdict)
         rejections = verdict.reasons
         if not ok:

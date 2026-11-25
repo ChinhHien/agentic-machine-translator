@@ -76,6 +76,10 @@ def mock_env(monkeypatch, tmp_path):
         # decide how long the tests take (and whether they look hung).
         "CHUNK_RETRY_BASE_DELAY",
         "CHUNK_RETRY_MAX_DELAY",
+        # Verification retries and completion sweeps must not make the suite
+        # sleep: the tests are about which state a chunk reaches, not the wait.
+        "VERIFY_RETRY_DELAY",
+        "COMPLETION_RETRY_DELAY",
         # A tuned request timeout decides whether a slow mock call looks hung,
         # and the default-value tests must read the code's default, not .env's.
         "LLM_TIMEOUT",
@@ -84,16 +88,30 @@ def mock_env(monkeypatch, tmp_path):
         monkeypatch.delenv(var, raising=False)
     for name in AGENT_NAMES:
         monkeypatch.delenv(f"{name}_TIMEOUT", raising=False)
+    # Retry counters are process-wide: without this reset, one test's chunk
+    # retries are charged to the next test's run-end report.
+    from polyglot_lc.llm.resilience import RetryStats
+
+    RetryStats.reset()
     # Retry settings: pin deterministic defaults (a tuned local .env may
     # otherwise change retry counts/timings mid-suite).
     monkeypatch.setenv("LLM_MAX_RETRIES", "3")
     monkeypatch.setenv("LLM_RETRY_BASE_DELAY", "2")
     monkeypatch.setenv("LLM_RETRY_MAX_DELAY", "60")
     monkeypatch.setenv("LLM_RETRY_BUFFER_SECONDS", "2")
+    monkeypatch.setenv("VERIFY_RETRY_DELAY", "0")
+    monkeypatch.setenv("COMPLETION_RETRY_DELAY", "0")
     # Provider queue + concurrency backoff: a tuned local .env must not change
     # how many calls a provider serves at once, nor how long a retry waits.
     monkeypatch.delenv("LLM_PROVIDER_CONCURRENCY", raising=False)
+    monkeypatch.delenv("LLM_PROVIDER_CONCURRENCY_MAX", raising=False)
     monkeypatch.delenv("LLM_RETRY_CONCURRENCY_WAIT", raising=False)
+    # Chunk retries are bounded by this; the machine's .env must not decide it.
+    monkeypatch.delenv("CHUNK_MAX_ATTEMPTS", raising=False)
+    # Budgets a previous test timed out must not shorten this one's ladder.
+    from polyglot_lc.agents import translator as _translator
+
+    _translator._TIMED_OUT_BUDGETS.clear()
     # Verifier output budget: a .env that raised it for a reasoning provider
     # must not change the caps the tests assert on.
     monkeypatch.delenv("VERIFIER_MAX_TOKENS", raising=False)
@@ -101,11 +119,7 @@ def mock_env(monkeypatch, tmp_path):
     # Same for the Translator's recovery budget: the caps the truncation tests
     # assert on must be the code's, not the machine's .env.
     monkeypatch.delenv("TRANSLATOR_MAX_TOKENS", raising=False)
-    # A cap learned from a cut reply lives as long as the process: one test must
-    # not start already at the cap another test taught this endpoint.
-    from polyglot_lc.agents.verifier import reset_learned_caps
-
-    reset_learned_caps()
+    monkeypatch.delenv("TRANSLATOR_REASONING", raising=False)
     # Backup endpoint: a local .env that names one would give every agent a
     # backup the suite does not know about, and the tests that say which agent
     # has which backup would read the machine's .env instead of their own.

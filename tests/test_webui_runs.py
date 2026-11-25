@@ -39,7 +39,7 @@ def planned(monkeypatch):
     monkeypatch.setattr(
         RunManager,
         "plan",
-        lambda self, file_path, max_tokens: {
+        lambda self, file_path: {
             "chunks": 3,
             "output_path": "/out/x.en.pdf",
             "title": "doc.pdf",
@@ -77,23 +77,15 @@ def test_start_builds_the_command_and_the_run_dir(repo, planned):
 
     rec = mgr.start(
         file="doc.pdf",
-        src="vi",
-        tgt="en",
-        glossary="g.csv",
-        max_tokens=555,
         mock=True,
     )
 
     argv, kw = made[0]
     assert argv[:3] == ["PY", "-m", "polyglot_lc.cli"]
     assert argv[3] == "translate"
-    for flag, value in (
-        ("--src", "vi"),
-        ("--tgt", "en"),
-        ("--glossary", "g.csv"),
-        ("--max-tokens", "555"),
-    ):
-        assert argv[argv.index(flag) + 1] == value, flag
+    for flag in ("--glossary", "--max-tokens"):
+        assert flag not in argv, flag
+    assert "--src" not in argv and "--tgt" not in argv
     assert kw["cwd"] == repo
     assert kw["env"]["LOGS_DIR"] == str(repo / "logs" / "webui" / rec.run_id)
     assert kw["env"]["LOG_JSONL"] == "1"
@@ -102,6 +94,47 @@ def test_start_builds_the_command_and_the_run_dir(repo, planned):
     assert Path(rec.output_path).parent == repo / "output" / "webui" / rec.run_id
     assert (repo / "logs" / "webui" / rec.run_id / "run.json").is_file()
     assert rec.status == "running" and rec.chunks == 3 and rec.pid == 4242
+
+
+def test_plan_probes_with_the_dialog_endpoint_overrides(repo, monkeypatch):
+    """The plan must count chunks for the configuration the child will run in.
+
+    Without the dialog's overrides the probe counted with the model in `.env`
+    (or its own fallback), and the page disagreed with the run about the number
+    of chunks in the very same document.
+    """
+    seen: dict = {}
+
+    def probe(self, args, extra_env=None):
+        seen["args"] = args
+        seen["env"] = extra_env or {}
+        return {"chunks": 5}
+
+    monkeypatch.setattr(RunManager, "probe", probe)
+    monkeypatch.setattr(
+        RunManager,
+        "_settings_env",
+        lambda self: ({"TRANSLATOR_MODEL": "override-model"}, ["TRANSLATOR_MODEL"]),
+    )
+
+    plan = _manager(repo).plan(repo / "input" / "doc.pdf")
+
+    assert plan == {"chunks": 5}
+    assert seen["args"][0] == "--plan" and seen["args"][1].endswith("doc.pdf")
+    assert seen["env"]["TRANSLATOR_MODEL"] == "override-model"
+
+
+def test_chunks_follow_the_run_start_not_the_plan(repo, planned):
+    """The page showed 78 chunks while the child was working on 76."""
+    mgr = _manager(repo)
+    rec = mgr.start(file="doc.pdf", mock=False)
+    assert rec.chunks == 3  # the plan's estimate, written before the child ran
+
+    log = mgr.logs_dir(rec.run_id) / "run_20260101_000000.jsonl"
+    log.write_text(json.dumps({"type": "run_start", "chunks": 5}) + "\n", encoding="utf-8")
+
+    assert mgr.status(rec.run_id).chunks == 5
+    assert mgr.store.read_record(rec.run_id).chunks == 5
 
 
 def test_resume_continues_the_run_in_place_with_its_own_command(repo, planned):
@@ -118,10 +151,6 @@ def test_resume_continues_the_run_in_place_with_its_own_command(repo, planned):
     mgr = _manager(repo, made)
     rec = mgr.start(
         file="doc.pdf",
-        src="vi",
-        tgt="en",
-        glossary="g.csv",
-        max_tokens=555,
         mock=False,
     )
     original = list(rec.command)
@@ -139,6 +168,46 @@ def test_resume_continues_the_run_in_place_with_its_own_command(repo, planned):
     assert kw["env"]["LOGS_DIR"] == str(repo / "logs" / "webui" / stopped.run_id)
 
 
+def test_finish_resumes_the_same_run_and_asks_for_both_formats(repo, planned):
+    """An old Markdown-only run gets one action that finishes it and merges its PDF.
+
+    The command is the run's own, plus ``--resume`` and ``--format both``:
+    checkpointed chunks are reused and the missing ones are the only work.
+    """
+    made: list = []
+    mgr = _manager(repo, made)
+    rec = mgr.start(
+        file="doc.pdf",
+        mock=False,
+        output_format="md",
+    )
+    stopped = _stopped(mgr, rec)
+
+    again = mgr.finish(stopped.run_id)
+
+    argv, _kw = made[1]
+    assert argv[-1] == "--resume"
+    assert argv[argv.index("--format") + 1] == "both"
+    assert again.run_id == stopped.run_id
+    assert again.status == "running" and again.exit_code is None
+    assert len(list((repo / "logs" / "webui").iterdir())) == 1
+
+
+def test_unfinished_chunks_falls_back_to_the_checkpoint_count(repo, planned):
+    """Old runs have no completion verdict; what is on disk still says how much is left."""
+    mgr = _manager(repo)
+    rec = mgr.start(file="doc.pdf", mock=False)
+    mgr.procs[rec.run_id].returncode = 0
+    rec.status = "done"
+    mgr.store.write_record(rec)
+    assert mgr.unfinished_chunks(rec.run_id) == rec.chunks  # no checkpoints yet
+    directory = repo / "data" / "checkpoints" / "doc"
+    directory.mkdir(parents=True)
+    (directory / "chunk-000.json").write_text("{}", encoding="utf-8")
+    mgr._checkpoint_dir = lambda run_id: directory
+    assert mgr.unfinished_chunks(rec.run_id) == rec.chunks - 1
+
+
 def test_resume_drops_an_option_the_cli_no_longer_takes(repo, planned):
     """A stored command is replayed without the options the CLI has dropped.
 
@@ -152,23 +221,28 @@ def test_resume_drops_an_option_the_cli_no_longer_takes(repo, planned):
     mgr = _manager(repo, made)
     rec = mgr.start(
         file="doc.pdf",
-        src="vi",
-        tgt="en",
-        glossary="g.csv",
-        max_tokens=555,
         mock=False,
     )
     stopped = _stopped(mgr, rec)
-    stale = list(stopped.command) + ["--legacy-flag", "general"]
+    stale = list(stopped.command) + [
+        "--glossary",
+        "g.csv",
+        "--max-tokens",
+        "555",
+        "--legacy-flag",
+        "general",
+    ]
     mgr.store.write_record(replace(stopped, command=stale))
 
     mgr.resume(stopped.run_id)
 
     argv, _ = made[1]
+    # Both dropped options are gone with the values they carried: the CLI does
+    # not take them any more, so replaying them would stop the child cold.
+    assert "--glossary" not in argv and "g.csv" not in argv
+    assert "--max-tokens" not in argv and "555" not in argv
     assert "--legacy-flag" not in argv
     assert "general" not in argv  # the value went with the option
-    assert "--glossary" in argv and "g.csv" in argv  # the rest is untouched
-    assert "--max-tokens" in argv and "555" in argv
     assert argv[-1] == "--resume"
 
 
@@ -179,10 +253,6 @@ def test_resume_refuses_a_run_that_is_still_running(repo, planned):
     mgr = _manager(repo, made)
     rec = mgr.start(
         file="doc.pdf",
-        src="vi",
-        tgt="en",
-        glossary=None,
-        max_tokens=None,
         mock=False,
     )
 
@@ -203,10 +273,6 @@ def test_resume_keeps_the_previous_attempt_s_console_output(repo, planned):
     mgr = _manager(repo, made)
     rec = mgr.start(
         file="doc.pdf",
-        src="vi",
-        tgt="en",
-        glossary=None,
-        max_tokens=None,
         mock=False,
     )
     stderr = repo / "logs" / "webui" / rec.run_id / "stderr.log"
@@ -218,7 +284,7 @@ def test_resume_keeps_the_previous_attempt_s_console_output(repo, planned):
     assert stderr.read_text(encoding="utf-8") == "provider 500\n"
 
 
-def test_resume_pins_the_model_the_run_itself_reported(repo, planned):
+def test_resume_pins_the_model_the_run_itself_reported(repo, planned, monkeypatch):
     """ "Tiếp tục" must keep the checkpoint key of the run it comes from.
 
     Checkpoints are keyed by the translator model (and the tokenizer it picks),
@@ -231,10 +297,6 @@ def test_resume_pins_the_model_the_run_itself_reported(repo, planned):
     mgr = _manager(repo, made)
     rec = mgr.start(
         file="doc.pdf",
-        src="vi",
-        tgt="en",
-        glossary=None,
-        max_tokens=None,
         mock=False,
     )
     (repo / "logs" / "webui" / rec.run_id / "run_20260101_000000.jsonl").write_text(
@@ -243,6 +305,15 @@ def test_resume_pins_the_model_the_run_itself_reported(repo, planned):
         encoding="utf-8",
     )
     stopped = _stopped(mgr, rec)
+    monkeypatch.setattr(
+        RunManager,
+        "_endpoint_check",
+        lambda self, model: {
+            "model": "gpt-4o",
+            "host": "",
+            "test": {"ok": True},
+        },
+    )
 
     mgr.resume(stopped.run_id)
 
@@ -251,14 +322,218 @@ def test_resume_pins_the_model_the_run_itself_reported(repo, planned):
     # A fresh run never pins: it should track whatever config is in effect now.
     fresh = mgr.start(
         file="doc.pdf",
-        src="vi",
-        tgt="en",
-        glossary=None,
-        max_tokens=None,
         mock=False,
     )
     assert fresh.translator_model == ""
     assert "TRANSLATOR_MODEL" not in made[2][1]["env"]
+
+
+def test_a_resume_pins_the_endpoint_the_run_used(repo, planned, monkeypatch):
+    """The model is only half the checkpoint identity; the URL is the other half.
+
+    The settings dialog's endpoint reaches the child *before* the run's own
+    values, so pinning the model alone kept the old name on a new server: the
+    checkpoint key changed and every finished chunk had to be paid for again.
+    """
+    made: list = []
+    mgr = _manager(repo, made)
+    rec = mgr.start(file="doc.pdf", mock=False)
+    (repo / "logs" / "webui" / rec.run_id / "run_20260101_000000.jsonl").write_text(
+        json.dumps(
+            {
+                "type": "run_start",
+                "agents": [
+                    {
+                        "name": "translator",
+                        "model": "gpt-4o",
+                        "endpoint": "http://old-host:4000/v1",
+                    }
+                ],
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    stopped = _stopped(mgr, rec)
+    monkeypatch.setattr(
+        RunManager,
+        "_endpoint_check",
+        lambda self, model: {"model": "gpt-4o", "test": {"ok": True}},
+    )
+    monkeypatch.setattr(
+        RunManager,
+        "_settings_env",
+        lambda self: (
+            {"TRANSLATOR_BASE_URL": "http://new-host:4000/v1", "TRANSLATOR_MODEL": "new"},
+            [],
+        ),
+    )
+
+    again = mgr.resume(stopped.run_id)
+
+    env = made[1][1]["env"]
+    assert env["TRANSLATOR_MODEL"] == "gpt-4o"
+    assert env["TRANSLATOR_BASE_URL"] == "http://old-host:4000/v1"
+    assert again.translator_base_url == "http://old-host:4000/v1"
+
+
+def test_resume_drops_a_model_the_provider_no_longer_serves(repo, planned, monkeypatch):
+    """One button is enough: a stale pin is checked and replaced by today's config."""
+    made: list = []
+    mgr = _manager(repo, made)
+    rec = mgr.start(file="doc.pdf", mock=False)
+    (repo / "logs" / "webui" / rec.run_id / "run_20260101_000000.jsonl").write_text(
+        json.dumps(
+            {
+                "type": "run_start",
+                "agents": [{"name": "translator", "model": "old-model", "host": "api.old"}],
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    stopped = _stopped(mgr, rec)
+    monkeypatch.setattr(
+        RunManager,
+        "_endpoint_check",
+        lambda self, model: {
+            "model": "new-model",
+            "host": "api.old",
+            "test": {"ok": False, "error": "HTTP 404"},
+        },
+    )
+
+    again = mgr.resume(stopped.run_id)
+
+    assert "TRANSLATOR_MODEL" not in made[1][1]["env"]
+    assert "cấu hình hiện tại" in again.note
+    assert "--resume" in again.command  # same run, same log and output
+
+
+def test_resume_archives_the_old_translation_before_switching_models(
+    repo, planned, monkeypatch
+):
+    """A model fallback re-translates, but must not destroy the old deliverable."""
+    made: list = []
+    mgr = _manager(repo, made)
+    rec = mgr.start(file="doc.pdf", mock=False)
+    (repo / "logs" / "webui" / rec.run_id / "run_20260101_000000.jsonl").write_text(
+        json.dumps(
+            {
+                "type": "run_start",
+                "agents": [{"name": "translator", "model": "old-model", "host": "api.old"}],
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    stopped = _stopped(mgr, rec)
+    markdown = Path(stopped.output_path)
+    markdown.parent.mkdir(parents=True, exist_ok=True)
+    markdown.write_text("old md", encoding="utf-8")
+    pdf = markdown.with_suffix(".pdf")
+    pdf.write_bytes(b"%PDF-old")
+    monkeypatch.setattr(
+        RunManager,
+        "_endpoint_check",
+        lambda self, model: {
+            "model": "new-model",
+            "host": "api.old",
+            "test": {"ok": False, "error": "HTTP 404"},
+        },
+    )
+
+    again = mgr.resume(stopped.run_id)
+
+    assert not markdown.exists() and not pdf.exists()
+    archives = list((markdown.parent / "archive").iterdir())
+    assert len(archives) == 1
+    assert (archives[0] / markdown.name).read_text(encoding="utf-8") == "old md"
+    assert (archives[0] / pdf.name).read_bytes() == b"%PDF-old"
+    assert "bản cũ đã lưu" in again.note
+
+
+def test_resume_keeps_the_pin_when_only_the_endpoint_host_changed(
+    repo, planned, monkeypatch
+):
+    """A moved endpoint alone is not proof that the old model is gone."""
+    made: list = []
+    mgr = _manager(repo, made)
+    rec = mgr.start(file="doc.pdf", mock=False)
+    (repo / "logs" / "webui" / rec.run_id / "run_20260101_000000.jsonl").write_text(
+        json.dumps(
+            {
+                "type": "run_start",
+                "agents": [{"name": "translator", "model": "old-model", "host": "api.old"}],
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    stopped = _stopped(mgr, rec)
+    monkeypatch.setattr(
+        RunManager,
+        "_endpoint_check",
+        lambda self, model: {
+            "model": "new-model",
+            "host": "api.new",
+            "test": {"ok": True},
+        },
+    )
+
+    mgr.resume(stopped.run_id)
+
+    assert made[1][1]["env"]["TRANSLATOR_MODEL"] == "old-model"
+
+
+def test_only_404_or_model_not_found_marks_the_model_missing(repo, monkeypatch):
+    """Ambiguous failures must never trigger a paid retranslation."""
+    mgr = _manager(repo)
+    cases = [
+        ({"ok": False, "status": 404, "error": ""}, True),
+        ({"ok": False, "status": 400, "error": "model_not_found"}, True),
+        ({"ok": False, "status": 500, "error": "HTTP 500: upstream"}, False),
+        ({"ok": False, "status": 0, "error": "connection reset"}, False),
+        ({"ok": False, "status": 429, "error": "rate limited"}, False),
+    ]
+    for test, expected in cases:
+        monkeypatch.setattr(
+            RunManager,
+            "_endpoint_check",
+            lambda self, model, test=test: {"model": "new-model", "test": test},
+        )
+        assert mgr._model_missing("old-model") is expected, test
+
+
+def test_resume_keeps_the_pin_on_a_timeout(repo, planned, monkeypatch):
+    """A timeout says nothing about the model; do not pay to retranslate."""
+    made: list = []
+    mgr = _manager(repo, made)
+    rec = mgr.start(file="doc.pdf", mock=False)
+    (repo / "logs" / "webui" / rec.run_id / "run_20260101_000000.jsonl").write_text(
+        json.dumps(
+            {
+                "type": "run_start",
+                "agents": [{"name": "translator", "model": "old-model", "host": "api.old"}],
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    stopped = _stopped(mgr, rec)
+    monkeypatch.setattr(
+        RunManager,
+        "_endpoint_check",
+        lambda self, model: {
+            "model": "new-model",
+            "test": {"ok": False, "status": 0, "error": "timed out"},
+        },
+    )
+
+    again = mgr.resume(stopped.run_id)
+
+    assert made[1][1]["env"]["TRANSLATOR_MODEL"] == "old-model"
+    assert "cấu hình hiện tại" not in again.note
 
 
 def test_input_path_is_validated_against_the_input_directory(repo, planned):
@@ -273,18 +548,10 @@ def test_two_runs_keep_separate_log_dirs(repo, planned):
     mgr = _manager(repo)
     a = mgr.start(
         file="doc.pdf",
-        src="vi",
-        tgt="en",
-        glossary=None,
-        max_tokens=None,
         mock=False,
     )
     b = mgr.start(
         file="doc.pdf",
-        src="vi",
-        tgt="en",
-        glossary=None,
-        max_tokens=None,
         mock=False,
     )
 
@@ -295,7 +562,7 @@ def test_two_runs_keep_separate_log_dirs(repo, planned):
 
 
 def test_probe_failure_raises_and_starts_nothing(repo, monkeypatch):
-    def boom(self, file_path, max_tokens):
+    def boom(self, file_path):
         raise RunPlanError("probe failed: ValueError: không đọc được file")
 
     monkeypatch.setattr(RunManager, "plan", boom)
@@ -305,10 +572,6 @@ def test_probe_failure_raises_and_starts_nothing(repo, monkeypatch):
     with pytest.raises(RunPlanError):
         mgr.start(
             file="doc.pdf",
-            src="vi",
-            tgt="en",
-            glossary=None,
-            max_tokens=None,
             mock=False,
         )
 
@@ -323,10 +586,6 @@ def test_input_file_outside_input_dir_is_rejected(repo, planned):
     with pytest.raises(ValueError):
         mgr.start(
             file="../.env",
-            src="vi",
-            tgt="en",
-            glossary=None,
-            max_tokens=None,
             mock=False,
         )
 
@@ -336,10 +595,6 @@ def test_missing_input_file_is_a_plan_error(repo, planned):
     with pytest.raises(RunPlanError):
         mgr.start(
             file="nope.pdf",
-            src="vi",
-            tgt="en",
-            glossary=None,
-            max_tokens=None,
             mock=False,
         )
 
@@ -358,7 +613,7 @@ def test_plan_asks_the_probe_and_reports_its_failure(repo, monkeypatch):
     mgr = _manager(repo)
 
     with pytest.raises(RunPlanError) as err:
-        mgr.plan(repo / "input" / "doc.pdf", None)
+        mgr.plan(repo / "input" / "doc.pdf")
 
     argv = calls[0][0]
     assert argv[0] == "PY" and argv[1].endswith("probe.py") and argv[2] == "--plan"
@@ -376,7 +631,7 @@ def test_plan_parses_probe_json(repo, monkeypatch):
             argv, 0, stdout=json.dumps(payload), stderr=""
         ),
     )
-    assert _manager(repo).plan(repo / "input" / "doc.pdf", 100)["chunks"] == 7
+    assert _manager(repo).plan(repo / "input" / "doc.pdf")["chunks"] == 7
 
 
 # --- Task 6: status, stop, events -----------------------------------------
@@ -387,10 +642,6 @@ def test_status_reports_no_events_when_log_is_absent(repo, planned):
     mgr = _manager(repo)
     rec = mgr.start(
         file="doc.pdf",
-        src="vi",
-        tgt="en",
-        glossary=None,
-        max_tokens=None,
         mock=False,
     )
 
@@ -411,10 +662,6 @@ def test_the_no_log_note_is_taken_back_once_the_log_appears(repo, planned):
     mgr = _manager(repo)
     rec = mgr.start(
         file="doc.pdf",
-        src="vi",
-        tgt="en",
-        glossary=None,
-        max_tokens=None,
         mock=False,
     )
 
@@ -441,10 +688,6 @@ def test_a_legacy_no_log_note_is_cleaned_up_too(repo, planned):
     mgr = _manager(repo)
     rec = mgr.start(
         file="doc.pdf",
-        src="vi",
-        tgt="en",
-        glossary=None,
-        max_tokens=None,
         mock=False,
     )
     (repo / "logs" / "webui" / rec.run_id / "run_20260101_000000.jsonl").write_text(
@@ -465,10 +708,6 @@ def test_status_reconciles_a_dead_pid_after_a_server_restart(repo, planned, monk
     mgr = _manager(repo)
     rec = mgr.start(
         file="doc.pdf",
-        src="vi",
-        tgt="en",
-        glossary=None,
-        max_tokens=None,
         mock=False,
     )
     mgr.procs.clear()  # như thể server vừa khởi động lại
@@ -479,30 +718,52 @@ def test_status_reconciles_a_dead_pid_after_a_server_restart(repo, planned, monk
     assert "khởi động lại" in st.note.lower()
 
 
+def test_status_uses_run_end_when_the_process_handle_was_already_reaped(
+    repo, planned, monkeypatch
+):
+    """A finished rebuild must not be called failed in the sweep/poll race."""
+    mgr = _manager(repo)
+    rec = mgr.start(
+        file="doc.pdf",
+        mock=False,
+    )
+    (mgr.logs_dir(rec.run_id) / "run_20260101_000000.jsonl").write_text(
+        json.dumps({"type": "run_end", "status": "done", "exit_code": 0}) + "\n",
+        encoding="utf-8",
+    )
+    mgr.procs.clear()  # another thread reaped the child just before this poll
+    monkeypatch.setattr("webui.runs.pid_alive", lambda pid: False)
+
+    st = mgr.status(rec.run_id)
+    assert st.status == "done"
+    assert st.exit_code == 0
+    assert "khởi động lại" not in st.note.lower()
+
+
 def test_status_folds_in_the_exit_code(repo, planned):
     mgr = _manager(repo)
     ok = mgr.start(
         file="doc.pdf",
-        src="vi",
-        tgt="en",
-        glossary=None,
-        max_tokens=None,
         mock=False,
     )
     bad = mgr.start(
         file="doc.pdf",
-        src="vi",
-        tgt="en",
-        glossary=None,
-        max_tokens=None,
+        mock=False,
+    )
+    partial = mgr.start(
+        file="doc.pdf",
         mock=False,
     )
     mgr.procs[ok.run_id].returncode = 0
     mgr.procs[bad.run_id].returncode = 1
+    mgr.procs[partial.run_id].returncode = 2
 
     assert mgr.status(ok.run_id).status == "done"
     assert mgr.status(bad.run_id).status == "failed"
     assert mgr.status(bad.run_id).exit_code == 1
+    # A written file with missing checkpoints is its own state, not a crash.
+    assert mgr.status(partial.run_id).status == "incomplete"
+    assert mgr.status(partial.run_id).exit_code == 2
     assert ok.run_id not in mgr.procs  # đã chốt thì không giữ handle nữa
 
 
@@ -515,10 +776,6 @@ def test_events_are_read_through_the_store(repo, planned):
     mgr = _manager(repo)
     rec = mgr.start(
         file="doc.pdf",
-        src="vi",
-        tgt="en",
-        glossary=None,
-        max_tokens=None,
         mock=False,
     )
     log = mgr.logs_dir(rec.run_id) / "run_20260101_000000.jsonl"
@@ -537,10 +794,6 @@ def test_stop_marks_stopped_and_kills_the_tree(repo, planned, monkeypatch):
     mgr = _manager(repo)
     rec = mgr.start(
         file="doc.pdf",
-        src="vi",
-        tgt="en",
-        glossary=None,
-        max_tokens=None,
         mock=False,
     )
 
@@ -567,10 +820,6 @@ def test_delete_removes_the_runs_dirs_and_the_input_it_was_last_at(repo, planned
     mgr = _manager(repo)
     rec = mgr.start(
         file="doc.pdf",
-        src="vi",
-        tgt="en",
-        glossary=None,
-        max_tokens=None,
         mock=False,
     )
     # Give the run some real output to be erased.
@@ -600,18 +849,10 @@ def test_delete_keeps_the_input_while_another_run_still_uses_it(repo, planned, m
     mgr = _manager(repo)
     first = mgr.start(
         file="doc.pdf",
-        src="vi",
-        tgt="en",
-        glossary=None,
-        max_tokens=None,
         mock=False,
     )
     second = mgr.start(
         file="doc.pdf",
-        src="vi",
-        tgt="en",
-        glossary=None,
-        max_tokens=None,
         mock=False,
     )
 
@@ -648,7 +889,7 @@ def test_probe_command_uses_the_configured_interpreter(repo, monkeypatch):
             subprocess.CompletedProcess(argv, 0, stdout='{"chunks": 1}', stderr=""),
         )[1],
     )
-    RunManager(repo, python=sys.executable).plan(repo / "input" / "doc.pdf", None)
+    RunManager(repo, python=sys.executable).plan(repo / "input" / "doc.pdf")
     argv, kw = seen[0]
     assert argv[0] == sys.executable
     assert kw["encoding"] == "utf-8"
@@ -663,10 +904,6 @@ def _run(mgr, **over):
     """Start one run with the choices every test in this section uses."""
     fields = {
         "file": "doc.pdf",
-        "src": "vi",
-        "tgt": "en",
-        "glossary": None,
-        "max_tokens": None,
         "mock": False,
     }
     fields.update(over)
@@ -841,7 +1078,7 @@ def test_sweep_uses_current_run_end_failure(repo, planned, chunks_rejected, fata
 def test_manual_resume_of_quality_rejected_run_keeps_identity_and_logs(repo, planned):
     made: list = []
     mgr = _manager(repo, made)
-    rec = _run(mgr, glossary="g.csv", max_tokens=555)
+    rec = _run(mgr)
     log = mgr.logs_dir(rec.run_id) / "run_20260101_000000.jsonl"
     events = (
         json.dumps(
@@ -1095,3 +1332,32 @@ def test_the_sweeper_keeps_going_and_survives_a_bad_pass(repo, planned):
 
     assert len(calls) >= 3  # một lần hỏng không kết thúc vòng lặp
     assert not thread.is_alive()
+
+
+def test_stop_answers_without_waiting_for_the_child_to_exit(repo, planned, monkeypatch):
+    """"Dừng" must not leave the page blocked while a killed child finishes dying."""
+    import threading
+    import time
+
+    monkeypatch.setattr("webui.runs.kill_tree", lambda pid: None)
+    mgr = _manager(repo)
+    rec = mgr.start(file="doc.pdf", mock=False)
+
+    released = threading.Event()
+
+    class SlowExit(FakeProc):
+        def wait(self, timeout=None):
+            released.wait(timeout)
+            self.returncode = -15
+            return self.returncode
+
+    mgr.procs[rec.run_id] = SlowExit(rec.command)
+
+    started = time.perf_counter()
+    stopped = mgr.stop(rec.run_id)
+    elapsed = time.perf_counter() - started
+    released.set()
+
+    assert stopped.status == "stopped"
+    assert mgr.store.read_record(rec.run_id).status == "stopped"
+    assert elapsed < 1.0, f"stop waited {elapsed:.1f}s for the child to exit"

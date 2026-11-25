@@ -5,7 +5,6 @@ from __future__ import annotations
 import json
 import os
 import re
-import threading
 import time
 from functools import lru_cache
 from typing import Any
@@ -14,7 +13,7 @@ from loguru import logger
 
 from polyglot_lc.agents.base import Agent
 from polyglot_lc.llm.client import parse_json_reply
-from polyglot_lc.llm.resilience import LLMError, RAISED_OUTPUT_CAP, TruncatedError
+from polyglot_lc.llm.resilience import RAISED_OUTPUT_CAP, LLMError, TruncatedError
 
 _PH_RE = re.compile(r"⟦CODE_\d+⟧")
 
@@ -34,51 +33,17 @@ _VERIFIER_MAX_TOKENS_ENV = "VERIFIER_MAX_TOKENS"
 #: ceiling now matches the Translator's, since both ask the same model.
 VERIFIER_MAX_TOKENS_CEILING = 32768
 
-#: Output caps already learned per served endpoint: ``(base_url, model) -> cap``.
-#: A reasoning model that cut one verdict at 4096 will cut the next chunk the
-#: same way, so the pipeline starts those calls at the raised cap instead of
-#: paying for the same failed attempt once per chunk.
-_LEARNED_CAPS: dict[tuple[str, str], int] = {}
-_LEARNED_LOCK = threading.Lock()
-
-
-def reset_learned_caps() -> None:
-    """Forget the per-endpoint caps (tests and a fresh configuration)."""
-    with _LEARNED_LOCK:
-        _LEARNED_CAPS.clear()
-
-
-def _learned_cap(provider: str, model: str) -> int:
-    with _LEARNED_LOCK:
-        return _LEARNED_CAPS.get((provider or "", model or ""), 0)
-
-
-def _remember_cap(provider: str, model: str, cap: int) -> int:
-    """Record that *cap* was not enough for this endpoint; return what to use.
-
-    Only ever raises the remembered value, and never above the ceiling: what
-    the retry needs may be more than this, but the next attempt already gets
-    the largest budget this project is willing to ask for.
-    """
-    key = (provider or "", model or "")
-    with _LEARNED_LOCK:
-        previous = _LEARNED_CAPS.get(key, 0)
-        if cap > previous:
-            _LEARNED_CAPS[key] = cap
-    if cap > previous:
-        logger.info(
-            "VERIFIER output cap learned | provider={} model={} cap={} (was {})",
-            provider or "?",
-            model or "?",
-            cap,
-            previous or "unset",
-        )
-    return max(previous, cap)
+#: Output caps live in the shared capability registry, keyed ``(base_url, model)``
+#: and persisted. A reasoning model that cut one verdict at 4096 will cut the next
+#: chunk the same way, so the pipeline starts those calls at the raised cap
+#: instead of paying for the same failed attempt once per chunk — and the
+#: Translator asking the same endpoint benefits from what the Verifier learned.
+#: These three functions are the thin view the Verifier keeps over that store.
 
 
 def _cap_for(provider: str, model: str) -> int:
-    """The output budget this call starts with: tuned, or learned, whichever is bigger."""
-    return max(_verifier_output_cap(), _learned_cap(provider, model))
+    """The output budget this call starts with."""
+    return _verifier_output_cap()
 
 
 def _reasoning_kwargs() -> dict[str, Any]:
@@ -185,6 +150,32 @@ def _term_pattern(term: str) -> re.Pattern[str]:
     return re.compile(rf"(?<!\w){body}(?!\w)")
 
 
+#: Fenced blocks and inline code: a glossary term found only here is an
+#: identifier or a sample, not prose the translator has to render.
+_FENCE_RE = re.compile(r"```.*?```", re.DOTALL)
+_INLINE_CODE_RE = re.compile(r"`[^`\n]*`")
+_IDENTIFIER_RE = re.compile(r"\b[A-Za-z_][A-Za-z0-9_]*(?:_[A-Za-z0-9_]+|[a-z][A-Z][A-Za-z0-9]*)\b")
+
+#: The words inside an identifier: ``keySet`` is ``key`` + ``set``. Needed
+#: because the term and the identifier are compared as words, not as strings —
+#: ``"key" in {"keyset"}`` is false, which used to make the ambiguity check
+#: silently never fire.
+_IDENTIFIER_SPLIT_RE = re.compile(r"[a-z0-9]+(?=[A-Z])|[A-Z]?[a-z0-9]+|[A-Z]+")
+
+
+def _identifier_words(text: str) -> set[str]:
+    return {
+        part.casefold()
+        for match in _IDENTIFIER_RE.finditer(text or "")
+        for part in _IDENTIFIER_SPLIT_RE.findall(match.group(0))
+    }
+
+
+def _prose_only(text: str) -> str:
+    """*text* with code fences and inline code removed: what is actually prose."""
+    return _INLINE_CODE_RE.sub(" ", _FENCE_RE.sub(" ", text or ""))
+
+
 def glossary_defects(
     source: str, translation: str, pairs: dict[str, str] | None
 ) -> list[dict[str, str]]:
@@ -196,14 +187,23 @@ def glossary_defects(
     is reported with the exact pair, so the graph can apply a targeted repair
     instead of re-translating (and possibly losing) the whole chunk.
 
-    Presence in the source is matched on whole words; presence of the target
-    form stays a substring test, so an inflected or compounded rendering
-    (``thấp hơn`` for ``thấp``) still counts as using the term.
+    Presence in the source is matched on whole words **in prose**: a term that
+    only ever appears inside a code fence, an inline code span or an identifier
+    (``key`` in ``keySet``, ``index`` in a sample) is code, and leaving it in
+    English there is correct. Presence of the target form stays a substring
+    test, so an inflected or compounded rendering (``thấp hơn`` for ``thấp``)
+    still counts as using the term.
+
+    A term that appears both in prose and inside an identifier somewhere in the
+    chunk is ambiguous — the translator may be right to keep the identifier in
+    English — so it is reported at ``minor`` severity: visible on the record,
+    never enough on its own to re-translate the chunk.
     """
     if not pairs:
         return []
-    source_key = _normalize_term(source)
+    source_key = _normalize_term(_prose_only(source))
     translation_key = _normalize_term(translation)
+    identifiers = _identifier_words(source)
     defects: list[dict[str, str]] = []
     for term, expected in pairs.items():
         term, expected = str(term).strip(), str(expected).strip()
@@ -213,7 +213,7 @@ def glossary_defects(
             continue
         defects.append(
             {
-                "severity": "major",
+                "severity": "minor" if _normalize_term(term) in identifiers else "major",
                 "type": "terminology",
                 "term": term,
                 "expected": expected,
@@ -252,9 +252,7 @@ def _is_continuation(prev_heading: str, heading: str) -> bool:
     return _reads_on(prev_heading, heading)
 
 
-def heading_defects(
-    source: str, translation: str
-) -> tuple[list[str], list[str]]:
+def heading_defects(source: str, translation: str) -> tuple[list[str], list[str]]:
     """Compare heading structure, forgiving the source's own artifacts.
 
     Returns ``(problems, notes)``: *problems* are hard failures for
@@ -269,14 +267,8 @@ def heading_defects(
     Notice`` between two titles -- has no such reading and still fails, so the
     re-translation feedback stays honest.
     """
-    src = [
-        (len(m.group(1)), m.group(2).strip())
-        for m in _HEAD_FULL_RE.finditer(source)
-    ]
-    tgt = [
-        (len(m.group(1)), m.group(2).strip())
-        for m in _HEAD_FULL_RE.finditer(translation)
-    ]
+    src = [(len(m.group(1)), m.group(2).strip()) for m in _HEAD_FULL_RE.finditer(source)]
+    tgt = [(len(m.group(1)), m.group(2).strip()) for m in _HEAD_FULL_RE.finditer(translation)]
     if [lvl for lvl, _ in src] == [lvl for lvl, _ in tgt]:
         return [], []
     if _aligns_with_joins(src, tgt):
@@ -288,9 +280,7 @@ def heading_defects(
     return ["heading structure changed"], []
 
 
-def _aligns_with_joins(
-    src: list[tuple[int, str]], tgt: list[tuple[int, str]]
-) -> bool:
+def _aligns_with_joins(src: list[tuple[int, str]], tgt: list[tuple[int, str]]) -> bool:
     """Whether the translation's heading sequence matches the source's when
     adjacent source headings may be joined into one (small memoized search;
     heading counts are tiny)."""
@@ -463,9 +453,7 @@ def _filter_profile_defects(defects: list[dict[str, str]], profile: str) -> list
     """Drop checks that do not apply to a reference list or code block."""
     if profile in {"references", "code"}:
         return [
-            defect
-            for defect in defects
-            if defect.get("type") not in {"language", "terminology"}
+            defect for defect in defects if defect.get("type") not in {"language", "terminology"}
         ]
     return defects
 
@@ -496,11 +484,10 @@ class VerifierAgent(Agent):
     ) -> dict[str, Any]:
         """Ask for the JSON verdict, recovering truncated replies.
 
-        The call starts at the larger of the tuned cap and the cap this endpoint
-        already taught us it needs. A reasoning model charges its thinking to
-        the same output budget, so a verdict cut at 4096 will cut the next chunk
-        too; remembering the raised cap is what stops that from costing a failed
-        request per chunk.
+        The call starts at the configured verifier cap. A reasoning model
+        charges its thinking to the same output budget, so a verdict cut at
+        4096 would cut the next chunk too; the retry below raises the cap for
+        this call only.
 
         A cut reply whose content is already a complete JSON verdict is used as
         is: the answer finished, the thinking is what overran. Anything else is
@@ -514,13 +501,6 @@ class VerifierAgent(Agent):
         provider = self.client.config.base_url
         model = self.client.config.model
         cap = _cap_for(provider, model)
-        if cap > _verifier_output_cap():
-            logger.info(
-                "VERIFIER starting at the learned output cap ({}) | provider={} model={}",
-                cap,
-                provider,
-                model,
-            )
         try:
             return self.chat_json(messages, max_tokens=cap, **_reasoning_kwargs())
         except TruncatedError as err:
@@ -529,7 +509,6 @@ class VerifierAgent(Agent):
             if complete is not None:
                 return complete
             raised = _raised_output_cap(cap)
-            _remember_cap(err.provider or provider, err.model or model, raised)
             logger.warning(
                 "VERIFIER reply was cut at the provider's output-token limit; "
                 "re-asking with a raised cap ({})",
@@ -662,8 +641,8 @@ class VerifierAgent(Agent):
             '"type": "completeness|addition|language|structure|terminology", '
             '"message": "...", "source_quote": "...", "translation_quote": "..."}], '
             '"reasons": ["..."]}\n'
-            "Keep the answer short: omit \"defects\" entirely when the chunk "
-            "passes, use at most two \"reasons\" of one line each, and quote no "
+            'Keep the answer short: omit "defects" entirely when the chunk '
+            'passes, use at most two "reasons" of one line each, and quote no '
             "more than 60 characters. The verdict is the answer; do not explain "
             "the checks you ran."
         )

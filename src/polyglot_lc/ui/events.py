@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import threading
 import time
 from collections import deque
@@ -80,7 +81,10 @@ class EventSink:
             logs = Path(logs_dir)
             logs.mkdir(parents=True, exist_ok=True)
             ts = time.strftime("%Y%m%d_%H%M%S")
-            self.path = logs / f"run_{ts}.jsonl"
+            # Two runs can start in the same second. The short run id keeps
+            # their logs apart while the ``run_*.jsonl`` glob still finds both.
+            suffix = re.sub(r"[^0-9A-Za-z_-]", "", self.run_id)[-8:]
+            self.path = logs / f"run_{ts}_{suffix}.jsonl"
 
     def record(self, **fields: Any) -> None:
         """Append one typed record: ``{"ts", "run_id", **fields}``.
@@ -107,7 +111,6 @@ class EventSink:
             **fields,
         }
         if payload.get("type") == "error":
-            self.problem_count += 1
             # An error record *is* a failure: say so in the old vocabulary too,
             # so the web UI's existing ``fail``/``retry`` filter finds it.
             if payload["status"] == "ok":
@@ -115,17 +118,20 @@ class EventSink:
             if not payload["error"]:
                 payload["error"] = str(payload.get("message") or "")
         line = json.dumps(payload, ensure_ascii=False, default=str)
-        with self._lock, self.path.open("a", encoding="utf-8") as f:
-            f.write(line + "\n")
+        with self._lock:
+            if payload.get("type") == "error":
+                self.problem_count += 1
+            with self.path.open("a", encoding="utf-8") as f:
+                f.write(line + "\n")
 
     # Convenience -------------------------------------------------------
     def emit(self, event: Event) -> None:
         if not event.run_id:
             # Stamp the run id here rather than at every construction site.
             event.run_id = self.run_id
-        if event.status in {"fail", "retry"}:
-            self.problem_count += 1
         with self._lock:
+            if event.status in {"fail", "retry"}:
+                self.problem_count += 1
             self._tail.append(event)
             if self.enabled and self.path is not None:
                 with self.path.open("a", encoding="utf-8") as f:

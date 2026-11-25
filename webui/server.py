@@ -50,7 +50,7 @@ from webui.settings import (
     SettingsStore,
     test_endpoint,
 )
-from webui.store import GlossaryStore, RunRecord, RunsStore
+from webui.store import RunRecord, RunsStore
 
 logger = logging.getLogger("webui")
 
@@ -256,16 +256,12 @@ class Api:
         root: Path,
         manager: RunManager,
         runs: RunsStore,
-        glossaries: GlossaryStore,
         port: int = DEFAULT_PORT,
         settings: SettingsStore | None = None,
     ) -> None:
         self.root = Path(root)
         self.manager = manager
         self.runs = runs
-        #: Read-only: the run planner resolves a glossary name through it, and
-        #: nothing on this surface can write to it.
-        self.glossaries = glossaries
         #: The settings dialog's own store; built over the same root when the
         #: caller did not bring one (tests construct theirs explicitly).
         self.settings = settings or SettingsStore(root)
@@ -410,6 +406,15 @@ class Api:
         summary = {field: data[field] for field in RUN_SUMMARY_FIELDS}
         summary["has_md"] = self._md_path(record) is not None
         summary["has_pdf"] = self._pdf_path(record) is not None
+        # The library's one-line answer to "why is this not done?": how many
+        # chunks never got a verified checkpoint. Three numbers, not the whole
+        # completion verdict, because this record is sent for every run.
+        completion = self.runs.last_run_end(record.run_id).get("completion") or {}
+        summary["completion"] = {
+            "expected": int(completion.get("expected") or 0),
+            "verified": int(completion.get("verified") or 0),
+            "incomplete": len(completion.get("incomplete") or []),
+        }
         return summary
 
     def _run_route(self, method: str, rest: str, query: dict[str, list[str]]) -> Response | None:
@@ -441,6 +446,10 @@ class Api:
                 return self._run_partial(run_id)
         if len(parts) == 2 and method == "POST" and parts[1] == "stop":
             return self._stop_run(run_id)
+        if len(parts) == 2 and method == "POST" and parts[1] == "rebuild":
+            return self._rebuild_run(run_id)
+        if len(parts) == 2 and method == "POST" and parts[1] == "finish":
+            return self._finish_run(run_id)
         return None
 
     def _run_detail(self, run_id: str) -> Response:
@@ -454,6 +463,7 @@ class Api:
         # stopped run's "Tiếp tục" must keep the same model, or the checkpoint
         # key it reuses changes and the resume starts over from scratch.
         translator_model = self.manager.translator_model(run_id)
+        completion = self.runs.last_run_end(run_id).get("completion") or {}
         return json_response(
             {
                 "run": _public_record(record),
@@ -466,6 +476,16 @@ class Api:
                 # name a file that is not there.
                 "pdf_path": str(pdf) if pdf else "",
                 "artifacts": self._artifacts(record),
+                # The run's own verdict on completeness: which chunks never got
+                # a verified checkpoint, and why. A rebuild replays checkpoints
+                # instead of translating, so it is offered only when this list
+                # is empty.
+                "completion": completion,
+                "incomplete_chunks": completion.get("incomplete") or [],
+                # Old runs have no completion verdict; the checkpoint count is
+                # still a truthful answer to "how much is left?".
+                "missing_chunks": self.manager.unfinished_chunks(run_id),
+                "rebuildable": self.manager.rebuildable(run_id),
                 "problems": self._problems(record),
             }
         )
@@ -589,30 +609,12 @@ class Api:
         file = str(data.get("file") or "").strip()
         if not file:
             return error(400, "file is required")
-        raw_tokens = data.get("max_tokens")
-        try:
-            max_tokens = int(raw_tokens) if raw_tokens not in (None, "") else None
-        except (TypeError, ValueError):
-            return error(400, "max_tokens must be a whole number")
         output_format = str(data.get("format") or "md").strip().lower()
         if output_format not in OUTPUT_FORMATS:
             return error(400, "format must be md, pdf or both")
-        glossary = str(data.get("glossary") or "").strip() or None
-        if glossary is not None:
-            try:
-                path = self.glossaries.path_for(glossary)
-            except ValueError as exc:
-                return error(403, f"refused: {exc}")
-            if not path.is_file():
-                return error(422, f"no such glossary: {glossary}")
-            glossary = str(path)
         try:
             record = self.manager.start(
                 file=file,
-                src=str(data.get("src") or "auto"),
-                tgt=str(data.get("tgt") or "vi"),
-                glossary=glossary,
-                max_tokens=max_tokens,
                 # Kept for the test suite and for a demo deployment driven from
                 # the terminal; the page never sends it (see the module doc).
                 mock=bool(data.get("mock")),
@@ -628,7 +630,7 @@ class Api:
     def _resume_run(self, data: dict[str, Any]) -> Response:
         """Continue the run named by ``run_id``, in place.
 
-        Everything the child needs — document, languages, glossary,
+        Everything the child needs — document, languages,
         token budget, output path, Translator model — is stored on that run's
         own record, so the page sends only its id. The run keeps its identity:
         same run_id, same log directory, same output file, and its earlier
@@ -672,6 +674,37 @@ class Api:
         except RuntimeError as exc:
             return error(409, f"cannot stop: {exc}")
         return json_response({"status": record.status, "exit_code": record.exit_code})
+
+    def _rebuild_run(self, run_id: str) -> Response:
+        """Re-assemble a finished run's PDF from its checkpoints.
+
+        The child is launched as the same run, so the answer names that run and
+        the page keeps polling the row it already has. The refusal cases are the
+        manager's: unknown run, a run still working, or a run whose chunks are
+        not all checkpointed.
+        """
+        try:
+            record = self.manager.rebuild_pdf(run_id)
+        except KeyError:
+            return error(404, f"no such run: {run_id}")
+        except RuntimeError as exc:
+            return error(409, f"cannot rebuild: {exc}")
+        return json_response({"run_id": record.run_id, "status": record.status}, 202)
+
+    def _finish_run(self, run_id: str) -> Response:
+        """Finish a short run and merge its PDF in one attempt.
+
+        Unlike ``rebuild``, this may translate the chunks that never landed;
+        every finished chunk is still replayed from its checkpoint, so only the
+        missing work is paid for. The page keeps watching this same run.
+        """
+        try:
+            record = self.manager.finish(run_id)
+        except KeyError:
+            return error(404, f"no such run: {run_id}")
+        except RuntimeError as exc:
+            return error(409, f"cannot finish: {exc}")
+        return json_response({"run_id": record.run_id, "status": record.status}, 202)
 
     def _delete_run(self, run_id: str) -> Response:
         """Erase a run's history and its output from disk.
@@ -1101,7 +1134,6 @@ def default_api(root: Path = REPO_ROOT, *, port: int = DEFAULT_PORT, **manager_k
         root=root,
         manager=RunManager(root, **manager_kw),
         runs=RunsStore(root / LOGS_DIR),
-        glossaries=GlossaryStore(root / "glossaries"),
         port=port,
     )
 

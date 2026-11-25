@@ -9,7 +9,7 @@ traceback.
 Usage::
 
     python webui/probe.py --config
-    python webui/probe.py --plan FILE --src en --tgt vi [--max-tokens 700]
+    python webui/probe.py --plan FILE
     python webui/probe.py --text FILE
     python webui/probe.py --memory
 
@@ -26,8 +26,12 @@ import json
 import os
 import re
 import sys
+import time
+import urllib.error
+import urllib.request
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlparse
 
 #: Settings the UI may edit: environment-variable name -> AppConfig attribute.
 #: Kept here rather than imported from :mod:`webui.store` because a script's
@@ -158,6 +162,122 @@ def _jsonable(value: Any) -> Any:
     return value
 
 
+def _models_has(base_url: str, model: str, api_key: str, *, timeout: float = 2.0) -> bool:
+    """Whether the endpoint's own model list names *model*.
+
+    A listed name is not proof the model still accepts work — gateways keep
+    names they have stopped serving — so a hit is only ever used to *skip* the
+    paid one-token chat probe. A list that cannot be read answers ``False``,
+    which sends the caller to that probe instead of guessing.
+    """
+    headers = {"Accept": "application/json"}
+    if api_key:
+        headers["Authorization"] = f"Bearer {api_key}"
+    request = urllib.request.Request(f"{base_url.rstrip('/')}/models", headers=headers)
+    try:
+        with urllib.request.urlopen(request, timeout=timeout) as response:
+            data = json.loads(response.read().decode("utf-8", "replace"))
+    except Exception:  # noqa: BLE001 - an unreadable list is not an answer
+        return False
+    items = data.get("data") if isinstance(data, dict) else None
+    if not isinstance(items, list):
+        return False
+    return any(isinstance(item, dict) and str(item.get("id") or "") == model for item in items)
+
+
+def _chat_check(base_url: str, model: str, api_key: str, *, timeout: float = 4.0) -> dict[str, Any]:
+    """One one-token chat call: proves this exact model still answers.
+
+    The free ``/models`` probe is only a filter (see :func:`_models_has`); when
+    it cannot vouch for the model, this is the stronger answer the resume path
+    needs. The first token spelling is tried once, and the second only when the
+    endpoint rejected *that spelling*: retrying every failure made a dead
+    endpoint cost two full timeouts per resume click.
+    """
+    started = time.perf_counter()
+    headers = {"Content-Type": "application/json"}
+    if api_key:
+        headers["Authorization"] = f"Bearer {api_key}"
+    error = "không kết nối được endpoint"
+    status = 0
+    for field in ("max_tokens", "max_completion_tokens"):
+        body = json.dumps(
+            {
+                "model": model,
+                "messages": [{"role": "user", "content": "ping"}],
+                field: 1,
+            }
+        ).encode("utf-8")
+        try:
+            request = urllib.request.Request(
+                f"{base_url.rstrip('/')}/chat/completions",
+                data=body,
+                headers=headers,
+                method="POST",
+            )
+            with urllib.request.urlopen(request, timeout=timeout):
+                return {
+                    "ok": True,
+                    "status": 200,
+                    "latency_ms": int((time.perf_counter() - started) * 1000),
+                    "error": "",
+                }
+        except urllib.error.HTTPError as exc:
+            status = int(exc.code)
+            detail = ""
+            try:
+                detail = (exc.read() or b"").decode("utf-8", "replace")[:200]
+            except Exception:  # noqa: BLE001 - body is a courtesy, not a contract
+                detail = ""
+            error = f"HTTP {exc.code}: {detail}".strip()
+            lowered = detail.lower()
+            if "max_tokens" not in lowered and "max_completion_tokens" not in lowered:
+                # The endpoint refused the model or the request, not this token
+                # spelling: asking again with the other name is the same question.
+                break
+        except Exception as exc:  # noqa: BLE001 - transport failures are answers too
+            status = 0
+            error = str(exc) or exc.__class__.__name__
+            break
+    return {
+        "ok": False,
+        "status": status,
+        "latency_ms": int((time.perf_counter() - started) * 1000),
+        "error": error,
+    }
+
+
+def check_agent(name: str, model: str = "") -> dict[str, Any]:
+    """Report the configured endpoint and whether *model* still answers there.
+
+    When *model* is empty or matches the configured model, no request is made:
+    the current configuration is by definition the one a fresh attempt would
+    use. A different (old) model is first looked up in the endpoint's own model
+    list (free), and only named by neither that list nor the configuration is
+    it tested with a real call — a stale name is what this check exists to
+    catch, and a paid round trip per resume click is not how to catch it.
+    """
+    from polyglot_lc.config import get_agent_config
+
+    cfg = get_agent_config(name)
+    requested = (model or "").strip()
+    if not requested or requested == cfg.model:
+        test = {"ok": True, "status": 200, "latency_ms": 0, "error": ""}
+    elif _models_has(cfg.base_url, requested, cfg.api_key):
+        # Listed by the endpoint: no request has to be paid to learn this. A
+        # name the list does not carry still gets the chat probe below, because
+        # "missing from the list" is the ambiguous case this check exists for.
+        test = {"ok": True, "status": 200, "latency_ms": 0, "error": ""}
+    else:
+        test = _chat_check(cfg.base_url, requested, cfg.api_key)
+    return {
+        "agent": name,
+        "model": cfg.model,
+        "host": urlparse(cfg.base_url).hostname or "",
+        "test": test,
+    }
+
+
 def effective_config() -> dict[str, Any]:
     """Effective settings plus each one's source; no credential is reported."""
     from polyglot_lc.config import get_app_config
@@ -192,7 +312,17 @@ def _translator_model() -> str:
         return FALLBACK_MODEL
 
 
-def plan_file(file_path: Path, *, tgt: str, max_tokens: int | None) -> dict[str, Any]:
+def _translator_base_url() -> str:
+    """The endpoint the run will use, so the preview resolves the same profile."""
+    from polyglot_lc.config import ConfigError, get_agent_config
+
+    try:
+        return get_agent_config("TRANSLATOR").base_url
+    except ConfigError:
+        return ""
+
+
+def plan_file(file_path: Path) -> dict[str, Any]:
     """How a file will be split, without spending a single model request."""
     from polyglot_lc.ingest import load_document
     from polyglot_lc.pipeline.assembler import output_path
@@ -202,10 +332,10 @@ def plan_file(file_path: Path, *, tgt: str, max_tokens: int | None) -> dict[str,
         raise FileNotFoundError(f"input file not found: {file_path}")
     model = _translator_model()
     doc = load_document(file_path)
-    chunks = chunk_document(doc, max_tokens=max_tokens, model=model)
+    chunks = chunk_document(doc, model=model, base_url=_translator_base_url())
     return {
         "chunks": len(chunks),
-        "output_path": str(output_path(file_path, tgt, None)),
+        "output_path": str(output_path(file_path, "vi", None)),
         "title": Path(str(doc.metadata.get("filename") or file_path.name)).name,
         "model": model,
     }
@@ -323,33 +453,34 @@ def main(argv: list[str] | None = None) -> int:
     )
     group = parser.add_mutually_exclusive_group(required=True)
     group.add_argument("--config", action="store_true", help="Print effective settings.")
+    group.add_argument(
+        "--check-agent",
+        metavar="NAME",
+        help="Print an agent's endpoint and whether a model still answers there.",
+    )
     group.add_argument("--plan", metavar="FILE", help="Print a file's chunk plan.")
     group.add_argument("--text", metavar="FILE", help="Print a document's text.")
     group.add_argument(
         "--memory", action="store_true", help="Print what the reasoning bank holds (read-only)."
     )
-    # --src is accepted for interface symmetry with the CLI; planning depends
-    # only on the target language, because the tokenizer does not read the text.
-    parser.add_argument("--src", default="auto", help="Source language (informational).")
-    parser.add_argument("--tgt", default="vi", help="Target language.")
     parser.add_argument(
-        "--max-tokens",
-        type=int,
-        dest="max_tokens",
-        default=None,
-        help="Chunk token budget (default: CHUNK_MAX_TOKENS).",
+        "--check-model",
+        default="",
+        help="Old model to test on the agent's configured endpoint.",
     )
     args = parser.parse_args(argv)
 
     try:
-        if args.config:
+        if args.check_agent:
+            payload = check_agent(args.check_agent, args.check_model)
+        elif args.config:
             payload = effective_config()
         elif args.text:
             payload = document_text(Path(args.text))
         elif args.memory:
             payload = memory_summary()
         else:
-            payload = plan_file(Path(args.plan), tgt=args.tgt, max_tokens=args.max_tokens)
+            payload = plan_file(Path(args.plan))
     except Exception as exc:  # noqa: BLE001 - the contract is JSON on stdout, a
         # reason on stderr and a non-zero exit; a traceback would break the
         # single-object contract the caller parses.

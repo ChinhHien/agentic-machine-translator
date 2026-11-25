@@ -30,9 +30,9 @@ from __future__ import annotations
 
 import dataclasses
 import hashlib
+import json
 import threading
 import time
-import json
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
@@ -51,8 +51,13 @@ from polyglot_lc.agents import (
     TranslatorAgent,
     VerifierAgent,
 )
-from polyglot_lc.agents.verifier import TranslationRejected
+from polyglot_lc.agents.verifier import TranslationRejected, VerificationError
 from polyglot_lc.analysis import DocumentPlan, score_chunk
+from polyglot_lc.analysis.unified_planner import (
+    PLAN_CACHE_SCHEMA,
+    plan_from_dict,
+    plan_to_dict,
+)
 from polyglot_lc.config import (
     ConfigError,
     RetryConfig,
@@ -62,7 +67,13 @@ from polyglot_lc.config import (
     get_retry_config,
 )
 from polyglot_lc.ingest import load_document
-from polyglot_lc.llm.client import TokenUsage, active_api_calls
+from polyglot_lc.ingest.ai_review import ReviewReport, review_with_llm
+from polyglot_lc.llm.client import (
+    LLMClient,
+    TokenUsage,
+    active_api_calls,
+    provider_gate_stats,
+)
 from polyglot_lc.llm.resilience import (
     LLMError,
     NoBackupError,
@@ -87,16 +98,16 @@ from polyglot_lc.pipeline.assembler import (
 )
 from polyglot_lc.pipeline.checkpoint import CheckpointStore, ChunkCheckpoint
 from polyglot_lc.pipeline.consistency import ConsistencyChecker
+from polyglot_lc.pipeline.ingest_cache import IngestCache
 from polyglot_lc.pipeline.pdf_output import rebuild_pdf
 from polyglot_lc.reasoning_bank.embedder import Embedder
 from polyglot_lc.reasoning_bank.store import ReasoningBank
 from polyglot_lc.segment.chunker import Chunk, chunk_document
 from polyglot_lc.segment.glossary import (
-    MAX_USER_GLOSSARY_TERMS,
+    GlossaryTerm,
     default_glossary,
     extract_glossary,
     glossary_budget,
-    load_glossary_csv,
 )
 from polyglot_lc.skillopt.optimizer import SkillOptimizer
 from polyglot_lc.skillopt.skill_store import SkillStore
@@ -194,6 +205,11 @@ class PipelineResult:
     standard_path_chunks: int = 0
     deep_path_chunks: int = 0
     resumed_chunks: int = 0
+    #: Chunks replayed from the content bank because this job had no checkpoint
+    #: of its own — the translation was made under another model or endpoint.
+    #: Kept separately from ``resumed_chunks``: those words are not this
+    #: attempt's work and must not read as if they were.
+    reused_foreign: int = 0
     #: How many inconsistencies the pass found across chunks — the count is of
     #: *drifts*, not of terms the pass inspected (that is ``checked_terms``).
     consistency_inconsistencies: int = 0
@@ -219,12 +235,38 @@ class PipelineResult:
     #: rest of its budget was not spent, and the chunks it left are counted as
     #: skipped rather than silently looking consistent.
     consistency_stopped_early: bool = False
-    #: Unavailable verifications that stopped chunk processing.
+    #: Chunks the Verifier could not judge: their drafts are kept, flagged, and
+    #: left out of the checkpoint so a resume asks the Verifier again.
     verify_skipped: int = 0
+    #: True when this attempt reused the plan saved in its checkpoint instead
+    #: of paying for another Planner request.
+    plan_reused: bool = False
+    #: Counters across every attempt of this translation. Filled at run end;
+    #: empty until then. The per-attempt fields above keep their old meaning.
+    cumulative: dict[str, Any] = field(default_factory=dict)
+    #: Per-chunk scores observed by this attempt, merged into ``cumulative`` so
+    #: a chunk retried later does not count twice in the mean.
+    skill_scores: dict[str, float] = field(default_factory=dict)
+    # Internal hand-off to ``_record_run_end``: prior counters and where to
+    # write the merged ones. Excluded from repr because they are not a report.
+    previous_stats: dict[str, Any] = field(default_factory=dict, repr=False)
+    checkpoint_store: Any = field(default=None, repr=False)
+    doc_key: str = field(default="", repr=False)
     partial_output: bool = False
     elapsed_s: float = 0.0
     chunks_failed: int = 0
+    #: Chunks whose own request failed in a way no retry can fix (bad key,
+    #: malformed prompt, a model name that does not exist). They are holes in the
+    #: document, reported as incomplete rather than as a failed run.
+    chunks_permanently_failed: int = 0
     chunks_rejected: int = 0
+    #: Every chunk the plan expected, how many finished with a verified
+    #: checkpoint, and which ones did not — the completion verdict.
+    expected_chunks: int = 0
+    verified_chunks: int = 0
+    checkpointed_chunks: int = 0
+    incomplete_chunks: list[dict[str, str]] = field(default_factory=list)
+    completion: dict[str, Any] = field(default_factory=dict)
     #: Per-chunk review notes for best-effort translations that did not pass
     #: every gate. The records are deliberately structured: a dashboard can
     #: count causes without parsing prose, and a reviewer can find the exact
@@ -280,13 +322,30 @@ def _file_sha256(path: Path) -> str:
         return ""
 
 
+def _endpoint_of(base_url: str) -> str:
+    """A URL fit to record: scheme, host, port and path, never a credential.
+
+    The web UI pins this value on a resume, so it has to name the same server
+    the checkpoints were keyed by; userinfo and query are dropped because they
+    are where a key ends up when a provider wants one in the URL.
+    """
+    parts = urlparse(str(base_url or ""))
+    if not parts.hostname:
+        return ""
+    netloc = parts.hostname
+    if parts.port:
+        netloc = f"{netloc}:{parts.port}"
+    scheme = f"{parts.scheme}://" if parts.scheme else ""
+    return f"{scheme}{netloc}{parts.path}".rstrip("/")
+
+
 def _detect_lang(text: str) -> str:
     """Detect source language with langdetect (falls back to 'en')."""
     try:
         from langdetect import detect
 
         return detect(text[:2000]) or "en"
-    except Exception:  # noqa: BLE001 - detection is best-effort
+    except Exception:
         return "en"
 
 
@@ -321,12 +380,11 @@ class TranslationPipeline:
         file_path: str | Path,
         src: str = "auto",
         tgt: str = "vi",
-        glossary: str | None = None,
         out: str | None = None,
-        max_tokens: int | None = None,
         resume: bool | None = None,
         checkpoint_dir: str | Path | None = None,
         output_format: str | None = None,
+        reuse_foreign: bool = True,
     ) -> PipelineResult:
         """Translate *file_path* from *src* to *tgt*; returns a report."""
         result = PipelineResult()
@@ -338,14 +396,13 @@ class TranslationPipeline:
                     file_path,
                     src,
                     tgt,
-                    glossary,
                     out,
-                    max_tokens,
                     ui,
                     result,
                     resume=self.resume if resume is None else bool(resume),
                     checkpoint_dir=checkpoint_dir or self.app.checkpoint_dir,
                     output_format=output_format or self.app.output_format,
+                    reuse_foreign=reuse_foreign,
                 )
             except ConfigError as exc:
                 ui.add_error(str(exc))
@@ -398,16 +455,24 @@ class TranslationPipeline:
         this class has been accumulating alongside them.
         """
         usage = TokenUsage.snapshot()
+        # A crashed attempt never reaches the score pass, but the chunks it did
+        # finish carry their scores in the checkpoint. Include those so the
+        # cumulative mean covers every measured chunk, not just the last run's.
+        if result.checkpoint_store is not None and result.doc_key:
+            for chunk_id, checkpoint in result.checkpoint_store.completed(result.doc_key).items():
+                result.skill_scores.setdefault(chunk_id, checkpoint.score)
+        result.cumulative = _merge_cumulative(
+            result.previous_stats, result, usage, stats, duration_ms
+        )
+        if result.checkpoint_store is not None and result.doc_key:
+            result.checkpoint_store.save_stats(result.doc_key, result.cumulative)
         # "Failed" is a verdict on the deliverable, not on the road to it: a run
         # that waited out a provider outage and translated every chunk is done.
         # It reads as failed only when a chunk has no translation or the run
         # stopped on an error. Its problems are still counted below.
         failed = bool(result.chunks_failed or result.fatal_error)
-        status = (
-            "failed"
-            if failed
-            else ("done_with_warnings" if result.chunks_rejected else "done")
-        )
+        incomplete = bool(result.incomplete_chunks)
+        status = "failed" if failed else ("incomplete" if incomplete else "done")
         artifacts: list[dict[str, Any]] = []
         for kind, path in (("md", result.output_path), ("pdf", result.pdf_path)):
             if not path:
@@ -426,12 +491,22 @@ class TranslationPipeline:
             status=status,
             active_api_calls=calls.get("active"),
             max_active_api_calls=calls.get("peak"),
-            exit_code=1 if failed else 0,
+            # What the per-provider queues settled on: a run that grew to 4
+            # slots (or was halved by 429s) says so here instead of leaving it
+            # to be guessed from timings.
+            provider_slots=provider_gate_stats(),
+            exit_code=(1 if failed else (2 if incomplete else 0)),
             duration_ms=duration_ms,
             tokens={
                 "sent": usage["sent"],
                 "received": usage["received"],
                 "cached": usage.get("cached", 0),
+                # Whether the provider reported prompt-cache use at all: a run
+                # with large prompts and every call "unknown" cannot claim
+                # caching works, and saying so is the first half of checking it.
+                "cache_hits": usage.get("cache_hits", 0),
+                "cache_misses": usage.get("cache_misses", 0),
+                "cache_unknown": usage.get("cache_unknown", 0),
             },
             calls=usage["calls"],
             cache_hits=usage.get("cache_hits", 0),
@@ -442,11 +517,19 @@ class TranslationPipeline:
             retries=result.retries,
             chunk_retries=result.chunk_retries,
             fallbacks=stats.get("fallbacks", 0),
-            chunks_done=max(0, result.chunks - result.chunks_failed),
+            chunks_done=max(
+                0,
+                result.chunks - result.chunks_failed - result.chunks_permanently_failed,
+            ),
             chunks_failed=result.chunks_failed,
+            chunks_permanently_failed=result.chunks_permanently_failed,
             chunks_rejected=result.chunks_rejected,
+            completion=result.completion,
+            incomplete_chunks=result.incomplete_chunks,
             fatal_error=result.fatal_error,
             resumed_chunks=result.resumed_chunks,
+            reused_foreign=result.reused_foreign,
+            plan_reused=result.plan_reused,
             # The consistency pass's own tally, on the record a reader opens
             # first: chunk left drifting and patch refused were only ever
             # visible as lines buried in the log.
@@ -472,19 +555,26 @@ class TranslationPipeline:
             # that reached the report: a reader can then reconcile the count
             # with the `error` records it finds.
             problems=self.sink.problem_count,
+            # Per-attempt fields above stay untouched for the supervisor and
+            # for an old reader; this is the whole translation's running tally.
+            cumulative=result.cumulative,
         )
 
     def _agent_summaries(self) -> list[dict[str, Any]]:
-        """Who ran this run: model, **host**, sampling — never a URL or a key.
+        """Who ran this run: model, **host**, endpoint, sampling — never a key.
 
         The host rather than the configured ``base_url`` keeps any credential
-        and any path in it out of a file that gets copied, shared and read.
+        and any path in it out of a file that gets copied, shared and read. The
+        ``endpoint`` is the same URL without its userinfo or query, which is
+        what a resumed run pins so it keeps talking to the very server that
+        produced its checkpoints (the endpoint is part of their identity).
         """
         return [
             {
                 "name": name.lower(),
                 "model": cfg.model,
                 "host": urlparse(cfg.base_url).hostname or "",
+                "endpoint": _endpoint_of(cfg.base_url),
                 "temperature": cfg.temperature,
             }
             for name, cfg in self.agent_configs.items()
@@ -498,7 +588,7 @@ class TranslationPipeline:
         try:
             embedder = Embedder(self.embed_config)
             reasoning_bank = ReasoningBank(self.app.reasoning_bank_path, embedder)
-        except Exception as exc:  # noqa: BLE001 - RB is best-effort
+        except Exception as exc:
             ui.add_error(f"reasoning bank unavailable: {exc}")
             logger.warning("Reasoning bank unavailable: {}", exc)
         return {
@@ -517,7 +607,7 @@ class TranslationPipeline:
         ctx: GraphContext,
         chunks: list[Any],
         heuristic_terms: list[Any],
-        user_glossary: dict[str, str],
+        core_glossary: dict[str, str],
         src: str,
         tgt: str,
         doc_text: str,
@@ -539,7 +629,7 @@ class TranslationPipeline:
             doc_text=doc_text,
             doc_title=doc_title,
             heuristic_terms=heuristic_terms,
-            user_glossary=user_glossary,
+            core_glossary=core_glossary,
         )
 
     # ------------------------------------------------------------------
@@ -572,6 +662,13 @@ class TranslationPipeline:
         # provider was asked for one: the mock harness answers with a canned
         # pseudo-reply by design (see :func:`coverage_error`).
         measure_coverage = _coverage_enabled(self.agent_configs["TRANSLATOR"])
+        # A run must not ask a dead provider 76 times, and it must not throw
+        # away 75 good chunks because three hit a blip either. The streak counts
+        # consecutive "the provider is gone" failures; the config says how many
+        # in a row mean the run itself is over.
+        outage = {"streak": 0}
+        outage_lock = threading.Lock()
+        stop_after_failures = max(1, int(self.app.chunk_stop_after_failures))
 
         def translate_chunk(chunk: Any) -> dict[str, Any]:
             state = {**base_state, **per_chunk_state.get(chunk.id, {}), "chunk": chunk}
@@ -603,6 +700,32 @@ class TranslationPipeline:
                 time.sleep(slice_s)
                 waited += slice_s
 
+        def wait_verify_retry(chunk: Any, attempt: int) -> None:
+            """Wait before asking the Verifier again, without re-translating.
+
+            A verifier outage says nothing about the draft, so the retry asks
+            the same draft again. The wait doubles and is sliced, so the stop
+            button cuts it short like every other wait in this loop.
+            """
+            delay = min(60.0, self.app.verify_retry_delay * (2 ** (attempt - 1)))
+            where = ctx.last_step(chunk.id) if ctx is not None else ""
+            logger.warning(
+                "Chunk {} verification unavailable; re-checking the same draft in {:.0f}s",
+                chunk.id,
+                delay,
+            )
+            ui.retry(
+                where,
+                chunk.id,
+                f"verification unavailable - re-checking in {delay:.0f}s",
+            )
+            RetryStats.add_chunk_retry()
+            waited = 0.0
+            while waited < delay and not self._stop.is_set():
+                slice_s = min(_RETRY_TICK, delay - waited)
+                time.sleep(slice_s)
+                waited += slice_s
+
         def settle(chunk: Any, depth: int) -> tuple[dict[str, Any], bool, bool]:
             """Translate *chunk* until its reply covers it.
 
@@ -614,25 +737,102 @@ class TranslationPipeline:
             coverage_retries = 0
             empty_replies = 0
             truncated_retries = 0
+            verify_retries = 0
+            attempt_limit = max(1, int(self.app.chunk_max_attempts))
+            last_reason = ""
             while True:
                 if self._stop.is_set():
                     # Another chunk hit something no retry can fix, so the run
                     # is over: this chunk is not asked again.
                     return {"translated": "", "chunk": chunk, "error": "run stopped"}, False, True
+                if attempt >= attempt_limit:
+                    # The provider has said no this many times: asking again is
+                    # the same question, and waiting it out forever is how a
+                    # 74-chunk run held a whole morning without writing a file.
+                    reason = f"gave up after {attempt} attempt(s)"
+                    if last_reason:
+                        reason = f"{reason}: {last_reason}"
+                    logger.warning(
+                        "chunk={} {}; leaving it untranslated for this run "
+                        "(CHUNK_MAX_ATTEMPTS={}) and out of the checkpoint",
+                        chunk.id,
+                        reason,
+                        attempt_limit,
+                    )
+                    ui.add_error(f"{chunk.id}: {reason} - left untranslated")
+                    return (
+                        {"translated": "", "chunk": chunk, "error": reason},
+                        True,
+                        False,
+                    )
                 attempt += 1
                 try:
                     out = translate_chunk(chunk)
                 except LLMError as exc:
+                    last_reason = f"{type(exc).__name__}: {exc}"
                     ui.add_error(f"{chunk.id}: {type(exc).__name__}: {exc}")
-                    if isinstance(exc, (NoBackupError, PermanentError)):
-                        # Nothing left to try: the attempts are spent and there
-                        # is no backup endpoint to switch to, or the failure is
-                        # one no retry can fix. Asking again would be the same
-                        # question with the same answer, so the run stops here
-                        # and says why — instead of spinning on a dead provider
-                        # for as long as the reader keeps the page open.
-                        self._stop.set()
-                        return {"translated": "", "chunk": chunk, "error": str(exc)}, False, True
+                    if isinstance(exc, PermanentError):
+                        # This chunk's request is wrong in a way no retry fixes
+                        # (bad key, malformed prompt, a model name that does not
+                        # exist). It is one hole in the document, not an outage:
+                        # leave it untranslated and out of the checkpoint, let
+                        # the other chunks finish, and report the run incomplete
+                        # (exit 2) so --resume fills exactly this gap. Stopping
+                        # every worker here ended a 76-chunk run after 27 chunks.
+                        logger.warning(
+                            "chunk={} failed permanently ({}); leaving it untranslated "
+                            "for this run and out of the checkpoint",
+                            chunk.id,
+                            last_reason,
+                        )
+                        return (
+                            {
+                                "translated": "",
+                                "chunk": chunk,
+                                "error": str(exc),
+                                "permanent_failure": True,
+                            },
+                            True,
+                            False,
+                        )
+                    if isinstance(exc, NoBackupError):
+                        # The attempts are spent and there is no backup endpoint
+                        # to switch to. One chunk losing that race is a hole the
+                        # file can live with; a provider that keeps failing is
+                        # an outage, and asking it 73 more times is not a retry,
+                        # it is a decision to waste the rest of the run.
+                        with outage_lock:
+                            outage["streak"] += 1
+                            streak = outage["streak"]
+                        if streak >= stop_after_failures:
+                            logger.error(
+                                "chunk={} failed with no endpoint left ({} in a row); "
+                                "stopping the run",
+                                chunk.id,
+                                streak,
+                            )
+                            self._stop.set()
+                            return (
+                                {"translated": "", "chunk": chunk, "error": str(exc)},
+                                False,
+                                True,
+                            )
+                        logger.warning(
+                            "chunk={} has no endpoint left ({} in a row); leaving it "
+                            "untranslated for this run and out of the checkpoint",
+                            chunk.id,
+                            streak,
+                        )
+                        return (
+                            {
+                                "translated": "",
+                                "chunk": chunk,
+                                "error": str(exc),
+                                "permanent_failure": True,
+                            },
+                            True,
+                            False,
+                        )
                     if isinstance(exc, TruncatedError):
                         # The Translator's own budget ladder is spent by the time
                         # the error reaches here, so re-running the whole graph
@@ -668,6 +868,18 @@ class TranslationPipeline:
                 if translated.strip():
                     reason = coverage_error(chunk, translated) if measure_coverage else None
                     if reason is None:
+                        # A verifier outage is retried here, on the same draft:
+                        # translator_node reuses ``kept_draft``, so the only
+                        # new request is the verdict that never arrived.
+                        if (
+                            out.get("verify_unavailable")
+                            and verify_retries < self.app.verify_unavailable_retries
+                        ):
+                            verify_retries += 1
+                            wait_verify_retry(chunk, verify_retries)
+                            if self._stop.is_set():
+                                return out, True, True
+                            continue
                         return out, False, False
                     if coverage_retries >= _MAX_COVERAGE_RETRIES:
                         salvaged = salvage_by_split(chunk, depth)
@@ -778,6 +990,9 @@ class TranslationPipeline:
                     ),
                     section_path=chunk.section_path,
                     index=chunk.index,
+                    # Verification reads the profile: half a reference list is
+                    # still a reference list, not body prose.
+                    profile=getattr(chunk, "profile", "body"),
                 )
                 sub_out, _, aborted = settle(sub, depth + 1)
                 sub_text = (sub_out.get("translated", "") or "").strip()
@@ -812,6 +1027,9 @@ class TranslationPipeline:
             try:
                 out, kept_partial, aborted = settle(chunk, 0)
             except TranslationRejected as exc:
+                # TranslationRejected subclasses VerificationError: catch it
+                # first, or a quality rejection would be mistaken for an
+                # unavailable Verifier.
                 ui.add_error(f"{chunk.id}: {exc}")
                 # Keep the best draft even when the gate refused it. A reader
                 # can review imperfect text; a marker cannot recover words.
@@ -825,20 +1043,63 @@ class TranslationPipeline:
                     "rejection_reason": str(exc),
                 }
                 kept_partial, aborted = True, False
+            except VerificationError as exc:
+                # A custom/test graph can raise where the production graph now
+                # returns a skipped verdict. Treat it the same: keep the best
+                # draft, flag it, and let the rest of the document finish.
+                message = f"verification unavailable: {exc}"
+                add_error = getattr(ui, "add_error", None)
+                if callable(add_error):
+                    add_error(f"{chunk.id}: {message}")
+                best = ctx.drafts.get(chunk.id, "") if ctx is not None else ""
+                if ctx is not None:
+                    ctx.note_verify_skip(chunk.id)
+                    ctx.record_error(step="verify", chunk_id=chunk.id, cause="verify", message=message)
+                out = {
+                    "translated": best,
+                    "chunk": chunk,
+                    "error": message,
+                    "quality_rejected": False,
+                    "verify_unavailable": True,
+                }
+                kept_partial, aborted = True, False
+            if not aborted and (out.get("translated") or "").strip():
+                # The provider answered: whatever streak it had is over.
+                with outage_lock:
+                    outage["streak"] = 0
             if aborted:
                 return out
+            # Unverified text is kept for the reader but never checkpointed:
+            # a resume must ask the Verifier again rather than replay it.
+            if out.get("verify_unavailable"):
+                kept_partial = True
             # A translation — whole or salvaged — is worth keeping: a resume
             # never has to translate the chunk again. A partial one that
             # failed the coverage check is kept out of the checkpoint so a
             # later --resume can still recover the words it never got.
             if store is not None and store.usable and not kept_partial:
                 store.put(doc_key, self._to_checkpoint(chunk, out))
+            if (
+                ctx is not None
+                and not out.get("verify_unavailable")
+                and not out.get("quality_rejected")
+            ):
+                # A chunk that eventually passed was not "never verified": the
+                # retry worked, so the warning must not outlive it.
+                ctx.clear_verify_skip(chunk.id)
             if on_chunk_done is not None:
                 on_chunk_done(chunk, out)
             return out
 
         results: list[Any] = [None] * len(chunks)
         workers = max(1, self.app.max_concurrency)
+        # The executor already has at most ``workers`` threads. This gate makes
+        # the invariant explicit at the chunk boundary as well: a worker holds
+        # one permit for the whole translate/verify/checkpoint lifecycle and
+        # cannot pick up another chunk until ``run_one`` returns. Keeping this
+        # local to one run also means completion sweeps and a later run can
+        # never silently accumulate extra workers.
+        chunk_slots = threading.BoundedSemaphore(workers)
         slots = get_retry_config().provider_concurrency
         if workers > slots:
             # Both knobs default to 1 and the settings dialog exposes both, so
@@ -856,21 +1117,131 @@ class TranslationPipeline:
             for i, chunk in enumerate(chunks):
                 results[i] = run_one(i, chunk)
                 ui.advance()
-            return results
+        else:
+            def run_in_slot(index: int, chunk: Any) -> dict[str, Any]:
+                """Hold one chunk slot until this chunk is completely finished."""
+                with chunk_slots:
+                    return run_one(index, chunk)
 
-        with ThreadPoolExecutor(max_workers=min(workers, len(chunks))) as pool:
-            futures = {pool.submit(run_one, i, chunk): i for i, chunk in enumerate(chunks)}
-            try:
-                for future in as_completed(futures):
-                    idx = futures[future]
-                    results[idx] = future.result()  # raise the first failure
-                    ui.advance()
-            except BaseException:
-                # A chunk is retried without a ceiling, so an interrupted run
-                # has to say so: the workers check this while they wait, and this
-                # block joins them on the way out.
-                self._stop.set()
-                raise
+            with ThreadPoolExecutor(max_workers=min(workers, len(chunks))) as pool:
+                futures = {
+                    pool.submit(run_in_slot, i, chunk): i for i, chunk in enumerate(chunks)
+                }
+                try:
+                    for future in as_completed(futures):
+                        idx = futures[future]
+                        results[idx] = future.result()  # raise the first failure
+                        ui.advance()
+                except BaseException:
+                    # A chunk is retried without a ceiling, so an interrupted run
+                    # has to say so: the workers check this while they wait, and this
+                    # block joins them on the way out.
+                    self._stop.set()
+                    raise
+
+        # ---- completion sweeps ----
+        # A verifier outage that outlasted the per-chunk retries is retried
+        # here at document level: the drafts are already in hand, so each round
+        # re-verifies them (and only retranslates a chunk the Verifier actually
+        # rejected). No sweep means no unbounded spending, and a chunk that is
+        # still not verified is reported as incomplete rather than as done.
+        def needs_completion(index: int, chunk: Any) -> bool:
+            out = results[index] or {}
+            if out.get("permanent_failure"):
+                # Asked and answered: a bad request does not become a good one
+                # by waiting, and the sweeps exist for outages, not for holes.
+                return False
+            if out.get("verify_unavailable") or out.get("quality_rejected"):
+                return True
+            if not (out.get("translated") or "").strip():
+                return True
+            if store is not None and store.usable:
+                return store.get(doc_key, chunk.id, chunk.hash()) is None
+            return False
+
+        # A definitive rejection gets **one** extra try across the sweeps. A
+        # verifier that rejected the same draft twice is unlikely to change its
+        # mind just because time passed, and repeating it would only spend
+        # translation calls. An unavailable verifier has no verdict yet, so it
+        # is worth retrying in every round.
+        extra_retry_used: set[str] = set()
+        completion_started = time.monotonic()
+        deadline = self.app.completion_deadline
+        deadline_hit = False
+        for round_no in range(1, max(0, self.app.completion_rounds) + 1):
+            if self._stop.is_set():
+                break
+            if deadline > 0 and time.monotonic() - completion_started >= deadline:
+                deadline_hit = True
+                self.sink.info(
+                    step="completion",
+                    message=(
+                        "completion deadline reached after "
+                        f"{deadline:.0f}s; leaving the remaining chunks incomplete"
+                    ),
+                )
+                logger.warning(
+                    "Completion deadline reached after {:.0f}s; "
+                    "leaving remaining chunks incomplete",
+                    deadline,
+                )
+                break
+            pending = [
+                i
+                for i, chunk in enumerate(chunks)
+                if needs_completion(i, chunk)
+                and not (
+                    (results[i] or {}).get("quality_rejected")
+                    and chunk.id in extra_retry_used
+                )
+            ]
+            if not pending:
+                break
+            delay = min(120.0, self.app.completion_retry_delay * round_no)
+            if delay > 0:
+                self.sink.info(
+                    step="completion",
+                    message=(
+                        f"completion sweep {round_no}: {len(pending)} chunk(s) chưa xác minh; "
+                        f"thử lại sau {delay:.0f}s"
+                    ),
+                )
+                waited = 0.0
+                while waited < delay and not self._stop.is_set():
+                    slice_s = min(_RETRY_TICK, delay - waited)
+                    time.sleep(slice_s)
+                    waited += slice_s
+            if self._stop.is_set():
+                break
+            self.sink.record(
+                type="completion_round",
+                round=round_no,
+                chunks=len(pending),
+                ids=[chunks[i].id for i in pending[:50]],
+            )
+            for i in pending:
+                if self._stop.is_set():
+                    break
+                if deadline > 0 and time.monotonic() - completion_started >= deadline:
+                    deadline_hit = True
+                    break
+                if (results[i] or {}).get("quality_rejected"):
+                    extra_retry_used.add(chunks[i].id)
+                results[i] = run_one(i, chunks[i])
+            if deadline_hit:
+                self.sink.info(
+                    step="completion",
+                    message=(
+                        "completion deadline reached after "
+                        f"{deadline:.0f}s; leaving the remaining chunks incomplete"
+                    ),
+                )
+                logger.warning(
+                    "Completion deadline reached after {:.0f}s; "
+                    "leaving remaining chunks incomplete",
+                    deadline,
+                )
+                break
         return results
 
     @staticmethod
@@ -904,8 +1275,43 @@ class TranslationPipeline:
             (directory / f"{chunk.id}.json").write_text(
                 json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8"
             )
-        except OSError as exc:  # noqa: BLE001 - evidence is best-effort
+        except OSError as exc:
             logger.warning("Could not save rejected draft for {}: {}", chunk.id, exc)
+
+    @staticmethod
+    def _incomplete_chunks(
+        chunks: list[Any],
+        states: dict[str, dict[str, Any]],
+        store: CheckpointStore | None,
+        doc_key: str,
+    ) -> list[dict[str, str]]:
+        """Every planned chunk that is not finished and verified.
+
+        A checkpoint is only written for a chunk the pipeline accepted, so its
+        presence is the run's own receipt for "verified". When checkpointing is
+        disabled there is no receipt to read; the chunk state's flags are then
+        the only evidence, and they are still enough to refuse a false done.
+        """
+        missing: list[dict[str, str]] = []
+        for chunk in chunks:
+            state = states.get(chunk.id) or {}
+            reason = ""
+            if state.get("permanent_failure"):
+                reason = "translation failed permanently: " + str(state.get("error") or "")[:300]
+            elif not (state.get("translated") or "").strip():
+                reason = "missing translation"
+            elif state.get("quality_rejected"):
+                reason = "verification rejected: " + (
+                    str(state.get("rejection_reason") or "no acceptable translation")[:300]
+                )
+            elif state.get("verify_unavailable"):
+                reason = "verification unavailable"
+            elif store is not None and store.usable:
+                if store.get(doc_key, chunk.id, chunk.hash()) is None:
+                    reason = "no verified checkpoint"
+            if reason:
+                missing.append({"chunk": chunk.id, "reason": reason})
+        return missing
 
     @staticmethod
     def _to_checkpoint(chunk: Any, state: dict[str, Any]) -> ChunkCheckpoint:
@@ -939,29 +1345,92 @@ class TranslationPipeline:
         }
 
     # ------------------------------------------------------------------
+    @staticmethod
+    def _review_ingest(doc: Any) -> ReviewReport | None:
+        """Best-effort AI repair of extracted blocks; never fails the run."""
+        try:
+            cfg = get_agent_config("TRANSLATOR").model_copy(
+                update={"name": "INGEST_REVIEW", "temperature": 0.0}
+            )
+            app = get_app_config()
+            report = review_with_llm(
+                doc,
+                LLMClient(cfg),
+                max_blocks=app.ingest_ai_review_max_blocks,
+                max_chars=app.ingest_ai_review_max_chars,
+            )
+        except Exception as exc:
+            logger.warning("AI ingest review skipped: {}", exc)
+            return None
+        logger.info(
+            "AI ingest review | candidates={} reviewed={} changed={} rejected={} failed={}",
+            report.candidates,
+            report.reviewed,
+            report.changed,
+            report.rejected,
+            report.failed,
+        )
+        return report
+
     def _run_inner(
         self,
         file_path: str | Path,
         src: str,
         tgt: str,
-        glossary: str | None,
         out: str | None,
-        max_tokens: int | None,
         ui: SimpleUI,
         result: PipelineResult,
         *,
         resume: bool = False,
         checkpoint_dir: str | Path | None = None,
         output_format: str = "md",
+        reuse_foreign: bool = True,
     ) -> PipelineResult:
         app = self.app
         fmt = (output_format or "md").strip().lower()
         want_md, want_pdf = fmt in {"md", "both"}, fmt in {"pdf", "both"}
+        source_path = Path(file_path)
 
         # ---- ingest ----
+        # A resume must not read the whole document again. Extraction is minutes
+        # on a long book, and the optional AI review would rewrite block text —
+        # changing every chunk hash and, with it, the checkpoint identity the
+        # resume is about to look up. Both are cached by content (see
+        # ``pipeline.ingest_cache``).
+        ingest_cache = IngestCache(checkpoint_dir, enabled=checkpoint_dir is not None)
+        sha256 = _file_sha256(source_path)
+        cached = ingest_cache.load(sha256) if resume else None
+        heuristic_terms: list[GlossaryTerm] = []
         with ui.step("ingest") as _:
-            doc = load_document(file_path)
-            ui.set_stats(file=doc.metadata.get("filename", ""), blocks=len(doc.blocks))
+            if cached is not None:
+                doc, heuristic_terms = cached
+                # The cache is keyed by content, not by name: the same bytes
+                # under another path must still present themselves as this file.
+                doc.metadata["source"] = str(source_path)
+                doc.metadata["filename"] = source_path.name
+                logger.info(
+                    "Ingest cache: reusing {} block(s) extracted for {}",
+                    len(doc.blocks),
+                    source_path.name,
+                )
+                self.sink.info(
+                    step="ingest",
+                    message="dùng lại bản trích xuất đã lưu — không đọc lại tài liệu",
+                )
+                ui.set_stats(file=source_path.name, blocks=len(doc.blocks), cached_ingest=True)
+            else:
+                doc = load_document(file_path)
+                ui.set_stats(file=doc.metadata.get("filename", ""), blocks=len(doc.blocks))
+                if app.ingest_ai_review:
+                    # The extractor has already attached page geometry to every
+                    # block; review only rewrites block text in place and never
+                    # re-runs extraction, so the rebuild path keeps its rectangles.
+                    report = self._review_ingest(doc)
+                    if report is not None:
+                        ui.set_stats(
+                            ai_review_changed=report.changed,
+                            ai_review_rejected=report.rejected,
+                        )
 
         # ---- language detection ----
         if src == "auto":
@@ -969,10 +1438,14 @@ class TranslationPipeline:
                 src = _detect_lang(doc.plain_text())
         ui.set_stats(src=src, tgt=tgt)
 
-        # ---- chunking (token budget from TRANSLATOR_MODEL) ----
+        # ---- chunking (pinned tokenizer, budget from CHUNK_MAX_TOKENS) ----
         translator_cfg = self.agent_configs["TRANSLATOR"]
         with ui.step("segment"):
-            chunks = chunk_document(doc, max_tokens=max_tokens, model=translator_cfg.model)
+            chunks = chunk_document(
+                doc,
+                model=translator_cfg.model,
+                base_url=translator_cfg.base_url,
+            )
             ui.set_stats(chunks=len(chunks))
         result.chunks = len(chunks)
         result.chunks_failed = len(chunks)
@@ -984,7 +1457,7 @@ class TranslationPipeline:
         skill_store = SkillStore(app.skills_dir)
         try:
             skill = skill_store.load() if app.skill_apply else None
-        except Exception as exc:  # noqa: BLE001 - optimization is best-effort
+        except Exception as exc:
             logger.warning("Skill load skipped: {}", exc)
             skill = None
         result.skill_applied = skill is not None
@@ -998,7 +1471,7 @@ class TranslationPipeline:
         self.sink.record(
             type="run_start",
             file=source_path.name,
-            sha256=_file_sha256(source_path),
+            sha256=sha256,
             bytes=source_path.stat().st_size if source_path.is_file() else 0,
             pages=doc.metadata.get("pages"),
             chunks=len(chunks),
@@ -1006,7 +1479,7 @@ class TranslationPipeline:
             src=src,
             tgt=tgt,
             agents=self._agent_summaries(),
-            max_tokens=max_tokens if max_tokens is not None else app.chunk_max_tokens,
+            max_tokens=app.chunk_max_tokens,
             flags={
                 "resume": bool(resume),
                 "format": fmt,
@@ -1021,25 +1494,24 @@ class TranslationPipeline:
             version=__version__,
         )
 
-        # ---- terminology candidates (heuristic, local) + user glossary ----
+        # ---- terminology candidates (heuristic, local) + the pair's core terms ----
         # Read once: the same text feeds the extractor, the budget and the plan.
         doc_text = doc.plain_text()
         with ui.step("glossary"):
             # A 1000-page book deserves more than a memo's 40 terms; the budget
             # grows with the document (glossary_budget).
-            heuristic_terms = extract_glossary(doc_text, max_terms=glossary_budget(len(doc_text)))
+            if not heuristic_terms:
+                heuristic_terms = extract_glossary(
+                    doc_text, max_terms=glossary_budget(len(doc_text))
+                )
             # The pair's own core terms first: every chunk prompt then carries
-            # the same target form for them. The user's CSV is applied over it,
-            # so an explicit choice always wins.
-            user_glossary: dict[str, str] = default_glossary(src, tgt)
-            if glossary:
-                user_glossary.update(load_glossary_csv(glossary))
-                if len(user_glossary) > MAX_USER_GLOSSARY_TERMS:
-                    logger.warning(
-                        "Glossary has {} entries; keeping the first {} to bound context",
-                        len(user_glossary),
-                        MAX_USER_GLOSSARY_TERMS,
-                    )
+            # the same target form for them. The document's own candidates come
+            # from the extractor above; there is no per-run override here.
+            core_glossary: dict[str, str] = default_glossary(src, tgt)
+        if cached is None:
+            # Before anything can fail: the next attempt reuses this extraction
+            # instead of paying for it again.
+            ingest_cache.save(sha256, doc, heuristic_terms)
 
         # ---- subsystems ----
         subsystems = self._build_subsystems(ui)
@@ -1064,12 +1536,11 @@ class TranslationPipeline:
         # ---- checkpoints / resume (before planning: a fully resumed run must
         # ---- not pay for a fresh document plan or a new consistency pass) ----
         store = CheckpointStore(checkpoint_dir or "", enabled=checkpoint_dir is not None)
-        # The user's glossary is part of the job, not a detail of the run: a
-        # chunk translated without a term the reader has since added is not the
-        # same deliverable. Hashing it here makes `--resume` re-ask those chunks
-        # instead of replaying them and leaving the new term out.
+        # The glossary is part of the job, not a detail of the run: a chunk
+        # translated against other terms is not the same deliverable. Hashing it
+        # here makes `--resume` re-ask those chunks instead of replaying them.
         glossary_fingerprint = "\n".join(
-            f"{term}\t{target}" for term, target in sorted(user_glossary.items())
+            f"{term}\t{target}" for term, target in sorted(core_glossary.items())
         )
         doc_key = CheckpointStore.doc_key(
             file_path,
@@ -1079,6 +1550,9 @@ class TranslationPipeline:
             chunk_hashes=[c.hash() for c in chunks],
             glossary=glossary_fingerprint,
             skip_llm_verify=app.fast_path_skip_llm_verify,
+            base_url=translator_cfg.base_url,
+            skill_id=result.skill_id,
+            skill_applied=result.skill_applied,
         )
         # The page shows the translation as it arrives, chunk by chunk, out of
         # the chunks' own files on disk. It cannot work out where those live:
@@ -1092,9 +1566,32 @@ class TranslationPipeline:
                 doc_key=doc_key,
                 path=str(store.dir_for(doc_key)),
             )
+        # Provenance for every checkpoint this store writes: which model's words
+        # a chunk carries is part of its record, not of the job's identity.
+        store.model = translator_cfg.model
+        store.base_url = translator_cfg.base_url
+        # Everything the deliverable is, minus the model and endpoint: what the
+        # content bank matches on when a chunk is carried over from another
+        # model. A changed glossary or verification policy is *not* a match.
+        store.content_key = CheckpointStore.content_key(
+            file_path,
+            src=src,
+            tgt=tgt,
+            chunk_hashes=[c.hash() for c in chunks],
+            glossary=glossary_fingerprint,
+            skip_llm_verify=app.fast_path_skip_llm_verify,
+            skill_id=result.skill_id,
+            skill_applied=result.skill_applied,
+        )
         if store.usable and not resume:
             store.clear(doc_key)
         previous_meta = store.load_meta(doc_key) if resume else {}
+        previous_stats = store.load_stats(doc_key) if resume else {}
+        # Hand the prior counters and the checkpoint location to the run-end
+        # recorder: it writes the merged totals after this attempt finishes.
+        result.previous_stats = previous_stats
+        result.checkpoint_store = store if store.usable else None
+        result.doc_key = doc_key
         chunk_states: list[Any] = [None] * len(chunks)
         if resume and store.usable:
             for i, chunk in enumerate(chunks):
@@ -1110,6 +1607,30 @@ class TranslationPipeline:
                         continue
                     chunk_states[i] = self._from_checkpoint(chunk, checkpoint)
                     ui.advance()
+        reused_foreign = 0
+        if resume and store.usable and reuse_foreign:
+            for i, chunk in enumerate(chunks):
+                if chunk_states[i] is not None:
+                    continue
+                donor = store.bank_get(chunk.hash())
+                if donor is None or donor.source_doc_key == doc_key:
+                    continue
+                # Another model or endpoint translated this exact text. Reusing
+                # it is what pressing "Tiếp tục" is for; the chunk keeps its own
+                # provenance so the report says whose words these are, and it is
+                # adopted into this job's checkpoints so the completion verdict
+                # (and a later PDF rebuild) sees it as finished.
+                chunk_states[i] = self._from_checkpoint(chunk, donor)
+                chunk_states[i]["from_other_model"] = True
+                store.put(doc_key, donor, bank=False)
+                ui.advance()
+                reused_foreign += 1
+                logger.info(
+                    "chunk={} reused from the content bank (model {}); not asked again",
+                    chunk.id,
+                    donor.model or "unknown",
+                )
+        result.reused_foreign = reused_foreign
         pending = [c for i, c in enumerate(chunks) if chunk_states[i] is None]
         resumed_all = not pending
         result.resumed_chunks = len(chunks) - len(pending)
@@ -1125,10 +1646,24 @@ class TranslationPipeline:
             type="resume",
             resume_requested=bool(resume),
             resumed_chunks=result.resumed_chunks,
+            reused_foreign=result.reused_foreign,
             checkpoint_usable=bool(store.usable),
         )
 
-        if resumed_all:
+        cached_plan = (
+            _load_cached_plan(previous_meta, chunks, src, tgt, glossary_fingerprint)
+            if resume
+            else None
+        )
+        if cached_plan is not None:
+            # The same translation job keeps the plan its first attempt made:
+            # the remaining chunks must see the same glossary and section notes,
+            # and a resumed run should not pay for the Planner again.
+            plan = cached_plan
+            result.plan_reused = True
+            logger.info("Resume reused the saved document plan; skipping planning")
+            self.sink.record(type="plan", reused=True, planner_calls=0)
+        elif resumed_all:
             # Everything was already translated and consistency-patched; the
             # plan only needs to survive into the report.
             logger.info(
@@ -1141,24 +1676,26 @@ class TranslationPipeline:
                 glossary_md="(none)",
                 section_count=0,
             )
+            self.sink.record(type="plan", reused=False, planner_calls=0)
         else:
             # ---- document plan (ONE Planner request on the unified path) ----
             plan = self._plan(
                 ctx=ctx,
                 chunks=chunks,
                 heuristic_terms=heuristic_terms,
-                user_glossary=user_glossary,
+                core_glossary=core_glossary,
                 src=src,
                 tgt=tgt,
                 doc_text=doc_text,
                 doc_title=doc.metadata.get("filename", "Document"),
             )
+            self.sink.record(type="plan", reused=False, planner_calls=planner.calls)
         result.planner_calls = planner.calls
         result.document_complexity = round(plan.complexity, 3)
 
         glossary_md = plan.glossary_md or "(none)"
         # What the prompts actually carry, not the Planner's own list: the
-        # heuristic terms (and every user CSV entry) reach the translator too,
+        # heuristic terms (and the pair's core terms) reach the translator too,
         # so a fallback plan used to report "0 terminology" while sending 65.
         result.glossary_terms = _glossary_entry_count(glossary_md)
         # ---- the skill read before the run's first record: carried into every
@@ -1172,7 +1709,7 @@ class TranslationPipeline:
             "glossary_md": glossary_md,
             "glossary_pairs": {
                 **{p.term: p.translation for p in plan.glossary_pairs},
-                **user_glossary,
+                **core_glossary,
             },
             "skill": skill,
         }
@@ -1188,6 +1725,27 @@ class TranslationPipeline:
                     "strategy": plan.strategy,
                     "summary": plan.summary,
                     "planner_used_llm": plan.used_llm,
+                    # Never replace a real cached plan with the report-only stub
+                    # used by an old fully-resumed checkpoint.
+                    **(
+                        {}
+                        if resumed_all and cached_plan is None
+                        else {
+                            "plan": {
+                                "schema": PLAN_CACHE_SCHEMA,
+                                "plan_hash": plan_hash(chunks),
+                                "src": src,
+                                "tgt": tgt,
+                                "glossary": glossary_fingerprint,
+                                # Also part of ``doc_key``; kept here so a
+                                # reader of meta.json can see which skill
+                                # shaped the cached plan.
+                                "skill_id": result.skill_id,
+                                "skill_applied": result.skill_applied,
+                                "data": plan_to_dict(plan),
+                            }
+                        }
+                    ),
                 },
             )
 
@@ -1216,14 +1774,69 @@ class TranslationPipeline:
         }
 
         rejected: set[str] = set()
+        # ``on_chunk_done`` runs on every worker thread. Guard the shared maps,
+        # and write partial snapshots in generation order so a slow older write
+        # cannot overwrite a newer one.
+        progress_lock = threading.Lock()
+        partial_lock = threading.Lock()
+        partial_generation = 0
+        last_partial_generation = 0
 
         def on_chunk_done(chunk: Any, state: dict[str, Any]) -> None:
-            completed[chunk.id] = state.get("translated", "")
-            if state.get("quality_rejected"):
-                rejected.add(chunk.id)
+            nonlocal partial_generation, last_partial_generation
+            with progress_lock:
+                completed[chunk.id] = state.get("translated", "")
+                if state.get("quality_rejected"):
+                    rejected.add(chunk.id)
+                else:
+                    # A later completion pass may have verified the chunk; the
+                    # rejection was this chunk's earlier attempt, not its result.
+                    rejected.discard(chunk.id)
+                partial_generation += 1
+                generation = partial_generation
+                snapshot = dict(completed)
             if not app.partial_output or not want_md:
                 return
-            write_atomic(out_path, assemble_partial(chunks, completed, code_map))
+            with partial_lock:
+                if generation < last_partial_generation:
+                    return
+                try:
+                    write_atomic(out_path, assemble_partial(chunks, snapshot, code_map))
+                except OSError as exc:
+                    # A live preview is a convenience; failing to write it must
+                    # not abort a run whose final assembly can still succeed.
+                    logger.warning("partial output write skipped: {}", exc)
+                    self.sink.info(
+                        step="partial_output",
+                        message=f"could not write partial output: {exc}",
+                    )
+                    return
+                last_partial_generation = generation
+
+        # ---- preflight ----
+        # A wrong key, a model that does not exist, an endpoint that is down:
+        # each used to surface at the chunk that happened to hit it, after the
+        # plan and dozens of translations were paid for (chunk-073 discovered a
+        # bad model name). Three short calls buy that answer before the run
+        # spends anything real.
+        if pending and app.preflight:
+            from polyglot_lc.pipeline.preflight import run_preflight
+
+            with ui.step("preflight") as _:
+                check = run_preflight(self.agent_configs)
+            self.sink.record(
+                type="step",
+                step="preflight",
+                status="ok" if check.ok else "fail",
+                error=check.summary(),
+                checks=check.as_dicts(),
+            )
+            if not check.ok:
+                result.chunks_failed = len(chunks)
+                result.fatal_error = check.summary()
+                ui.add_error(check.summary())
+                logger.error("Preflight failed; no chunk was translated | {}", check.summary())
+                return result
 
         t0 = time.monotonic()
         try:
@@ -1245,11 +1858,27 @@ class TranslationPipeline:
                         chunk_states[i] = next(iterator)
         finally:
             result.elapsed_s = round(time.monotonic() - t0, 1)
+            # A chunk whose request failed permanently is a hole in the
+            # document, not a broken run: it is counted as incomplete below, so
+            # the file still ships (exit 2) and ``--resume`` fills exactly that
+            # gap. Counting it here made one bad chunk end a whole run with 1.
+            permanent = {
+                str(getattr(state.get("chunk"), "id", ""))
+                for state in chunk_states
+                if state is not None and state.get("permanent_failure")
+            }
+            result.chunks_permanently_failed = len(permanent)
             result.chunks_failed = sum(
-                1 for chunk in chunks if not (completed.get(chunk.id) or "").strip()
+                1
+                for chunk in chunks
+                if not (completed.get(chunk.id) or "").strip() and chunk.id not in permanent
             )
             result.chunks_rejected = len(rejected)
-            result.verify_skipped = ctx.verify_skips
+            # Unique chunks, not attempts: a verification retry is the same
+            # chunk asking twice, and counting both would overstate the gap.
+            result.verify_skipped = sum(
+                1 for st in chunk_states if st is not None and st.get("verify_unavailable")
+            )
             result.fast_path_rejections = ctx.fast_path_rejections
             result.fast_path_top_reason = (
                 ctx.fast_path_reasons.most_common(1)[0][0] if ctx.fast_path_reasons else ""
@@ -1272,7 +1901,7 @@ class TranslationPipeline:
 
         # ---- cross-chunk consistency (bounded, targeted patches) ----
         pairs: dict[str, str] = {p.term: p.translation for p in plan.glossary_pairs}
-        pairs.update(user_glossary)  # the user's CSV always wins
+        pairs.update(core_glossary)  # the pair's core terms always win
         # Not gated on a glossary: the pass also votes on labels and repeated
         # paragraph openings, which need no planned target form.
         if pending and app.consistency_check and chunks:
@@ -1321,12 +1950,27 @@ class TranslationPipeline:
                 if store.usable:
                     store.put(doc_key, self._to_checkpoint(chunk, state))
 
-        final: dict[str, Any] = {
-            "translated": translated,
-            "traces": [st.get("trace", {}) for st in chunk_states],
+        # ---- completion verdict ----
+        # Every planned chunk must have its own verified checkpoint. This is
+        # the gate the reader sees: a run with a draft for everything but a
+        # verifier outage on part of it is incomplete, not done.
+        result.expected_chunks = len(chunks)
+        result.incomplete_chunks = self._incomplete_chunks(chunks, by_id, store, doc_key)
+        result.verified_chunks = max(0, len(chunks) - len(result.incomplete_chunks))
+        result.checkpointed_chunks = (
+            len(chunks) - len(store.missing(doc_key, chunks)) if store is not None and store.usable else 0
+        )
+        result.completion = {
+            "expected": result.expected_chunks,
+            "verified": result.verified_chunks,
+            "checkpointed": result.checkpointed_chunks,
+            "reused_from_other_model": result.reused_foreign,
+            "incomplete": result.incomplete_chunks,
         }
 
         # ---- assemble output (Markdown and/or the rebuilt PDF) ----
+        pdf_ok = True
+        pdf_error = ""
         with ui.step("assemble_output"):
             if want_md:
                 write_atomic(out_path, assemble(chunks, translated, code_map))
@@ -1339,33 +1983,57 @@ class TranslationPipeline:
                         pdf_path,
                         font_path=app.pdf_font_path or None,
                     )
-                    result.pdf_path = str(pdf_path)
-                    result.pdf_blocks = stats.placed
-                    result.pdf_kept = stats.kept
+                    pdf_ok = pdf_path.is_file()
+                    if pdf_ok:
+                        result.pdf_path = str(pdf_path)
+                        result.pdf_blocks = stats.placed
+                        result.pdf_kept = stats.kept
+                    else:
+                        pdf_error = "rebuild produced no PDF file"
                     result.pdf_failures = list(stats.failures)
                     for failure in stats.failures[:5]:
                         ui.add_error(f"pdf rebuild: {failure}")
-                except Exception as exc:  # noqa: BLE001 - a failed rebuild must
+                except Exception as exc:
                     # not discard a finished translation; the Markdown still is.
-                    ui.add_error(f"PDF rebuild failed: {type(exc).__name__}: {exc}")
+                    pdf_ok = False
+                    pdf_error = f"{type(exc).__name__}: {exc}"
+                    ui.add_error(f"PDF rebuild failed: {pdf_error}")
                     logger.warning("PDF rebuild failed: {}", exc)
+            if want_pdf and not want_md and not pdf_ok:
+                # PDF was the only deliverable. Reporting the run as complete
+                # with no file (or a stale one) would be a lie.
+                result.fatal_error = f"PDF rebuild failed: {pdf_error or 'no output file'}"
+                result.output_path = ""
 
         # ---- skillopt update (best-effort; never fails the translation) ----
-        # Skipped on a pure resume: nothing new was translated to learn from.
-        # Computed once: the SkillOpt update and the report ask the same
-        # question of the same traces, and reading them twice was pure work.
-        scores = _collect_scores(final)
+        # A chunk with no trace score is not a zero: it was not measured, and
+        # averaging it in would drag every mean down as a provider fails. Use
+        # the scores actually observed, keyed by chunk, for both the report and
+        # the optimizer. Resumed chunks are not this run's evidence; only the
+        # chunks translated now are observed.
+        scores = _collect_scores(chunks, by_id)
         if scores:
-            result.skill_mean = sum(scores) / len(scores)
+            result.skill_mean = sum(scores.values()) / len(scores)
             result.skill_samples = len(scores)
+        # The SkillOpt gate reads the retry counters; capture them before the
+        # update so ``retranslate_rate`` is this run's, not the zero default
+        # that ``run()`` only fills in after ``_run_inner`` returns.
+        current_stats = RetryStats.snapshot()
+        result.chunk_retries = current_stats["chunk_retries"]
+        result.retries = (
+            current_stats["rate_limit_retries"]
+            + current_stats["transient_retries"]
+            + current_stats["chunk_retries"]
+        )
         try:
             # SKILL_APPLY=off is the control arm: no skill went into the prompt,
             # so nothing here can be attributed to one. The run still reports
             # its own mean, which is what a with-skill run is compared against.
             if pending and app.skill_apply:
                 with ui.step("skillopt_update"):
-                    for chunk, score in zip(chunks, scores, strict=False):
-                        if not translated.get(chunk.id):
+                    for chunk in pending:
+                        score = scores.get(chunk.id)
+                        if score is None or not translated.get(chunk.id):
                             continue
                         skill_opt.observe(
                             src,
@@ -1384,13 +2052,32 @@ class TranslationPipeline:
                         applied=skill,
                     )
                     result.skill_promoted = promoted is not None
-        except Exception as exc:  # noqa: BLE001 - optimization is best-effort
+            elif pending and scores:
+                # The control arm still leaves a row: otherwise its runs are
+                # invisible in history and a with-skill mean has nothing to be
+                # compared against.
+                skill_store.record_run(
+                    run_id=getattr(self.sink, "run_id", ""),
+                    doc=source_path.name,
+                    pair=f"{src}-{tgt}",
+                    used_skill_id="",
+                    used_version=0,
+                    scores=list(scores.values()),
+                    verify_fail_rate=(result.verify_skipped / len(chunks)) if chunks else 0.0,
+                    retranslate_rate=(result.chunk_retries / len(chunks)) if chunks else 0.0,
+                    promoted=False,
+                    reason="SKILL_APPLY=off",
+                )
+        except Exception as exc:
             logger.warning("SkillOpt update skipped: {}", exc)
 
         # ---- report ----
         paths = [str(st.get("path", "standard")) for st in chunk_states]
-        result.output_path = str(out_path if want_md else pdf_path)
-        result.avg_critic = (sum(scores) / len(scores)) if scores else 0.0
+        result.output_path = (
+            str(out_path) if want_md else (str(pdf_path) if pdf_path.is_file() else "")
+        )
+        result.skill_scores = dict(scores)
+        result.avg_critic = (sum(scores.values()) / len(scores)) if scores else 0.0
         result.traces_stored = sum(1 for st in chunk_states if st.get("stored"))
         result.fast_path_chunks = paths.count("fast")
         result.standard_path_chunks = paths.count("standard")
@@ -1417,17 +2104,122 @@ def _merge_few_shot(skill_few_shot: list[str], plan_few_shot: list[str]) -> list
 def _glossary_entry_count(glossary_md: str) -> int:
     """How many terms the glossary block handed to the prompts actually has.
 
-    One bullet per term, whatever produced it — the user's CSV, the Planner or
-    the heuristics. Counting the Planner's pairs instead reported zero on a
+    One bullet per term, whatever produced it — the pair's core terms, the
+    Planner or the heuristics. Counting the Planner's pairs instead reported zero on a
     fallback plan that still sent dozens of heuristic terms to every request.
     """
     return sum(1 for line in glossary_md.splitlines() if line.lstrip().startswith("- "))
 
 
-def _collect_scores(final: dict[str, Any]) -> list[float]:
-    """Extract per-chunk quality scores recorded in traces (0-10 scale)."""
-    scores: list[float] = []
-    for trace in final.get("traces", []):
-        s = trace.get("score", 0.0)
-        scores.append(float(s) * 10.0)
+def _load_cached_plan(
+    meta: dict[str, Any],
+    chunks: list[Any],
+    src: str,
+    tgt: str,
+    glossary_fingerprint: str,
+) -> DocumentPlan | None:
+    """The saved plan for this exact job, or ``None`` when it cannot be used.
+
+    ``doc_key`` already partitions checkpoints by file, chunk hashes, model,
+    endpoint, glossary and skill; the extra checks catch a truncated or
+    hand-edited ``meta.json`` and an old cache written before this schema.
+    """
+    cached = meta.get("plan")
+    if not isinstance(cached, dict):
+        return None
+    try:
+        schema = int(cached.get("schema", 0) or 0)
+    except (TypeError, ValueError):
+        return None
+    if schema != PLAN_CACHE_SCHEMA:
+        return None
+    if cached.get("plan_hash") != plan_hash(chunks):
+        return None
+    if str(cached.get("src", "")) != src or str(cached.get("tgt", "")) != tgt:
+        return None
+    if str(cached.get("glossary", "")) != glossary_fingerprint:
+        return None
+    return plan_from_dict(cached.get("data"))
+
+
+def _merge_cumulative(
+    previous: dict[str, Any],
+    result: PipelineResult,
+    usage: dict[str, int],
+    stats: dict[str, int],
+    duration_ms: int,
+) -> dict[str, Any]:
+    """Add one attempt's counters to the translation's running tally.
+
+    Token and retry counters are additive; chunk state is a snapshot of the
+    whole document and must not be summed; scores are keyed by chunk so a chunk
+    translated again replaces its old score instead of inflating the mean.
+    """
+    prev = previous if isinstance(previous, dict) else {}
+    previous_tokens = prev.get("tokens") if isinstance(prev.get("tokens"), dict) else {}
+    scores: dict[str, float] = {}
+    raw_scores = prev.get("skill_scores")
+    if isinstance(raw_scores, dict):
+        for chunk_id, value in raw_scores.items():
+            try:
+                scores[str(chunk_id)] = float(value)
+            except (TypeError, ValueError):
+                continue
+    scores.update(result.skill_scores)
+    mean = (sum(scores.values()) / len(scores)) if scores else 0.0
+
+    def add(name: str, current: int) -> int:
+        try:
+            return int(prev.get(name, 0) or 0) + int(current or 0)
+        except (TypeError, ValueError):
+            return int(current or 0)
+
+    return {
+        "attempts": add("attempts", 1),
+        "tokens": {
+            "sent": int(previous_tokens.get("sent", 0) or 0) + int(usage.get("sent", 0) or 0),
+            "received": int(previous_tokens.get("received", 0) or 0)
+            + int(usage.get("received", 0) or 0),
+            "cached": int(previous_tokens.get("cached", 0) or 0)
+            + int(usage.get("cached", 0) or 0),
+        },
+        "calls": add("calls", usage.get("calls", 0)),
+        "cache_hits": add("cache_hits", usage.get("cache_hits", 0)),
+        "cache_misses": add("cache_misses", usage.get("cache_misses", 0)),
+        "retries": add("retries", result.retries),
+        "chunk_retries": add("chunk_retries", result.chunk_retries),
+        "fallbacks": add("fallbacks", stats.get("fallbacks", 0)),
+        "duration_ms": add("duration_ms", duration_ms),
+        "planner_calls": add("planner_calls", result.planner_calls),
+        "chunks_done": max(
+            0, result.chunks - result.chunks_failed - result.chunks_permanently_failed
+        ),
+        "chunks_rejected": result.chunks_rejected,
+        "verify_skipped": result.verify_skipped,
+        "skill": {"mean": round(mean, 3), "samples": len(scores)},
+        "skill_scores": scores,
+    }
+
+
+def _collect_scores(
+    chunks: list[Any], by_id: dict[str, dict[str, Any]]
+) -> dict[str, float]:
+    """Map each measured chunk id to its trace score (0-10 scale).
+
+    A missing score means "not measured", not zero: including it turned a
+    provider failure into a bad translation and quietly biased every mean.
+    """
+    scores: dict[str, float] = {}
+    for chunk in chunks:
+        state = by_id.get(chunk.id)
+        trace = (state or {}).get("trace") or {}
+        if "score" not in trace:
+            continue
+        try:
+            value = float(trace["score"])
+        except (TypeError, ValueError):
+            continue
+        if value != value:  # NaN
+            continue
+        scores[chunk.id] = value * 10.0
     return scores

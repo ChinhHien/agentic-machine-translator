@@ -19,7 +19,7 @@ from rich.console import Console
 
 from polyglot_lc import __version__
 from polyglot_lc.config import get_app_config
-from polyglot_lc.llm.client import TokenUsage
+from polyglot_lc.llm.client import TokenUsage, provider_gate_stats
 from polyglot_lc.llm.resilience import RetryStats
 from polyglot_lc.skillopt.skill_store import SKILL_SCHEMA, SkillStore
 
@@ -49,10 +49,10 @@ def _console_safe(text: str, encoding: str | None = None) -> str:
     return text
 
 
-def _skill_summary(result: object, src: str, tgt: str) -> str:
+def _skill_summary(result: object) -> str:
     """The skill the run used, what it measured, and whether it was replaced."""
     if not getattr(result, "skill_applied", False):
-        return f"{src}-{tgt}: không dùng skill (SKILL_APPLY=off hoặc chưa có skill)"
+        return "không dùng skill (SKILL_APPLY=off hoặc chưa có skill)"
     mean = (
         f"đo {result.skill_mean:.2f}/10 ({result.skill_samples} chunk)"
         if getattr(result, "skill_samples", 0)
@@ -60,7 +60,7 @@ def _skill_summary(result: object, src: str, tgt: str) -> str:
     )
     promoted = "có" if getattr(result, "skill_promoted", False) else "không"
     return (
-        f"{src}-{tgt} v{result.skill_version} ({result.skill_id}) · {mean}"
+        f"v{result.skill_version} ({result.skill_id}) · {mean}"
         f" · promote: {promoted}"
     )
 
@@ -124,11 +124,23 @@ def _token_report() -> str:
     misses = usage.get("cache_misses", 0)
     unknown = usage.get("cache_unknown", 0)
     if hits or misses:
+        reported = hits + misses
         lines.append("")
         lines.append("Cache (per request):")
         lines.append(f"  hits:    {hits:,}")
         lines.append(f"  misses:  {misses:,}")
         lines.append(f"  unknown: {unknown:,}")
+        lines.append(f"  hit rate: {100 * hits // reported}% of {reported:,} reported request(s)")
+        by_agent = TokenUsage.snapshot_by_agent()
+        per_agent = [
+            f"{name} {b['cache_hits']}/{b['cache_hits'] + b['cache_misses']}"
+            for name, b in by_agent.items()
+            if b.get("cache_hits") or b.get("cache_misses")
+        ]
+        if len(per_agent) > 1:
+            # Which agent's stable prefix the provider is actually caching: a
+            # Translator at 0% has a prefix that changes every chunk.
+            lines.append("  by agent (hits/reported): " + ", ".join(per_agent))
 
     by_model = TokenUsage.snapshot_by_model()
     if len(by_model) > 1:
@@ -142,6 +154,19 @@ def _token_report() -> str:
             )
             lines.append(f"  {key}")
             lines.append(f"    {detail}")
+
+    moving = {key: s for key, s in provider_gate_stats().items() if s["adaptive"] or s["throttles"]}
+    if moving:
+        # Only worth a line when the queue actually moved (or was pushed back):
+        # a static limit is just LLM_PROVIDER_CONCURRENCY, which the caller set.
+        lines.append("")
+        lines.append("Provider slots (concurrency):")
+        for key, s in moving.items():
+            extra = f", {s['throttles']} throttle backoff(s)" if s["throttles"] else ""
+            lines.append(
+                f"  {key}: {s['start']} -> {s['limit']} of {s['ceiling']} "
+                f"(peak {s['peak']} in flight{extra})"
+            )
     return "\n".join(lines)
 
 
@@ -158,20 +183,6 @@ def translate(
             help="Input PDF document.",
         ),
     ],
-    src: Annotated[
-        str, typer.Option("--src", "-s", help="Source language ('auto' = langdetect).")
-    ] = "auto",
-    tgt: Annotated[str, typer.Option("--tgt", "-t", help="Target language code.")] = "vi",
-    glossary: Annotated[
-        Path | None,
-        typer.Option(
-            "--glossary",
-            "-g",
-            exists=True,
-            dir_okay=False,
-            help="CSV glossary (src,tgt per row).",
-        ),
-    ] = None,
     out: Annotated[
         Path | None,
         typer.Option(
@@ -189,10 +200,6 @@ def translate(
             "translation) or both (env: OUTPUT_FORMAT).",
         ),
     ] = None,
-    max_tokens: Annotated[
-        int | None,
-        typer.Option("--max-tokens", "-m", min=64, help="Chunk token budget."),
-    ] = None,
     quiet: Annotated[
         bool,
         typer.Option("--quiet", "-q", help="Only print the final report (no step lines)."),
@@ -205,6 +212,15 @@ def translate(
             "(default: RESUME env var, off).",
         ),
     ] = None,
+    reuse_foreign: Annotated[
+        bool,
+        typer.Option(
+            "--reuse-foreign/--no-reuse-foreign",
+            help="On --resume, reuse a verified translation of the same chunk text "
+            "even when it was made by another model or endpoint (default: on). "
+            "Pass --no-reuse-foreign to translate every chunk again.",
+        ),
+    ] = True,
     checkpoint_dir: Annotated[
         Path | None,
         typer.Option(
@@ -240,14 +256,13 @@ def translate(
     try:
         result: PipelineResult = pipeline.run(
             file_path=file,
-            src=src,
-            tgt=tgt,
-            glossary=str(glossary) if glossary else None,
+            src="en",
+            tgt="vi",
             out=str(out) if out else None,
-            max_tokens=max_tokens,
             resume=resume,
             checkpoint_dir=str(checkpoint_dir) if checkpoint_dir else None,
             output_format=output_format,
+            reuse_foreign=reuse_foreign,
         )
     except Exception as exc:
         console.print(f"Run failed: {type(exc).__name__}: {exc}", markup=False)
@@ -258,17 +273,17 @@ def translate(
         # The verdict is on the deliverable: a chunk never got its translation,
         # or the run ended on an error.
         outcome = "Failed"
-    elif result.chunks_rejected:
-        # The document is complete; some chunks are kept as best effort and
-        # marked for review. That is a warning, not a missing deliverable.
-        outcome = "Completed with warnings"
+    elif result.incomplete_chunks:
+        # Every chunk may have words, but some never got a verified checkpoint.
+        # Calling that "completed" is the false report this run exists to end.
+        outcome = "Incomplete"
     elif result.errors:
         # Everything asked for was delivered. The provider failures the run
         # waited out are listed below, but the file itself is complete.
         outcome = "Completed with errors"
     else:
         outcome = "Completed"
-    critic_label = "avg critic (est.)" if result.avg_critic_estimate else "avg critic"
+    critic_label = "avg score (est.)" if result.avg_critic_estimate else "avg score"
     console.print("", markup=False)
     console.print(f"{outcome}.", markup=False)
     console.print(
@@ -276,7 +291,39 @@ def translate(
         f"  retries: {result.retries}  traces: {result.traces_stored}",
         markup=False,
     )
-    console.print(f"  skill: {_skill_summary(result, src, tgt)}", markup=False)
+    if result.incomplete_chunks:
+        console.print(
+            f"  completion: {result.verified_chunks}/{result.expected_chunks} chunk có "
+            f"checkpoint đã xác minh; còn {len(result.incomplete_chunks)} chunk chưa xong",
+            markup=False,
+        )
+        for item in result.incomplete_chunks[:20]:
+            console.print(
+                f"    - {item.get('chunk', '')}: {item.get('reason', '')}",
+                markup=False,
+            )
+        if len(result.incomplete_chunks) > 20:
+            console.print(
+                f"    ... và {len(result.incomplete_chunks) - 20} chunk khác (xem log)",
+                markup=False,
+            )
+    cumulative = result.cumulative or {}
+    attempts = int(cumulative.get("attempts", 0) or 0)
+    if attempts > 1:
+        tokens = cumulative.get("tokens") or {}
+        skill = cumulative.get("skill") or {}
+        duration_s = int(cumulative.get("duration_ms", 0) or 0) / 1000.0
+        console.print(
+            f"  total after {attempts} attempts: "
+            f"input {int(tokens.get('sent', 0) or 0):,} / "
+            f"output {int(tokens.get('received', 0) or 0):,} tokens, "
+            f"retries {int(cumulative.get('retries', 0) or 0)}, "
+            f"planner requests {int(cumulative.get('planner_calls', 0) or 0)}, "
+            f"{duration_s:.1f}s, skill {float(skill.get('mean', 0) or 0):.2f}/10 "
+            f"({int(skill.get('samples', 0) or 0)} chunk)",
+            markup=False,
+        )
+    console.print(f"  skill: {_skill_summary(result)}", markup=False)
     console.print(
         f"  routes: fast {result.fast_path_chunks} / standard "
         f"{result.standard_path_chunks} / deep {result.deep_path_chunks}"
@@ -297,6 +344,13 @@ def translate(
             f"  resumed chunks: {result.resumed_chunks}"
             f"  consistency patches: {result.consistency_patches}"
             f"  elapsed: {result.elapsed_s:.1f}s",
+            markup=False,
+        )
+    if result.reused_foreign:
+        # The words are there, but they are another model's: saying so keeps a
+        # mixed document from reading like a single model's work.
+        console.print(
+            f"  reused from another model: {result.reused_foreign} chunk(s)",
             markup=False,
         )
     if result.consistency_patch_budget:
@@ -373,14 +427,21 @@ def translate(
         )
     if result.log_path:
         console.print(f"log file    : {result.log_path}", markup=False)
-    if result.chunks_failed:
+    missing = result.chunks_failed or len(result.incomplete_chunks)
+    if missing:
+        # A permanently failed chunk has no translation but is counted as
+        # incomplete, not as a failed run, so the count comes from the verdict.
         console.print(
-            f"incomplete: {result.chunks_failed}/{result.chunks} chunk(s) missing; "
+            f"incomplete: {missing}/{result.chunks} chunk(s) missing; "
             "use --resume to retry only unfinished chunks",
             markup=False,
         )
     if result.chunks_failed or result.fatal_error:
         raise typer.Exit(code=1)
+    if result.incomplete_chunks:
+        # 2, not 1: the file exists, but this is not a finished translation.
+        # A supervisor can tell "crashed" from "needs another pass" by this.
+        raise typer.Exit(code=2)
 
 
 @app.command()
@@ -444,25 +505,13 @@ def skills(
         bool,
         typer.Option("--validate", help="Kiểm tra schema và nội dung skill.md rồi thoát."),
     ] = False,
-    restore: Annotated[
-        int | None,
-        typer.Option("--restore", min=1, help="Khôi phục phiên bản v<N> đã lưu."),
-    ] = None,
 ) -> None:
-    """Skill duy nhất của hệ thống: nội dung, lần đo, lịch sử, khôi phục.
+    """Skill duy nhất của hệ thống: nội dung, lần đo và lịch sử.
 
     Không có skill nào thì nói vậy, không phải lỗi: SkillOpt chỉ ghi khi một
     lượt dịch đã chạy đủ mẫu và vượt baseline.
     """
     store = SkillStore(get_app_config().skills_dir)
-    if restore is not None:
-        try:
-            path = store.restore(restore)
-        except (FileNotFoundError, ValueError) as exc:
-            console.print(f"Không khôi phục được: {exc}", markup=False)
-            raise typer.Exit(code=1) from exc
-        console.print(f"Đã khôi phục v{restore} -> {path}", markup=False)
-        return
     if validate:
         issues = store.validate()
         if not issues:

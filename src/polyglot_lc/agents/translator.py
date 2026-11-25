@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+from typing import Any
 
 from loguru import logger
 
@@ -12,7 +13,7 @@ from polyglot_lc.agents.context import (
     source_context_messages,
     stable_prefix_fingerprint,
 )
-from polyglot_lc.llm.resilience import TruncatedError
+from polyglot_lc.llm.resilience import LLMError, TruncatedError
 from polyglot_lc.memory.tm import TranslationMemory
 
 #: Output budget for the recovery ask after a reply is cut at the provider's
@@ -31,8 +32,31 @@ DEFAULT_TRANSLATOR_OUTPUT_CAP = 16384
 TRANSLATOR_MAX_TOKENS_CEILING = 32768
 
 
-def _translator_output_cap() -> int:
-    """The configured recovery budget, for an endpoint with a different ceiling."""
+#: Recovery budgets this process asked for and got a timeout instead of a
+#: reply, per (provider, model). A proxy that could not produce 32768 tokens
+#: inside its deadline will not produce them on the next ask either, and each
+#: one costs a full deadline (plus the resilience ladder around it). Dropping
+#: the ceiling to half of the smallest timed-out budget turns the next cut into
+#: the chunk layer's split path instead of another wait on the same question.
+_TIMED_OUT_BUDGETS: dict[tuple[str, str], int] = {}
+
+
+def _looks_like_timeout(err: LLMError) -> bool:
+    """True when *err* is a deadline, not a refusal the endpoint could change."""
+    text = str(err).lower()
+    return "timed out" in text or "timeout" in text
+
+
+def _note_timed_out_budget(provider: str, model: str, budget: int) -> None:
+    """Remember that *budget* was too large to answer in time on this endpoint."""
+    key = (provider, model)
+    previous = _TIMED_OUT_BUDGETS.get(key)
+    if previous is None or budget < previous:
+        _TIMED_OUT_BUDGETS[key] = budget
+
+
+def _configured_output_cap() -> int:
+    """The recovery budget the reader configured, or this project's default."""
     raw = os.getenv("TRANSLATOR_MAX_TOKENS", "").strip()
     if not raw:
         return DEFAULT_TRANSLATOR_OUTPUT_CAP
@@ -48,14 +72,55 @@ def _translator_output_cap() -> int:
     return value if value > 0 else DEFAULT_TRANSLATOR_OUTPUT_CAP
 
 
-def _recovery_cap(cap: int, cut_at: int | None) -> int:
+def _translator_output_cap(provider: str = "", model: str = "") -> int:
+    """The recovery budget the reader configured for this agent."""
+    return _configured_output_cap()
+
+
+def _recovery_ceiling(provider: str, model: str) -> int:
+    """The largest budget a recovery ask may use.
+
+    A budget this endpoint already timed out is not asked again: the ceiling
+    drops to half of it, so the next cut raises ``TruncatedError`` at the
+    ceiling and the chunk layer splits the question instead.
+    """
+    timed_out = _TIMED_OUT_BUDGETS.get((provider, model))
+    if timed_out is None:
+        return TRANSLATOR_MAX_TOKENS_CEILING
+    return min(TRANSLATOR_MAX_TOKENS_CEILING, max(1024, timed_out // 2))
+
+
+def _recovery_cap(
+    cap: int, cut_at: int | None, ceiling: int = TRANSLATOR_MAX_TOKENS_CEILING
+) -> int:
     """The budget a recovery ask uses, given the budget that was just cut.
 
     At least twice what the provider consumed before stopping: asking for less
     than that cannot produce a longer reply, so a tuned cap below the observed
     cut yields to the evidence. Never above the ceiling.
     """
-    return min(max(cap, (cut_at or 0) * 2), TRANSLATOR_MAX_TOKENS_CEILING)
+    return min(max(cap, (cut_at or 0) * 2), ceiling)
+
+
+def _reasoning_kwargs() -> dict[str, Any]:
+    """Provider hint that keeps the output budget for the translation.
+
+    ``TRANSLATOR_REASONING=off`` sends the hint reasoning gateways understand
+    (``thinking.type = disabled``). On the run that hung, the Translator spent
+    a median of ~6100 thinking tokens per chunk to produce ~2600 of
+    translation, and the thinking share was what pushed replies past the
+    endpoint's limit and into timeouts. Support is the gateway's business: one
+    that ignores the hint keeps reasoning, which costs nothing here; one that
+    rejects the field fails loudly instead of silently truncating. The default,
+    ``auto``, sends nothing at all.
+    """
+    # Spelled out rather than read through the constant: the env-guide test finds
+    # variables by the literal name at the getenv call, and a name that only
+    # exists as a constant would look unread to it.
+    raw = os.getenv("TRANSLATOR_REASONING", "").strip().lower()
+    if raw in {"off", "none", "disabled", "disable"}:
+        return {"extra_body": {"thinking": {"type": "disabled"}}}
+    return {}
 
 
 class TranslatorAgent(Agent):
@@ -164,9 +229,16 @@ class TranslatorAgent(Agent):
         # sentence from a legitimately short one, so ``finish_reason`` is the
         # signal acted on.
         try:
-            resp = self.chat(prompt, cache_prefix=True)
+            resp = self.chat(prompt, cache_prefix=True, **_reasoning_kwargs())
         except TruncatedError as err:
-            cap = _recovery_cap(_translator_output_cap(), err.completion_tokens)
+            # The endpoint that SERVED the cut is the one that must learn from
+            # it: a fallback answers under its own name and its own limits.
+            provider = err.provider or self.config.base_url
+            model = err.model or self.config.model
+            ceiling = _recovery_ceiling(provider, model)
+            cap = _recovery_cap(
+                _translator_output_cap(provider, model), err.completion_tokens, ceiling
+            )
             logger.warning(
                 "chunk={} reply was cut at {} completion tokens (thinking={} answer={}); "
                 "re-asking with a budget of {}",
@@ -177,9 +249,11 @@ class TranslatorAgent(Agent):
                 cap,
             )
             try:
-                resp = self.chat(prompt, cache_prefix=True, max_tokens=cap)
+                resp = self.chat(
+                    prompt, cache_prefix=True, max_tokens=cap, **_reasoning_kwargs()
+                )
             except TruncatedError as again:
-                raised = _recovery_cap(cap, again.completion_tokens)
+                raised = _recovery_cap(cap, again.completion_tokens, ceiling)
                 if raised <= cap:
                     # At the ceiling: another ask is the same question. The
                     # chunk layer salvages by splitting instead of spinning.
@@ -193,7 +267,20 @@ class TranslatorAgent(Agent):
                     again.answer_tokens,
                     raised,
                 )
-                resp = self.chat(prompt, cache_prefix=True, max_tokens=raised)
+                try:
+                    resp = self.chat(
+                        prompt, cache_prefix=True, max_tokens=raised, **_reasoning_kwargs()
+                    )
+                except LLMError as err:
+                    if _looks_like_timeout(err):
+                        _note_timed_out_budget(provider, model, raised)
+                    raise
+            except LLMError as err:
+                # The recovery ask itself timed out: that budget is beyond what
+                # this endpoint answers in a deadline, so do not ask it again.
+                if _looks_like_timeout(err):
+                    _note_timed_out_budget(provider, model, cap)
+                raise
         out = resp.text.strip()
         # Source text is recovered from the shared context markers.
         source = extract_source(prompt)

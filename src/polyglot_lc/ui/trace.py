@@ -290,10 +290,7 @@ class Trace:
                 f"  sha256: {started.get('sha256', '?')}   plan: {started.get('plan_hash') or '?'}"
                 f"   chunks: {started.get('chunks', '?')}"
             )
-            lines.append(
-                f"  {started.get('src', '?')} -> {started.get('tgt', '?')}"
-                f"  max tokens: {started.get('max_tokens', '?')}"
-            )
+            lines.append(f"  max tokens: {started.get('max_tokens', '?')}")
             for agent in started.get("agents") or []:
                 lines.append(
                     f"  {agent.get('name', '?')}: {agent.get('model', '?')} @ "
@@ -326,14 +323,30 @@ class Trace:
                 f"  chunks: {totals.get('chunks_done', '?')} done / "
                 f"{totals.get('chunks_failed', 0)} failed"
             )
+            cache_hits = int(totals.get("cache_hits") or 0)
+            reported = cache_hits + int(totals.get("cache_misses") or 0)
+            cache_detail = f"  cache hits: {cache_hits}"
+            if reported:
+                cache_detail += f" ({100 * cache_hits // reported}% of {reported} reported)"
             lines.append(
                 f"  tokens: {tokens.get('sent', 0):,} sent / {tokens.get('received', 0):,} received"
                 f" ({tokens.get('cached', 0):,} cached)"
                 f"  requests: {totals.get('calls', '?')}"
-                f"  cache hits: {totals.get('cache_hits', 0)}"
-                f"  retries: {totals.get('retries', 0)}"
+                + cache_detail
+                + f"  retries: {totals.get('retries', 0)}"
                 f"  fallbacks: {totals.get('fallbacks', 0)}"
             )
+            slots = totals.get("provider_slots") or {}
+            for key, state in slots.items():
+                if not (state.get("adaptive") or state.get("throttles")):
+                    continue
+                extra = (
+                    f", {state['throttles']} throttle backoff(s)" if state.get("throttles") else ""
+                )
+                lines.append(
+                    f"  slots [{key}]: {state.get('start')} -> {state.get('limit')}"
+                    f" of {state.get('ceiling')} (peak {state.get('peak')} in flight{extra})"
+                )
             # Drift the pass could not fix is part of the totals too: a run that
             # skipped four chunks and had two patches refused is not a run whose
             # terminology came out consistent.

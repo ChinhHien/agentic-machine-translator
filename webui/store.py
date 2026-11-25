@@ -1,4 +1,4 @@
-"""Stores for the web UI: runs and glossaries.
+"""Stores for the web UI: runs.
 
 Everything here is a plain file reader meant to be called from the server
 process, so nothing in this module imports :mod:`polyglot_lc` (see the package
@@ -9,10 +9,9 @@ The pipeline's endpoints come from `.env` alone: the WebUI never edits them.
 
 from __future__ import annotations
 
-import csv
 import json
 import os
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any
 
@@ -73,9 +72,6 @@ def _read_jsonl(path: Path) -> tuple[list[dict[str, Any]], int]:
 #: Name of the metadata file inside each run directory.
 RECORD_NAME = "run.json"
 
-#: A run's lifecycle: is the child alive, and how did it end?
-RUN_STATUSES = ("running", "done", "failed", "stopped")
-
 
 @dataclass
 class RunRecord:
@@ -104,6 +100,11 @@ class RunRecord:
     #: checkpoints, which are keyed by the model, so it must pin this value
     #: rather than re-read it from `.env`; empty until the first event arrives.
     translator_model: str = ""
+    #: The Translator endpoint that run talked to, read from the same
+    #: `run_start` event. It is part of the checkpoint identity just like the
+    #: model, so a resume pins it too — otherwise a model left pinned on a
+    #: changed URL derives a new key and replays nothing.
+    translator_base_url: str = ""
     #: How many times the supervisor has continued this run by itself after a
     #: temporary provider failure, and when the next such attempt is due (epoch
     #: seconds; 0 means none is pending). Both live on the record rather than in
@@ -141,6 +142,7 @@ class RunRecord:
             command=[str(x) for x in (data.get("command") or [])],
             note=str(data.get("note") or ""),
             translator_model=str(data.get("translator_model") or ""),
+            translator_base_url=str(data.get("translator_base_url") or ""),
             auto_resumes=int(data.get("auto_resumes") or 0),
             retry_at=float(data.get("retry_at") or 0.0),
         )
@@ -216,6 +218,23 @@ class RunsStore:
                 return event
         return {}
 
+    def last_run_start(self, run_id: str) -> dict[str, Any]:
+        """The newest attempt's own ``run_start`` record, or ``{}``.
+
+        The child that writes it is the one that chunks the document, so its
+        ``chunks`` is the authoritative count; ``run.json`` only holds the plan's
+        estimate until this arrives. Reading the newest attempt's file only keeps
+        the same question cheap as the run grows.
+        """
+        path = self.log_path(run_id)
+        if path is None:
+            return {}
+        events, _malformed = _read_jsonl(path)
+        for event in reversed(events):
+            if str(event.get("type") or "") == "run_start":
+                return event
+        return {}
+
     def read_events(self, run_id: str, after: int) -> tuple[list[dict[str, Any]], int, int]:
         """Events from index *after* on, plus ``(next_index, malformed_count)``.
 
@@ -264,59 +283,3 @@ class RunsStore:
 # ---------------------------------------------------------------------------
 # skills: no store — the system skill lives as skills/skill.md and
 # nothing in the server reads them.
-# ---------------------------------------------------------------------------
-# Glossaries
-# ---------------------------------------------------------------------------
-#: Glossaries are plain CSV: one ``src,tgt`` pair per row.
-GLOSSARY_SUFFIX = ".csv"
-
-
-class GlossaryStore:
-    """The CSV glossaries the UI manages, under one directory."""
-
-    def __init__(self, root: Path) -> None:
-        self.root = root
-
-    def path_for(self, name: str) -> Path:
-        """Resolve *name* to a CSV path, refusing anything that escapes *root*.
-
-        Public because a caller must be able to tell "you may not name that"
-        (``ValueError``) from "that glossary does not exist" (a missing file) —
-        a 403 and a 404 are different messages to the user.
-        """
-        filename = name if name.lower().endswith(GLOSSARY_SUFFIX) else f"{name}{GLOSSARY_SUFFIX}"
-        return safe_child(self.root, filename)
-
-    def list_files(self) -> list[dict[str, Any]]:
-        """Each glossary with its row count, ordered by name."""
-        if not self.root.is_dir():
-            return []
-        return [
-            {"name": path.name, "entries": len(self.read(path.name))}
-            for path in sorted(self.root.glob(f"*{GLOSSARY_SUFFIX}"))
-            if path.is_file()
-        ]
-
-    def read(self, name: str) -> list[list[str]]:
-        """Rows of a glossary; empty when the file does not exist.
-
-        Reads with ``utf-8-sig`` so a byte-order mark written by a spreadsheet
-        does not become part of the first term.
-        """
-        path = self.path_for(name)
-        try:
-            with path.open("r", encoding="utf-8-sig", newline="") as handle:
-                return [[cell.strip() for cell in row] for row in csv.reader(handle) if row]
-        except OSError:
-            return []
-
-    def write(self, name: str, pairs: list[list[str]]) -> None:
-        """Replace a glossary with *pairs*, written atomically."""
-        path = self.path_for(name)
-        path.parent.mkdir(parents=True, exist_ok=True)
-        tmp = path.with_name(path.name + ".tmp")
-        with tmp.open("w", encoding="utf-8", newline="") as handle:
-            writer = csv.writer(handle, lineterminator="\n")
-            for row in pairs:
-                writer.writerow([str(cell) for cell in row])
-        os.replace(tmp, path)

@@ -945,6 +945,51 @@ def test_a_family_key_ignores_weight_slant_and_subset_tags():
     assert pdf_output._kind_of("verdana") == "sans"
 
 
+def test_tex_families_keep_their_kind_and_weight():
+    """A LaTeX book is a serif document, and ``cmbx`` is its bold face.
+
+    Read as "sans", every rebuilt page of such a book came out in Arial, and
+    with no word for "bold" in the name, every heading lost its weight too.
+    """
+    assert pdf_output._kind_of(pdf_output._font_key("CMR12")) == "serif"
+    assert pdf_output._kind_of(pdf_output._font_key("CMBX12")) == "serif"
+    assert pdf_output._kind_of(pdf_output._font_key("CMTT10")) == "mono"
+    assert pdf_output._kind_of(pdf_output._font_key("CMSSBX10")) == "sans"
+    assert pdf_output._style_of("CMBX12") == (True, False)
+    assert pdf_output._style_of("CMBXTI10") == (True, True)
+    assert pdf_output._style_of("CMTI10") == (False, True)
+    # The extractor records the same weight the rebuild prints with.
+    from polyglot_lc.ingest.pdf_layout import _font_style
+
+    assert _font_style("CMBX12") == (True, False)
+    assert _font_style("Verdana-Bold") == (True, False)
+
+
+def test_a_cell_that_cannot_be_reprinted_is_left_alone():
+    """Asked before the redaction, so the source text is never turned into a hole."""
+    import pymupdf
+
+    doc = pymupdf.open()
+    page = doc.new_page(width=200, height=200)
+    measurer = pdf_output._Measurer(pymupdf, page)
+    try:
+        item = pdf_output._Placement(
+            page=0,
+            redact=[],
+            box=(10.0, 10.0, 30.0, 12.0),  # twenty points wide, two tall
+            size=10.0,
+            text="Một câu dài không thể vừa ô này",
+            kind="cell",
+            font_file=str(pdf_output.resolve_font()),
+        )
+        assert pdf_output._cell_would_print(item, measurer, pymupdf, page) is False
+        item.text = ""
+        assert pdf_output._cell_would_print(item, measurer, pymupdf, page) is True
+    finally:
+        measurer.close()
+        doc.close()
+
+
 def test_the_source_family_is_used_when_it_is_installed(monkeypatch):
     monkeypatch.setattr(pdf_output, "_covers_vietnamese", lambda path: True)
     monkeypatch.setattr(
@@ -1106,6 +1151,122 @@ def test_a_real_table_page_is_rebuilt_with_its_cells_translated(tmp_path, unicod
             ), f"chữ nằm ngoài ô: {word[4]!r}"
 
 
+def test_a_stray_control_byte_in_a_translation_never_reaches_the_page(tmp_path, unicode_font):
+    """A run saved by an older build still carries the symbol font's byte.
+
+    Ingest now turns it into a bullet or a space, but the translation already in
+    the checkpoint was written before that, so the print path has to drop it: a
+    control character prints as a missing-glyph box on the page.
+    """
+    pymupdf = pytest.importorskip("pymupdf")
+    from pdfdoc import write_pdf
+
+    src = write_pdf(tmp_path / "in.pdf", "Alpha line at the top of the page.\n\nBeta line below it.")
+    doc = load_document(src)
+    texts = {index: "Đoạn \x01\x7f văn bản số " + str(index) for index in range(len(doc.blocks))}
+    out = tmp_path / "out.pdf"
+    stats = rebuild_pdf(src, doc, texts, out, font_path=unicode_font)
+
+    assert stats.failures == []
+    with pymupdf.open(out) as rebuilt:
+        text = rebuilt[0].get_text()
+        assert not any(ord(ch) < 32 and ch != "\n" for ch in text), repr(text)
+        assert "văn bản số" in text
+
+
+def test_a_tail_does_not_cross_a_rotated_page_kept_as_source(tmp_path, unicode_font):
+    """Phần tràn của trang trước không được in sang trang sau của trang xoay.
+
+    A rotated page keeps its source layout, so a paragraph the page before it
+    spilled over must not be printed past it: its words would land after text
+    that comes later in the book. The tail takes the page right after the page
+    it started on, before the rotated page, in that page's own (upright) frame.
+    """
+    from pdfdoc import write_table_pdf
+
+    pymupdf = pytest.importorskip("pymupdf")
+    table = pymupdf.open(
+        write_table_pdf(
+            tmp_path / "table.pdf",
+            [["Feature", "State"], ["Servers", "5"]],
+            col_widths=[240.0, 70.0],
+        )
+    )
+    table[0].set_rotation(90)
+
+    source = pymupdf.open()
+    first = source.new_page(width=595.0, height=842.0)
+    first.insert_text(
+        (72.0, 795.0),
+        "Alpha paragraph line at the very bottom of page one.",
+        fontname="helv",
+        fontsize=10.0,
+    )
+    source.insert_pdf(table, from_page=0, to_page=0)
+    last = source.new_page(width=595.0, height=842.0)
+    last.insert_text((72.0, 200.0), "Third page ordinary paragraph line.", fontname="helv", fontsize=10.0)
+    src = tmp_path / "in.pdf"
+    source.save(str(src))
+    source.close()
+    table.close()
+
+    doc = load_document(src)
+    texts: dict[int, str] = {}
+    for index, block in enumerate(doc.blocks):
+        if block.meta.get("table"):
+            texts[index] = "| Đặc điểm | Trạng thái |\n| --- | --- |\n| Máy chủ | 5 |"
+        elif index == 0:
+            texts[index] = "Đoạn dài " + "chữ " * 700
+        else:
+            texts[index] = "Đoạn ba ngắn."
+
+    out = tmp_path / "out.pdf"
+    stats = rebuild_pdf(src, doc, texts, out, font_path=unicode_font)
+
+    assert stats.failures == []
+    assert stats.continued >= 1, "the long paragraph must overflow"
+    assert stats.rotated_pages == 1
+    with pymupdf.open(out) as rebuilt:
+        # The tail's page sits before the rotated table page, and upright.
+        assert rebuilt.page_count == 4
+        assert [rebuilt[i].rotation for i in range(rebuilt.page_count)] == [0, 0, 90, 0]
+        assert "chữ" in rebuilt[1].get_text()
+        assert "Feature" in rebuilt[2].get_text(), "the rotated table keeps its source"
+        assert "Đoạn ba" in rebuilt[3].get_text()
+
+
+def test_the_last_tail_is_not_printed_in_a_rotated_page_frame(tmp_path, unicode_font):
+    """Trang cuối bị xoay: phần tràn cuối tài liệu vẫn phải nằm ngang.
+
+    The document's last page is rotated and holds no translation, so it never
+    took a tail. A tail still waiting at that point belongs right after the last
+    page a translation was printed on, in that page's frame — printing it after
+    the rotated page turned the prose a quarter and put it after later text.
+    """
+    pymupdf = pytest.importorskip("pymupdf")
+    source = pymupdf.open()
+    first = source.new_page(width=595.0, height=842.0)
+    first.insert_text(
+        (72.0, 700.0), "Alpha line near the bottom of the first page", fontname="helv", fontsize=10.0
+    )
+    second = source.new_page(width=595.0, height=842.0)
+    second.insert_text((72.0, 734.0), "Rotated closing page title", fontname="helv", fontsize=10.0)
+    second.set_rotation(90)
+    src = tmp_path / "in.pdf"
+    source.save(str(src))
+    source.close()
+
+    doc = load_document(src)
+    out = tmp_path / "out.pdf"
+    stats = rebuild_pdf(src, doc, {0: "Đoạn dài " + "chữ " * 700}, out, font_path=unicode_font)
+
+    assert stats.failures == [] and stats.continued >= 1
+    with pymupdf.open(out) as rebuilt:
+        assert [rebuilt[i].rotation for i in range(rebuilt.page_count)] == [0, 0, 90]
+        assert "chữ" in rebuilt[1].get_text()
+        assert "Rotated closing page title" in rebuilt[2].get_text()
+
+
 # ------------------------------- emphasis -----------------------------------
 
 
@@ -1182,6 +1343,20 @@ def test_a_list_block_keeps_one_face_and_its_source_markers():
 
     assert items[0].runs is None
     assert items[0].text == "• A B"
+
+
+def test_a_translated_item_that_kept_its_own_bullet_is_not_bulleted_twice():
+    """Model hay giữ dấu đầu dòng bên trong cặp token (``⟦ITALIC⟧•⟦/ITALIC⟧``).
+
+    ``plain_text`` bỏ token nhưng để lại dấu ở đầu dòng; in thêm dấu của nguồn
+    nữa thì mục đó thành ``• • For each year…``.
+    """
+    source = "- ⟦ITALIC⟧•⟦/ITALIC⟧ A\n- B"
+    doc = _emphasis_doc(source, kind="list")
+    doc.blocks[0].meta["pdf"]["markers"] = ["•", "•"]
+    items, _, _ = placements(doc, {0: source}, match_style=False)
+
+    assert items[0].text == "• A\n• B"
 
 
 def test_tokens_inside_a_cell_are_stripped_before_the_cell_is_split():

@@ -10,7 +10,7 @@ import pytest
 
 from webui.runs import RunManager
 from webui.server import Api
-from webui.store import GlossaryStore, RunsStore
+from webui.store import RunsStore
 
 #: A minimal upload body that looks like a PDF, because that is what the route
 #: insists on now: anything else is refused before it is written.
@@ -31,7 +31,6 @@ def api(tmp_path):
         root=tmp_path,
         manager=RunManager(tmp_path, python="PY"),
         runs=RunsStore(tmp_path / "logs" / "webui"),
-        glossaries=GlossaryStore(tmp_path / "glossaries"),
         port=8787,
     )
 
@@ -326,7 +325,7 @@ def test_runs_endpoints_with_a_stubbed_manager(api, monkeypatch):
         api,
         "POST",
         "/api/runs",
-        body=json.dumps({"file": "doc.pdf", "src": "vi", "tgt": "en"}).encode(),
+        body=json.dumps({"file": "doc.pdf"}).encode(),
     )
     assert r.status == 201
     started = json.loads(r.body)
@@ -372,17 +371,13 @@ def test_post_run_passes_every_run_preference_to_the_manager(api):
         body=json.dumps(
             {
                 "file": "doc.pdf",
-                "src": "en",
-                "tgt": "vi",
-                "glossary": None,
-                "max_tokens": 512,
                 "format": "both",
             }
         ).encode(),
     )
     assert r.status == 201
     assert seen["output_format"] == "both"
-    assert seen["max_tokens"] == 512
+    assert "max_tokens" not in seen and "glossary" not in seen
 
 
 def test_post_run_with_a_failing_probe_is_422(api):
@@ -396,7 +391,7 @@ def test_post_run_with_a_failing_probe_is_422(api):
         api,
         "POST",
         "/api/runs",
-        body=json.dumps({"file": "doc.pdf", "src": "vi", "tgt": "en"}).encode(),
+        body=json.dumps({"file": "doc.pdf"}).encode(),
     )
     assert r.status == 422 and b"probe" in r.body
 
@@ -438,6 +433,57 @@ def test_stopping_a_finished_run_is_a_409(api):
     assert json.loads(call(api, "POST", "/api/runs/r1/stop").body)["status"] == "done"
 
 
+def test_rebuilding_a_run_calls_the_manager_and_answers_that_same_run(api):
+    """"Ghép lại PDF" is the same run, not a new one: the page keeps polling the
+    row it already has, so the answer names its id and the state it reached."""
+    seen: list = []
+    api.manager.rebuild_pdf = lambda rid: seen.append(rid) or record(
+        api.root, rid, status="running"
+    )
+    r = call(api, "POST", "/api/runs/r1/rebuild")
+    assert r.status == 202 and seen == ["r1"]
+    payload = json.loads(r.body)
+    assert payload == {"run_id": "r1", "status": "running"}
+
+
+def test_rebuilding_is_refused_when_the_run_has_not_checkpointed_every_chunk(api):
+    """A resumed child would translate the missing chunks again and spend the
+    provider's credits; ``ghép lại`` must never do that behind the reader's back."""
+    api.runs.write_record(record(api.root, "r1", chunks=2, command=["x"]))
+    with pytest.raises(RuntimeError, match="checkpointed"):
+        api.manager.rebuild_pdf("r1")
+    assert call(api, "POST", "/api/runs/r1/rebuild").status == 409
+
+
+def test_finishing_a_short_run_calls_the_manager_and_answers_that_same_run(api):
+    """"Dịch nốt & ghép PDF" continues the same run, so the page keeps its row."""
+    seen: list = []
+    api.manager.finish = lambda rid: seen.append(rid) or record(
+        api.root, rid, status="running"
+    )
+    r = call(api, "POST", "/api/runs/r1/finish")
+    assert r.status == 202 and seen == ["r1"]
+    assert json.loads(r.body) == {"run_id": "r1", "status": "running"}
+
+
+def test_finishing_refuses_a_run_that_cannot_continue(api):
+    assert call(api, "POST", "/api/runs/nope/finish").status == 404
+
+    def refuse(rid):
+        raise RuntimeError("run r1 is still running")
+
+    api.manager.finish = refuse
+    assert call(api, "POST", "/api/runs/r1/finish").status == 409
+
+
+def test_run_detail_reports_the_chunks_an_old_run_never_finished(api):
+    """Without a completion record the checkpoint count still drives the button."""
+    api.runs.write_record(record(api.root, "r1", chunks=4, command=["x"]))
+    api.manager.unfinished_chunks = lambda rid: 3
+    detail = json.loads(call(api, "GET", "/api/runs/r1").body)
+    assert detail["missing_chunks"] == 3
+
+
 def test_deleting_a_run_calls_the_manager_and_requires_an_origin(api):
     """Deleting is a mutation like any other: guarded by Origin, forwarded to
     the manager, and answered with the id it erased."""
@@ -473,6 +519,7 @@ def test_run_endpoints_say_404_for_an_unknown_run(api):
     ):
         assert call(api, "GET", path).status == 404, path
     assert call(api, "POST", "/api/runs/nope/stop").status == 404
+    assert call(api, "POST", "/api/runs/nope/rebuild").status == 404
 
 
 def test_run_detail_reports_the_translator_model_the_run_used(api, tmp_path):
@@ -1196,7 +1243,6 @@ def repo_api():
         root=root,
         manager=RunManager(root, python="PY"),
         runs=RunsStore(root / "logs" / "webui"),
-        glossaries=GlossaryStore(root / "glossaries"),
         port=8787,
     )
 
@@ -1214,7 +1260,7 @@ def test_index_has_the_elements_the_frontend_binds_to():
         "job-title",
         "job-meta",
         "job-status",
-        "job-actions",
+        "job-tools",
         "job-alert",
         "progress",
         "bar",
@@ -1256,27 +1302,24 @@ def test_index_has_the_elements_the_frontend_binds_to():
         assert f'id="{element_id}"' in html, element_id
 
 
-def test_the_language_choices_name_the_languages_in_full():
-    """A reader picks "Tiếng Việt", not "vi".
+def test_the_language_pair_is_fixed_to_english_and_vietnamese():
+    """The pipeline translates English to Vietnamese only.
 
-    The value stays the code the backend expects; the page is where the name in
-    words lives. Both ends of the run are dropdowns, so the list of accepted
-    codes is the page's own — a typo can no longer be typed in.
+    Both boxes still show the pair, spelled out in full, but they are locked:
+    no other language can be chosen, so a run cannot be started for one.
     """
     import re
 
     html = call(repo_api(), "GET", "/").body.decode("utf-8")
-    for select_id, chosen in (("src", "auto"), ("tgt", "vi")):
+    for select_id, code, label in (("src", "en", "Tiếng Anh"), ("tgt", "vi", "Tiếng Việt")):
+        assert re.search(
+            rf'<select[^>]*id="{select_id}"[^>]*disabled', html
+        ), select_id
         block = re.search(rf'<select[^>]*id="{select_id}"[^>]*>(.*?)</select>', html, re.DOTALL)
         assert block, select_id
         options = re.findall(r'<option value="([a-z]+)"[^>]*>([^<]+)</option>', block.group(1))
-        codes = [code for code, _ in options]
-        assert chosen in codes, (select_id, codes)
-        assert "en" in codes, "English has to be offered as an input language"
-        for code, label in options:
-            assert label != code, f"{code} should be spelled out"
-        assert re.search(rf'<option value="{chosen}"[^>]*selected', block.group(1))
-    # The abbreviation is not what a reader is asked to pick from.
+        assert options == [(code, label)]
+        assert re.search(rf'<option value="{code}"[^>]*selected', block.group(1))
     assert "<datalist" not in html
 
 
@@ -1659,6 +1702,32 @@ def test_app_js_poll_run_does_not_shadow_a_top_level_helper():
     assert not offenders, f"pollRun shadows top-level helpers: {offenders}"
 
 
+def test_a_failed_poll_keeps_watching_instead_of_freezing_the_page():
+    """One failed /events request used to end the live watch for good.
+
+    ``pollRun``'s catch showed the banner and returned without arming the next
+    timer, so a single timeout left the page frozen at the last log line it had
+    while the run went on finishing chunks — which reads exactly like a run
+    that died. A failure now re-arms the timer on a slower beat and keeps the
+    warning up, so the reader sees a gap instead of a silent stop.
+    """
+    import re
+    from pathlib import Path
+
+    js = (Path(__file__).resolve().parents[1] / "webui" / "static" / "app.js").read_text(
+        encoding="utf-8"
+    )
+    # Only the failure branch, from its catch to the reader-moved-on guard.
+    catch = js.split("async function pollRun(", 1)[1].split("} catch (error) {", 1)[1]
+    failure = catch.split("if (state.open !== runId)", 1)[0]
+    assert "renderBanner(\"error\"" in failure
+    assert "setTimeout(() => pollRun(runId), POLL_FAIL_MS)" in failure, failure
+    delay = int(re.search(r"const POLL_FAIL_MS = (\d+)", js).group(1))
+    assert 2000 <= delay <= 3000, delay
+    # The successful path still polls on the fast beat.
+    assert "setTimeout(() => pollRun(runId), POLL_MS)" in js
+
+
 def test_the_status_tab_shows_every_chunk():
     """A separate detail tab lists the whole task — one row per chunk, carrying
     its state and the work it is on — because a long run's progress bar cannot
@@ -2012,7 +2081,7 @@ def test_app_js_covers_the_steps_the_page_promises():
         "/api/runs/",
         "/output",
         "/pdf",
-        "/bundle",
+        "/rebuild",
         "/source",
     ):
         assert route in js, route
@@ -2216,34 +2285,37 @@ def test_the_run_settings_moved_from_the_title_to_the_report():
     # The heading keeps the document's name and the badge: its chip row is gone.
     assert "show(meta, false)" in js
     assert 'element("span", "tag", tag)' not in js
-    # And the three facts are in the report, ahead of the verdict that ends it.
-    for label in ('["Cặp ngôn ngữ"', '["Số chunk"', '["Bắt đầu"'):
+    # The pair is fixed, so the report keeps the facts that vary.
+    assert '["Cặp ngôn ngữ"' not in js
+    for label in ('["Số chunk"', '["Bắt đầu"'):
         assert label in js, label
     # Listed before the verdict, so the report still ends on how the run went.
     facts = js[js.index("function reportFacts(report)") : js.index("function reportTable")]
-    assert facts.index('["Cặp ngôn ngữ"') < facts.index('"Kết thúc"')
+    assert facts.index('["Số chunk"') < facts.index('"Kết thúc"')
 
 
-def test_the_running_clock_measures_the_attempt_and_not_the_whole_run():
-    """A continued run must not report the time it spent failed as running time.
+def test_the_running_clock_sums_each_attempt_instead_of_counting_idle_days():
+    """An old translation re-assembled today must not report days of running time.
 
-    A run keeps the day it was created, and one that sat failed for an hour
-    before the reader pressed "Tiếp tục" showed an hour of running time while
-    the attempt actually being watched was a minute old — a healthy run read
-    as one that had been stuck for an hour. The clock under the progress bar
-    starts again with every attempt, which is what the newest `run_start`
-    record says.
+    A run keeps the day it was created. Measuring from that date counted every
+    day it sat idle as work, so a three-hour translation rebuilt three days
+    later read as dozens of hours. Each attempt contributes its own recorded
+    duration; an attempt in flight contributes only the time since its own
+    run_start. No attempt seen yet means no clock, not a clock from the run's
+    creation date.
     """
     from pathlib import Path
 
     js = (Path(__file__).resolve().parents[1] / "webui" / "static" / "app.js").read_text(
         encoding="utf-8"
     )
-    assert "function attemptStart(events, run)" in js
-    # The attempt is the newest run_start in the log.
+    assert "function attemptTotals(events, run)" in js
     assert 'event.type === "run_start"' in js
-    # The clock reads the attempt, not the run's creation.
-    assert "formatClock(until - began)" in js
+    assert 'event.type === "run_end"' in js
+    # The attempt's own duration is summed; wall time since creation is not.
+    assert "totals.ms / 1000" in js
+    assert "formatClock(elapsedSeconds)" in js
+    assert "formatClock(until - began)" not in js
     assert "formatClock(until - run.started)" not in js
 
 
@@ -2343,7 +2415,7 @@ def test_a_run_waiting_out_a_provider_says_so_under_the_bar():
     # And it carries the wait's own words: what failed, and how long.
     assert "last.error || last.message" in js
     css = call(repo_api(), "GET", "/static/app.css").body.decode("utf-8")
-    assert '.log-line[data-status="retry"] .log-word' in css
+    assert '.log-line[data-status="retry"] .log-badge' in css
 
 
 def test_the_run_controls_sit_beside_the_state_they_change():
@@ -2354,8 +2426,11 @@ def test_the_run_controls_sit_beside_the_state_they_change():
 
     html = call(repo_api(), "GET", "/").body.decode("utf-8")
     assert 'id="job-control"' in html
-    # It is in the header, above the row it used to share with the downloads.
-    assert html.index('id="job-control"') < html.index('id="job-actions"')
+    # The downloads and the actions on a run are on the header line too, beside
+    # the state; there is no separate row of links for them any more.
+    assert 'id="job-tools"' in html
+    assert 'id="job-actions"' not in html
+    assert html.index('id="job-tools"') < html.index('id="job-control"')
     assert 'class="job-head-side"' in html
 
     js = (Path(__file__).resolve().parents[1] / "webui" / "static" / "app.js").read_text(
@@ -2444,3 +2519,39 @@ def test_a_fresh_run_does_not_claim_it_resumed_anything():
     record = coordinator.split('type="resume"', 1)[1].split("checkpoint_usable", 1)[0]
     assert "resume_requested=bool(resume)" in record, record
     assert "resumed_chunks=result.resumed_chunks" in record, record
+
+
+def test_the_log_offers_the_two_moves_a_long_run_needs():
+    """After the log redesign, the two controls that make it usable.
+
+    A 76-chunk run writes hundreds of lines around the few that explain it:
+    \"show only failures\" and \"go to the first failure\" are the two moves a
+    reader always needs, and the conclusion's chunk table points back into the
+    log for the same reason.
+    """
+    from pathlib import Path
+
+    root = Path(__file__).resolve().parents[1]
+    html = call(repo_api(), "GET", "/static/index.html").body.decode("utf-8")
+    assert 'id="log-fails"' in html
+    assert 'id="log-first-fail"' in html
+    js = (root / "webui" / "static" / "app.js").read_text(encoding="utf-8")
+    assert "function applyLogFilter()" in js
+    assert "function jumpToFirstFailure()" in js
+    assert "conclusion-chunk" in js
+    css = (root / "webui" / "static" / "app.css").read_text(encoding="utf-8")
+    assert ".log-tools" in css
+    # `hidden` has to beat `.log-line { display: grid }` or the filter does nothing.
+    assert ".log-line[hidden]" in css
+
+
+def test_the_library_says_why_a_run_is_not_done():
+    """The run list carries the completion counts the subtitle is built from."""
+    from pathlib import Path
+
+    root = Path(__file__).resolve().parents[1]
+    server = (root / "webui" / "server.py").read_text(encoding="utf-8")
+    summary = server.split("def _summary", 1)[1].split("def _run_route", 1)[0]
+    assert '"completion"' in summary, summary
+    js = (root / "webui" / "static" / "app.js").read_text(encoding="utf-8")
+    assert "job-row-why" in js

@@ -40,14 +40,13 @@
     <span class="crumb-sep" aria-hidden="true">/</span>
     <span id="crumb-doc" class="crumb-doc">Chưa mở lượt dịch nào</span>
   </nav>
-  <span id="crumb-meta" class="crumb-meta"></span>
   <!-- The one control about the tool itself, not the document: the settings
        dialog behind it holds the pipeline's endpoints. -->
   <button id="settings-open" class="icon-btn" type="button"
           aria-label="Cấu hình endpoint" title="Cấu hình endpoint">
     <svg class="icon" viewBox="0 0 20 20" aria-hidden="true" focusable="false">
+      <path d="M8.6 2.6h2.8l.4 1.9 1.5.7 1.7-.9 2 2-.9 1.7.7 1.5 1.9.4v2.8l-1.9.4-.7 1.5.9 1.7-2 2-1.7-.9-1.5.7-.4 1.9H8.6l-.4-1.9-1.5-.7-1.7.9-2-2 .9-1.7-.7-1.5-1.9-.4V8.6l1.9-.4.7-1.5-.9-1.7 2-2 1.7.9 1.5-.7.4-1.9z"/>
       <circle cx="10" cy="10" r="2.6"/>
-      <path d="M10 2.2v2.2M10 15.6v2.2M2.2 10h2.2M15.6 10h2.2M4.5 4.5l1.6 1.6M13.9 13.9l1.6 1.6M15.5 4.5l-1.6 1.6M6.1 13.9l-1.6 1.6"/>
     </svg>
   </button>
 </header>
@@ -108,11 +107,15 @@
              they change: "Dừng" while it runs, "Tiếp tục" once it has stopped. -->
         <div class="job-head-side">
           <span id="job-status" class="badge" data-state="empty"></span>
+          <!-- The files a run produced, the preview of the rebuilt PDF, and the
+               two actions that act on it, all on the state's own line: one
+               download control that lists what can be taken, rather than a row
+               of links that grew with every artefact. -->
+          <div id="job-tools" class="job-tools"></div>
           <div id="job-control" class="job-control"></div>
         </div>
       </div>
 
-      <div id="job-actions" class="job-actions"></div>
       <p id="job-alert" class="alert" hidden></p>
 
       <!-- One strip, not a panel: a state line, the bar, and the six phases of
@@ -205,12 +208,6 @@
           <header class="pane-head">
             <h3 id="source-title" class="card-title">Bản gốc</h3>
             <span id="source-meta" class="count"></span>
-            <!-- The extraction as a file, in the two shapes it can be useful
-                 in: the pipeline's own text, and the same text with the
-                 emphasis said the Markdown way and the code markers gone.
-                 Filled once the text has arrived, since neither file can exist
-                 before it. -->
-            <p id="source-gets" class="pane-gets" hidden></p>
           </header>
           <p id="source-note" class="note"></p>
           <pre id="source-text" class="pane-text" tabindex="0" aria-labelledby="source-title"></pre>
@@ -242,6 +239,13 @@
       </div>
 
       <div id="tab-panel-history" class="tab-panel tab-panel--list" role="tabpanel" aria-labelledby="tab-history" hidden>
+        <!-- A log of a few thousand lines is read by looking for the trouble:
+             the two controls say only what that needs — show the failures, and
+             go to the first one — rather than adding a search nobody asked for. -->
+        <div class="log-tools">
+          <button id="log-fails" class="chip" type="button" aria-pressed="false">Chỉ dòng lỗi</button>
+          <button id="log-first-fail" class="chip" type="button">Tới lỗi đầu tiên</button>
+        </div>
         <ol id="history" class="log" aria-label="Lịch sử chạy của lượt dịch"></ol>
       </div>
 
@@ -272,34 +276,19 @@
       <p id="upload-note" class="note"></p>
     </div>
 
-    <!-- The value stays the language code the backend expects; what the reader
-         picks is the language's own name, in full. -->
+    <!-- The pipeline translates English to Vietnamese only: the two boxes show
+         that fixed pair and cannot be changed. -->
     <div class="grid-2">
       <p class="field">
         <label class="label" for="src">Ngôn ngữ nguồn</label>
-        <select id="src" class="input">
-          <option value="auto" selected>Auto (Tự động nhận diện)</option>
-          <option value="vi">Tiếng Việt</option>
-          <option value="en">Tiếng Anh</option>
-          <option value="ja">Tiếng Nhật</option>
-          <option value="ko">Tiếng Hàn</option>
-          <option value="zh">Tiếng Trung</option>
-          <option value="fr">Tiếng Pháp</option>
-          <option value="de">Tiếng Đức</option>
-          <option value="es">Tiếng Tây Ban Nha</option>
+        <select id="src" class="input" disabled>
+          <option value="en" selected>Tiếng Anh</option>
         </select>
       </p>
       <p class="field">
         <label class="label" for="tgt">Ngôn ngữ đích</label>
-        <select id="tgt" class="input">
+        <select id="tgt" class="input" disabled>
           <option value="vi" selected>Tiếng Việt</option>
-          <option value="en">Tiếng Anh</option>
-          <option value="ja">Tiếng Nhật</option>
-          <option value="ko">Tiếng Hàn</option>
-          <option value="zh">Tiếng Trung</option>
-          <option value="fr">Tiếng Pháp</option>
-          <option value="de">Tiếng Đức</option>
-          <option value="es">Tiếng Tây Ban Nha</option>
         </select>
       </p>
     </div>
@@ -350,17 +339,20 @@
     <h2 id="settings-title" class="dialog-title">Cấu hình endpoint</h2>
     <p id="settings-alert" class="alert" hidden></p>
     <p class="settings-note">
-      Giá trị nhập ở đây <strong>ghi đè</strong> lên <code>.env</code> cho các lượt dịch mới.
-      Endpoint nào không kết nối được khi bắt đầu lượt dịch sẽ bị bỏ qua và pipeline dùng lại
-      giá trị gốc của <code>.env</code>.
+      Mỗi agent một hàng: Base URL, API key và model riêng; agent nào để trống sẽ
+      dùng giá trị trong <code>.env</code>. Bánh răng mở Temperature và Timeout
+      riêng của agent đó — đổi Base URL hoặc model thì hai giá trị này tự xóa.
+      Backup thu gọn mặc định; bấm Mở rộng mới nhập. Endpoint nào không kết nối
+      được khi bắt đầu lượt dịch sẽ bị bỏ qua và pipeline dùng lại giá trị gốc
+      của <code>.env</code>.
     </p>
 
-    <label class="seg seg--choice settings-toggle" for="settings-group">
+    <div id="settings-cards" class="settings-cards"></div>
+
+    <label id="settings-group-choice" class="seg seg--choice settings-toggle settings-group-choice" for="settings-group" hidden>
       <input id="settings-group" type="checkbox">
       <span>Gom cụm Translator · Critic · Refiner vào chung một endpoint</span>
     </label>
-
-    <div id="settings-cards" class="settings-cards"></div>
 
     <!-- How the run spends the provider, kept apart from the endpoints it
          spends it on: two numbers that multiply, and the key that explains
@@ -370,18 +362,15 @@
       <div class="settings-limits-grid">
         <p class="field">
           <label class="label" for="settings-concurrency">MAX_CONCURRENCY</label>
-          <input id="settings-concurrency" class="input" type="number" min="1" max="16" step="1" value="1">
-          <span class="settings-hint">Số chunk dịch song song (1–16)</span>
+          <input id="settings-concurrency" class="input" type="number" min="1" max="32" step="1" value="1">
+          <span class="settings-hint">Số chunk dịch song song</span>
         </p>
         <p class="field">
           <label class="label" for="settings-provider-concurrency">LLM_PROVIDER_CONCURRENCY</label>
           <input id="settings-provider-concurrency" class="input" type="number" min="1" max="32" step="1" value="1">
-          <span class="settings-hint">Request đồng thời tới mỗi endpoint (1–32)</span>
+          <span class="settings-hint">Request đồng thời tới mỗi endpoint</span>
         </p>
       </div>
-      <p class="settings-hint settings-legend">
-        ✓ xanh — đã kết nối · ✗ đỏ — lỗi · chấm — chưa kiểm tra
-      </p>
     </section>
 
     <div class="dialog-actions">
@@ -391,12 +380,36 @@
   </form>
 </dialog>
 
+<dialog id="agent-config" class="dialog dialog--agent-config" aria-labelledby="agent-config-title">
+  <form id="agent-config-form" class="dialog-form" method="dialog" novalidate>
+    <h2 id="agent-config-title" class="dialog-title">Cấu hình agent</h2>
+    <div class="settings-config-fields">
+      <p class="field">
+        <label class="label" for="agent-config-temperature">Temperature</label>
+        <input id="agent-config-temperature" class="input" type="number" min="0" max="2" step="0.1">
+      </p>
+      <p class="field">
+        <label class="label" for="agent-config-timeout">Timeout (s)</label>
+        <input id="agent-config-timeout" class="input" type="number" min="1" step="1">
+      </p>
+    </div>
+    <p class="settings-hint">Để trống dùng giá trị mặc định.</p>
+    <div class="dialog-actions">
+      <button id="agent-config-cancel" class="btn" type="button">Đóng</button>
+      <button id="agent-config-save" class="btn btn--primary" type="button">Xong</button>
+    </div>
+  </form>
+</dialog>
+
 <noscript>
   <p class="banner" data-kind="warn">
     Trang này cần JavaScript để theo dõi lượt dịch. Không có nó, hãy dùng terminal:
-    <code>polyglot translate --file input/&lt;tài liệu&gt;.pdf --tgt vi</code>.
+    <code>polyglot translate --file input/&lt;tài liệu&gt;.pdf</code>.
   </p>
 </noscript>
+
+<div id="toasts" class="toasts" popover="manual" aria-live="assertive"
+     aria-label="Thông báo"></div>
 
 <script src="/static/app.js" defer></script>
 

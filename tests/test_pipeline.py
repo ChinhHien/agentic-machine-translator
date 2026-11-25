@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+from pathlib import Path
 
 import pytest
 
@@ -232,27 +233,28 @@ def test_a_run_without_glossary_pairs_says_what_it_compared(mock_env, sample_pdf
     assert end["consistency_checked_terms"] == 0
 
 
-def test_a_run_with_a_glossary_reports_the_terms_it_compared(mock_env, sample_pdf_file, tmp_path):
-    """With a term to enforce, the same counters read differently."""
+def test_a_run_reports_the_terms_it_compared(mock_env, sample_pdf_file, tmp_path):
+    """With a term to enforce, the same counters read differently.
+
+    The en→vi pair ships two core terms, so a run always has something to
+    compare even without a per-run glossary.
+    """
     import os
 
     os.environ["LOG_JSONL"] = "1"
     from polyglot_lc.pipeline import TranslationPipeline
 
-    csv = tmp_path / "terms.csv"
-    csv.write_text("NMT,Dịch máy neural\n", encoding="utf-8")
-    result = TranslationPipeline(quiet=True).run(
-        sample_pdf_file, src="en", tgt="vi", glossary=str(csv)
-    )
+    result = TranslationPipeline(quiet=True).run(sample_pdf_file, src="en", tgt="vi")
 
     assert result.consistency_no_pairs is False
     assert result.consistency_checked_terms >= 1
 
 
 @pytest.mark.parametrize("failure", ["unavailable", "skipped"])
-def test_unverified_translation_stops_the_run(
+def test_unverified_translation_is_kept_and_reported(
     mock_env, sample_pdf_file, monkeypatch, tmp_path, failure
 ):
+    """A Verifier outage keeps the draft and warns; it does not erase the run."""
     from polyglot_lc.agents.verifier import VerificationError, VerifierAgent, VerifyResult
     from polyglot_lc.pipeline import TranslationPipeline
 
@@ -270,22 +272,187 @@ def test_unverified_translation_stops_the_run(
     monkeypatch.setattr(VerifierAgent, "verify", verify)
     pipeline = TranslationPipeline(quiet=True)
     target = tmp_path / "a.md"
-    with pytest.raises(VerificationError):
-        pipeline.run(sample_pdf_file, src="en", tgt="vi", out=str(target))
-    assert len(asked) == 1
-    assert not target.exists()
+    checkpoint_dir = tmp_path / "cp"
+    result = pipeline.run(
+        sample_pdf_file,
+        src="en",
+        tgt="vi",
+        out=str(target),
+        checkpoint_dir=str(checkpoint_dir),
+    )
+    # Retried by the verify retry budget and the completion sweeps, but always
+    # for the same chunk and without translating it again.
+    assert len(set(asked)) == 1
+    assert target.is_file() and target.read_text(encoding="utf-8").strip()
+    assert result.chunks_failed == 0
+    assert result.verify_skipped == 1
     records = [
         json.loads(line) for line in pipeline.sink.path.read_text(encoding="utf-8").splitlines()
     ]
     end = [record for record in records if record.get("type") == "run_end"][-1]
-    assert end["status"] == "failed"
-    assert end["exit_code"] == 1
-    assert end["chunks_done"] == 0
-    assert end["chunks_failed"] > 0
+    assert end["status"] == "incomplete"
+    assert end["exit_code"] == 2
+    assert end["chunks_done"] == result.chunks
+    assert end["chunks_failed"] == 0
     assert end["verify_skipped"] == 1
+    assert end["completion"]["incomplete"][0]["chunk"] == result.incomplete_chunks[0]["chunk"]
     assert any(
         record.get("type") == "error" and record.get("cause") == "verify" for record in records
     )
+    # Unverified text is not evidence for a later resume: the chunk is asked
+    # again instead of replaying text nobody checked.
+    from polyglot_lc.pipeline.checkpoint import CheckpointStore
+
+    named = [record for record in records if record.get("type") == "checkpoint"][0]
+    assert CheckpointStore(checkpoint_dir).completed(named["doc_key"]) == {}, (
+        "an unverified chunk must not be checkpointed"
+    )
+
+
+def test_completion_deadline_ends_a_verifier_outage(
+    mock_env, sample_pdf_file, monkeypatch, tmp_path
+):
+    """A verifier outage must not keep the run alive after its budget ends."""
+    from polyglot_lc.agents.verifier import VerificationError, VerifierAgent
+    from polyglot_lc.pipeline import TranslationPipeline
+
+    monkeypatch.setenv("LOG_JSONL", "1")
+    monkeypatch.setenv("VERIFY_UNAVAILABLE_RETRIES", "0")
+    monkeypatch.setenv("COMPLETION_DEADLINE_SECONDS", "0.0001")
+
+    def verify(self, source, translation, *args, **kwargs):
+        raise VerificationError("verification unavailable")
+
+    monkeypatch.setattr(VerifierAgent, "verify", verify)
+    pipeline = TranslationPipeline(quiet=True)
+    target = tmp_path / "deadline.md"
+    result = pipeline.run(sample_pdf_file, src="en", tgt="vi", out=str(target))
+
+    assert target.is_file()
+    assert result.incomplete_chunks
+    records = [
+        json.loads(line) for line in pipeline.sink.path.read_text(encoding="utf-8").splitlines()
+    ]
+    # The first round may already have been recorded before the clock check
+    # (monotonic resolution); what matters is that no second round starts.
+    assert sum(record.get("type") == "completion_round" for record in records) <= 1
+    assert any(
+        "completion deadline reached" in json.dumps(record, ensure_ascii=False)
+        for record in records
+    )
+
+
+def test_salvage_halves_keep_the_chunk_profile(mock_env, monkeypatch):
+    """Half a reference list is still a reference list to the Verifier."""
+    from types import SimpleNamespace
+
+    from polyglot_lc.llm.resilience import RetryStats
+    from polyglot_lc.pipeline import TranslationPipeline, coordinator
+    from polyglot_lc.segment.chunker import Chunk
+
+    chunk = Chunk(
+        id="ref",
+        text="Alpha entry one.\n\nBeta entry two.",
+        token_count=20,
+        section_path="References",
+        index=0,
+        profile="references",
+    )
+    profiles: list[tuple[str, str]] = []
+
+    def invoke(state, **kwargs):
+        current = state["chunk"]
+        profiles.append((current.id, current.profile))
+        text = current.text if ".d" in current.id else "cut"
+        return {"translated": text, "chunk": current, "trace": {}}
+
+    monkeypatch.setattr(coordinator, "_coverage_enabled", lambda cfg: True)
+    monkeypatch.setattr(
+        coordinator,
+        "coverage_error",
+        lambda current, translated: None if translated != "cut" else "cut short",
+    )
+    monkeypatch.setattr(coordinator, "jittered_delay", lambda cfg, attempt: 0.0)
+    ui = SimpleNamespace(advance=lambda: None, add_error=lambda *a: None, retry=lambda *a: None)
+    RetryStats.reset()
+    states = TranslationPipeline(quiet=True)._run_chunks(
+        SimpleNamespace(invoke=invoke),
+        [chunk],
+        {},
+        ui,
+    )
+    RetryStats.reset()
+
+    assert states[0]["translated"] == chunk.text
+    assert any(".d" in ident and profile == "references" for ident, profile in profiles)
+
+
+def test_a_chunk_that_keeps_failing_is_abandoned_after_its_attempt_budget(
+    mock_env, monkeypatch
+):
+    """CHUNK_MAX_ATTEMPTS ends a saturation loop instead of holding the run.
+
+    A real 74-chunk run retried one chunk for five hours against an endpoint
+    that kept refusing, and never wrote an output file. The chunk has to be
+    given up (and left out of the checkpoint) so the rest of the document — and
+    the reader — can get a file.
+    """
+    from types import SimpleNamespace
+
+    from polyglot_lc.llm.resilience import RateLimitError, RetryStats
+    from polyglot_lc.pipeline import TranslationPipeline, coordinator
+    from polyglot_lc.segment.chunker import Chunk
+
+    monkeypatch.setenv("CHUNK_MAX_ATTEMPTS", "2")
+    monkeypatch.setattr(coordinator, "jittered_delay", lambda cfg, attempt: 0.0)
+    chunk = Chunk(id="c0", text="Source text.", token_count=3, section_path=[], index=0)
+    asked: list[str] = []
+
+    def invoke(state, **kwargs):
+        asked.append(state["chunk"].id)
+        raise RateLimitError("429 concurrency_limit_exceeded: another request is running")
+
+    ui = SimpleNamespace(
+        advance=lambda: None, add_error=lambda *a: None, retry=lambda *a: None
+    )
+    RetryStats.reset()
+    states = TranslationPipeline(quiet=True)._run_chunks(
+        SimpleNamespace(invoke=invoke), [chunk], {}, ui
+    )
+    RetryStats.reset()
+
+    assert states[0]["translated"] == ""
+    assert "gave up after 2 attempt(s)" in states[0]["error"]
+    assert len(asked) >= 2
+
+
+def test_skill_off_still_leaves_a_control_row(mock_env, sample_pdf_file, monkeypatch, tmp_path):
+    from polyglot_lc.pipeline import TranslationPipeline
+    from polyglot_lc.skillopt.skill_store import SkillStore
+
+    monkeypatch.setenv("SKILL_APPLY", "0")
+    result = TranslationPipeline(quiet=True).run(
+        sample_pdf_file, src="en", tgt="vi", out=str(tmp_path / "control.md")
+    )
+
+    row = SkillStore(tmp_path / "skills").history()[-1]
+    assert row["reason"] == "SKILL_APPLY=off"
+    assert row["skill_id"] == ""
+    assert row["n"] == result.skill_samples
+    assert row["mean"] == pytest.approx(result.skill_mean)
+    assert row["retranslate_rate"] == pytest.approx(
+        result.chunk_retries / result.chunks, abs=1e-3
+    )
+
+
+def test_scores_skip_unmeasured_chunks_instead_of_counting_zero():
+    from types import SimpleNamespace
+
+    from polyglot_lc.pipeline.coordinator import _collect_scores
+
+    chunks = [SimpleNamespace(id="measured"), SimpleNamespace(id="missing")]
+    by_id = {"measured": {"trace": {"score": 0.8}}, "missing": {}}
+    assert _collect_scores(chunks, by_id) == {"measured": pytest.approx(8.0)}
 
 
 def test_drift_the_pass_could_not_fix_is_reported(mock_env, sample_pdf_file, monkeypatch, tmp_path):
@@ -321,14 +488,10 @@ def test_drift_the_pass_could_not_fix_is_reported(mock_env, sample_pdf_file, mon
     monkeypatch.setattr(coordinator, "ConsistencyChecker", _StubChecker)
     from polyglot_lc.pipeline import TranslationPipeline
 
-    # A glossary pair is what makes the pass run at all: it enforces the pairs the
-    # user asked for, never terminology the document did not declare.
-    user_glossary = tmp_path / "glossary.csv"
-    user_glossary.write_text("NMT,Dịch máy neural\n", encoding="utf-8")
-
-    result = TranslationPipeline(quiet=True).run(
-        sample_pdf_file, src="en", tgt="vi", glossary=str(user_glossary)
-    )
+    # A glossary pair is what makes the pass run at all: the en→vi pair's own
+    # core terms are present on every run, so the pass always has something to
+    # enforce.
+    result = TranslationPipeline(quiet=True).run(sample_pdf_file, src="en", tgt="vi")
     assert result.consistency_patches == 2
     assert result.consistency_skipped == 4
     assert result.consistency_rejected == 1
@@ -391,6 +554,16 @@ def test_explicit_out_names_one_pair_whichever_suffix_is_given():
     assert tuple(map(str, output_paths("book.pdf", "vi", "custom.pdf"))) == (
         "custom.md",
         "custom.pdf",
+    )
+
+
+def test_an_extensionless_out_still_gets_a_markdown_extension():
+    """``--out report`` is the base of the pair, not a suffix-less Markdown file."""
+    from polyglot_lc.pipeline.assembler import output_paths
+
+    assert tuple(map(str, output_paths("book.pdf", "vi", "report"))) == (
+        "report.md",
+        "report.pdf",
     )
 
 
@@ -536,6 +709,11 @@ def test_a_cut_short_reply_is_retried_and_never_checkpointed(
     assert TokenUsage.snapshot()["calls"] > 0  # so the chunk was asked again
     # The retry counters are process-global and later tests read them from
     # their run records: leave the suite the counters it found.
+    assert first.chunk_retries > 0
+    from polyglot_lc.skillopt.skill_store import SkillStore
+
+    row = SkillStore(tmp_path / "skills").history()[-1]
+    assert row["retranslate_rate"] > 0
     RetryStats.reset()
 
 
@@ -691,7 +869,9 @@ def test_a_provider_that_answers_with_nothing_does_not_hold_the_run(
 
     os.environ["LOG_JSONL"] = "1"
     chunks = chunk_document(load_document(sample_pdf_file))
-    limit = 25 * len(chunks)
+    # One bounded retry budget per chunk, plus the two completion sweeps that
+    # give up on the same empty reply without holding the run forever.
+    limit = (25 + 2) * len(chunks)
     graph = _SilentGraph(limit)
     monkeypatch.setattr(coordinator, "make_chunk_graph", lambda ctx: graph)
     # A real back-off would slow the test without testing anything.
@@ -728,6 +908,122 @@ def test_a_provider_that_answers_with_nothing_does_not_hold_the_run(
     second = _run_pipeline(sample_pdf_file, tmp_path / "b.md", resume=True)
     assert second.resumed_chunks == 0
     RetryStats.reset()
+
+
+def test_a_failed_preflight_stops_before_any_translation(
+    mock_env, tmp_path, monkeypatch, sample_pdf_file
+):
+    """A wrong key is answered in seconds, not at chunk 73.
+
+    The canary asks each agent for one word through the real client path before
+    the run spends anything. When it fails, the run ends with the reason, no
+    chunk is translated, and no half-written file is left behind.
+    """
+    import os
+
+    from polyglot_lc.agents.translator import TranslatorAgent
+    from polyglot_lc.pipeline import preflight
+
+    os.environ["LOG_JSONL"] = "1"
+
+    class Failed:
+        ok = False
+
+        def summary(self) -> str:
+            return "kiểm tra trước khi chạy thất bại: TRANSLATOR: 401 invalid api key"
+
+        def as_dicts(self) -> list[dict]:
+            return [{"agent": "TRANSLATOR", "ok": False, "detail": "401"}]
+
+    def never(self, *args, **kwargs):
+        raise AssertionError("a chunk was translated after a failed preflight")
+
+    monkeypatch.setattr(preflight, "run_preflight", lambda configs: Failed())
+    monkeypatch.setattr(TranslatorAgent, "translate", never)
+
+    target = tmp_path / "preflight.md"
+    result = _run_pipeline(sample_pdf_file, target)
+
+    assert "TRANSLATOR" in result.fatal_error
+    assert result.chunks_failed == result.chunks
+    assert not target.exists()
+
+
+class _PermanentForOne:
+    """A chunk graph that fails one chunk permanently and translates the rest."""
+
+    def __init__(self, bad: str) -> None:
+        self.bad = bad
+        self.asked: list[str] = []
+
+    def invoke(self, state, config=None):
+        from polyglot_lc.llm.resilience import PermanentError
+
+        chunk = state["chunk"]
+        self.asked.append(chunk.id)
+        if chunk.id == self.bad:
+            raise PermanentError("400 invalid model name", status=400)
+        return {
+            "translated": "[vi] " + chunk.text,
+            "chunk": chunk,
+            "trace": {"score": 9.0},
+            "path": "standard",
+        }
+
+
+def test_a_chunk_with_a_permanent_error_does_not_stop_the_run(
+    mock_env, tmp_path, monkeypatch, sample_pdf_file
+):
+    """One chunk's bad request is a hole in the file, not a failed run.
+
+    A 400 on chunk-073 and a 524 on chunk-025 each set the stop flag, so runs
+    ended after 27 of 76 chunks with exit 1 and no usable file. The chunk is now
+    left untranslated and out of the checkpoint, the rest finish, and the run
+    ends incomplete (exit 2) so ``--resume`` fills exactly that gap.
+    """
+    import os
+
+    from polyglot_lc.ingest import load_document
+    from polyglot_lc.pipeline import coordinator
+    from polyglot_lc.segment.chunker import chunk_document
+
+    os.environ["LOG_JSONL"] = "1"
+
+    def small(doc, **kwargs):
+        kwargs.pop("max_tokens", None)
+        return chunk_document(doc, max_tokens=25, overlap_tokens=0, **kwargs)
+
+    monkeypatch.setattr(coordinator, "chunk_document", small)
+    chunks = small(load_document(sample_pdf_file))
+    assert len(chunks) > 1, "the fixture must split for this test to mean anything"
+    bad = chunks[0].id
+    graph = _PermanentForOne(bad)
+    monkeypatch.setattr(coordinator, "make_chunk_graph", lambda ctx: graph)
+
+    result = _run_pipeline(sample_pdf_file, tmp_path / "hole.md")
+
+    assert result.chunks == len(chunks)
+    # Asked once, then left alone: the completion sweeps are for outages.
+    assert graph.asked.count(bad) == 1
+    assert result.chunks_failed == 0
+    assert result.chunks_permanently_failed == 1
+    assert [item["chunk"] for item in result.incomplete_chunks] == [bad]
+    assert "permanently" in result.incomplete_chunks[0]["reason"]
+    with open(result.output_path, encoding="utf-8") as fh:
+        assert fh.read().strip()  # the file is still usable
+    with open(result.log_path, encoding="utf-8") as fh:
+        records = [json.loads(line) for line in fh]
+    end = [record for record in records if record.get("type") == "run_end"][-1]
+    assert end["status"] == "incomplete"
+    assert end["exit_code"] == 2
+    assert end["chunks_done"] == len(chunks) - 1
+    assert end["chunks_permanently_failed"] == 1
+
+    # A resume asks the hole again and replays nothing else.
+    graph.asked.clear()
+    resumed = _run_pipeline(sample_pdf_file, tmp_path / "hole-2.md", resume=True)
+    assert resumed.resumed_chunks == len(chunks) - 1
+    assert graph.asked == [bad]
 
 
 def test_assemble_no_overlap_is_unchanged():
@@ -987,3 +1283,117 @@ def test_a_long_document_fills_the_glossary_budget(
     assert result.chunks >= 100
     lines = [line for line in seen["plan"].glossary_md.splitlines() if line.startswith("- ")]
     assert len(lines) > 80
+
+
+# --------------------- deliverable and output durability ---------------------
+def test_pdf_only_failure_is_a_failed_run(mock_env, sample_pdf_file, monkeypatch, tmp_path):
+    """A PDF-only run with no PDF has no deliverable; it must say so."""
+    from polyglot_lc.pipeline import TranslationPipeline, coordinator
+
+    monkeypatch.setenv("LOG_JSONL", "1")
+
+    def boom(*args, **kwargs):
+        raise RuntimeError("font exploded")
+
+    monkeypatch.setattr(coordinator, "rebuild_pdf", boom)
+    out = tmp_path / "only.pdf"
+    result = TranslationPipeline(quiet=True).run(
+        sample_pdf_file,
+        src="en",
+        tgt="vi",
+        out=str(out),
+        output_format="pdf",
+    )
+
+    assert result.fatal_error.startswith("PDF rebuild failed: RuntimeError")
+    assert result.output_path == ""
+    assert result.pdf_path == ""
+    assert not out.exists()
+    records = [
+        json.loads(line) for line in Path(result.log_path).read_text(encoding="utf-8").splitlines()
+    ]
+    end = [record for record in records if record.get("type") == "run_end"][-1]
+    assert end["status"] == "failed"
+    assert end["exit_code"] == 1
+    assert end["fatal_error"] == result.fatal_error
+
+
+def test_a_failed_pdf_beside_markdown_is_only_a_warning(
+    mock_env, sample_pdf_file, monkeypatch, tmp_path
+):
+    from polyglot_lc.pipeline import TranslationPipeline, coordinator
+
+    def boom(*args, **kwargs):
+        raise RuntimeError("font exploded")
+
+    monkeypatch.setattr(coordinator, "rebuild_pdf", boom)
+    result = TranslationPipeline(quiet=True).run(
+        sample_pdf_file,
+        src="en",
+        tgt="vi",
+        out=str(tmp_path / "both.md"),
+        output_format="both",
+    )
+
+    assert result.fatal_error == ""
+    assert result.output_path == str(tmp_path / "both.md")
+    assert Path(result.output_path).is_file()
+    assert result.pdf_path == ""
+    assert any("PDF rebuild failed" in error for error in result.errors)
+
+
+def test_write_atomic_retries_a_held_target(monkeypatch, tmp_path):
+    """Windows can refuse the replace while a reader holds the file open."""
+    from pathlib import Path
+
+    from polyglot_lc.pipeline.assembler import write_atomic
+
+    target = tmp_path / "out.md"
+    attempts = {"n": 0}
+    original = Path.replace
+
+    def flaky(self, destination):
+        if Path(destination) == target and attempts["n"] < 2:
+            attempts["n"] += 1
+            raise PermissionError("held open")
+        return original(self, destination)
+
+    monkeypatch.setattr(Path, "replace", flaky)
+    write_atomic(target, "nội dung")
+    assert target.read_text(encoding="utf-8") == "nội dung"
+    assert attempts["n"] == 2
+    assert not list(tmp_path.glob("*.tmp"))
+
+
+def test_a_failed_partial_write_does_not_fail_the_run(mock_env, tmp_path, monkeypatch):
+    """The live preview is a convenience; the final assembly still lands."""
+    from pdfdoc import write_pdf
+
+    from polyglot_lc.pipeline import TranslationPipeline, coordinator
+
+    monkeypatch.setenv("PARTIAL_OUTPUT", "1")
+    monkeypatch.setenv("MAX_CONCURRENCY", "2")
+    path = write_pdf(
+        tmp_path / "partial.pdf",
+        "Neural machine translation splits documents into segments.\n\n"
+        "Each segment is translated with a consistent glossary.\n\n"
+        "A third paragraph to translate as well.\n",
+    )
+    real = coordinator.write_atomic
+
+    def flaky(target, text):
+        if "pending" in text:
+            raise OSError("preview locked")
+        return real(target, text)
+
+    monkeypatch.setattr(coordinator, "write_atomic", flaky)
+    monkeypatch.setenv("CHUNK_MAX_TOKENS", "15")
+    out = tmp_path / "partial.vi.md"
+    result = TranslationPipeline(quiet=True).run(
+        path, src="en", tgt="vi", out=str(out)
+    )
+
+    assert result.chunks >= 2
+    assert result.chunks_failed == 0
+    assert result.fatal_error == ""
+    assert out.is_file() and out.read_text(encoding="utf-8").strip()

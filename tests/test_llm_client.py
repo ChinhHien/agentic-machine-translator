@@ -21,7 +21,6 @@ from polyglot_lc.llm.client import (
 )
 from polyglot_lc.llm.resilience import TruncatedError
 
-
 BASE = "http://mockapi.test/v1"
 
 
@@ -122,7 +121,7 @@ def test_concurrent_calls_never_overlap_on_a_single_request_provider(monkeypatch
     def call() -> None:
         try:
             results.append(client.chat([{"role": "user", "content": "hi"}]).text)
-        except BaseException as exc:  # noqa: BLE001 - asserted below
+        except BaseException as exc:
             errors.append(exc)
 
     threads = [threading.Thread(target=call) for _ in range(4)]
@@ -376,6 +375,8 @@ def test_token_usage_totals_and_per_agent():
         "thinking": 0,
         "answer": 55,
         "calls": 2,
+        "cache_hits": 0,
+        "cache_misses": 0,
     }
     assert by_agent["TRANSLATOR"] == {
         "sent": 200,
@@ -384,6 +385,8 @@ def test_token_usage_totals_and_per_agent():
         "thinking": 0,
         "answer": 25,
         "calls": 1,
+        "cache_hits": 0,
+        "cache_misses": 0,
     }
     by_model = TokenUsage.snapshot_by_model()
     assert by_model["http://p/v1 / m"] == {
@@ -393,11 +396,33 @@ def test_token_usage_totals_and_per_agent():
         "thinking": 0,
         "answer": 25,
         "calls": 1,
+        "cache_hits": 0,
+        "cache_misses": 0,
     }
     TokenUsage.reset()
     assert TokenUsage.snapshot()["sent"] == 0
     assert TokenUsage.snapshot_by_agent() == {}
     assert TokenUsage.snapshot_by_model() == {}
+
+
+def test_cache_hits_are_counted_per_agent():
+    """Each agent's own hit count says whose prefix the provider caches."""
+    TokenUsage.reset()
+    TokenUsage.add(
+        100,
+        10,
+        agent="CRITIC",
+        cached_tokens=60,
+        cache_status="HIT",
+        model="m",
+        provider="http://p/v1",
+    )
+    TokenUsage.add(100, 10, agent="VERIFIER", cache_status="MISS", model="m", provider="http://p/v1")
+    by_agent = TokenUsage.snapshot_by_agent()
+    assert by_agent["CRITIC"]["cache_hits"] == 1
+    assert by_agent["CRITIC"]["cached"] == 60
+    assert by_agent["VERIFIER"]["cache_misses"] == 1
+    TokenUsage.reset()
 
 
 def test_token_cache_cannot_exceed_prompt():
@@ -744,6 +769,30 @@ def test_the_translator_recovery_cap_is_configurable(monkeypatch):
 
 
 @respx.mock
+def test_the_translator_can_be_asked_not_to_reason(monkeypatch):
+    """TRANSLATOR_REASONING=off sends the thinking hint on every ask.
+
+    The thinking share is what pushed replies past the endpoint's limit on the
+    run that hung, so the hint must ride on the first ask AND on the recovery
+    ask: leaving it off the retry would spend the raised budget thinking again.
+    """
+    from polyglot_lc.agents.translator import TranslatorAgent
+
+    monkeypatch.setenv("TRANSLATOR_REASONING", "off")
+    route = respx.post(CHAT_URL)
+    route.side_effect = [
+        httpx.Response(200, json=truncated_payload("đoạn bị cắt")),
+        httpx.Response(200, json=chat_payload("bản dịch đầy đủ")),
+    ]
+    agent = TranslatorAgent(make_agent_config())
+    agent.translate(agent.build_prompt("Chunk text.", "en", "vi", "translate"))
+
+    assert route.call_count == 2
+    for call in route.calls:
+        assert json.loads(call.request.content)["thinking"] == {"type": "disabled"}
+
+
+@respx.mock
 def test_a_configured_cap_below_the_cut_yields_to_the_evidence(monkeypatch):
     """A tuned cap smaller than the budget just cut is a guaranteed failure.
 
@@ -833,3 +882,49 @@ def test_the_escalation_never_asks_above_the_ceiling(monkeypatch):
     caps = [json.loads(c.request.content).get("max_tokens") for c in route.calls]
     assert caps == [None, TRANSLATOR_MAX_TOKENS_CEILING]
     assert route.call_count == 2, "at the ceiling a second recovery ask is the same question"
+
+
+def test_a_recovery_budget_that_timed_out_is_not_asked_again(monkeypatch):
+    """A budget a proxy timed out is not asked a second time.
+
+    The gateway in a real run cut replies at its 1024 default, then served
+    16384, then timed out every 32768 ask after a full five-minute deadline.
+    Remembering that budget drops the ceiling to half of it, so the next cut
+    reaches the ceiling and the chunk layer splits the question instead of
+    spending another deadline on the same one.
+    """
+    from polyglot_lc.agents import translator as tr
+    from polyglot_lc.llm.resilience import TransientError, TruncatedError
+
+    tr._TIMED_OUT_BUDGETS.clear()
+    agent = tr.TranslatorAgent(make_agent_config())
+    caps: list[int | None] = []
+
+    def fake_chat(prompt, cache_prefix=False, max_tokens=None, **kw):
+        caps.append(max_tokens)
+        if max_tokens is None:
+            raise TruncatedError(
+                "cut at 1024",
+                completion_tokens=1024,
+                provider=agent.config.base_url,
+                model=agent.config.model,
+            )
+        raise TransientError("APITimeoutError: Request timed out.")
+
+    monkeypatch.setattr(agent, "chat", fake_chat)
+    with pytest.raises(TransientError):
+        agent.translate(agent.build_prompt("Chunk text.", "en", "vi", "translate"))
+
+    key = (agent.config.base_url, agent.config.model)
+    assert caps == [None, tr.DEFAULT_TRANSLATOR_OUTPUT_CAP]
+    assert tr._TIMED_OUT_BUDGETS[key] == tr.DEFAULT_TRANSLATOR_OUTPUT_CAP
+    assert tr._recovery_ceiling(*key) == tr.DEFAULT_TRANSLATOR_OUTPUT_CAP // 2
+    tr._TIMED_OUT_BUDGETS.clear()
+
+
+def test_the_recovery_ceiling_never_falls_below_one_kilobyte():
+    from polyglot_lc.agents import translator as tr
+
+    tr._TIMED_OUT_BUDGETS[("http://small.test/v1", "m")] = 1024
+    assert tr._recovery_ceiling("http://small.test/v1", "m") >= 1024
+    tr._TIMED_OUT_BUDGETS.clear()

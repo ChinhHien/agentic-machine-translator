@@ -54,6 +54,10 @@ class ChunkState(TypedDict, total=False):
     critique: Any  # Critique | None
     refine_round: int
     verify_result: Any  # VerifyResult | None
+    #: True when the Verifier could not produce a verdict at all. The draft is
+    #: kept for the reader and flagged, but it is not checkpointed: a later
+    #: resume must ask the Verifier again rather than replay unverified text.
+    verify_unavailable: bool
     retranslate_count: int  # semantic retranslate retries (bounded)
     repair_used: bool  # the last retry was a targeted terminology repair
     #: A translation that was kept for the reader but did not pass verification.

@@ -91,7 +91,7 @@ from typing import Any
 
 from loguru import logger
 
-from polyglot_lc import emphasis
+from polyglot_lc import emphasis, typography
 from polyglot_lc.ingest.model import Document
 from polyglot_lc.pipeline.assembler import block_translations
 
@@ -148,17 +148,11 @@ _PREFERRED_FAMILIES: dict[str, tuple[str, ...]] = {
     ),
 }
 
-_SERIF_MARKERS = (
-    "serif",
-    "times",
-    "georgia",
-    "garamond",
-    "antiqua",
-    "palatino",
-    "cambria",
-    "century",
-)
-_MONO_MARKERS = ("mono", "courier", "consol", "menlo", "terminal", "fixed")
+#: Family kinds and TeX weight/slant live in :mod:`polyglot_lc.typography`: the
+#: extractor records a block's weight with the same rules this rebuild prints
+#: it with, so a heading cannot be recorded bold and printed regular.
+_SERIF_MARKERS = typography.SERIF_MARKERS
+_MONO_MARKERS = typography.MONO_MARKERS
 
 #: Glyphs every candidate font must carry: Vietnamese needs Latin Extended
 #: Additional, which most PDF base faces and several system fonts lack.
@@ -179,6 +173,7 @@ _CODE_PLACEHOLDER_RE = re.compile(r"^⟦CODE_\d+⟧$")
 
 _HEADING_RE = re.compile(r"^#{1,6}\s+")
 _LIST_ITEM_RE = re.compile(r"^(?:[-*•]|\d{1,3}[.)])\s+")
+
 
 #: Fonts that do cover Vietnamese (they carry Latin Extended Additional), in the
 #: order we would rather use them. Times/Arial first because a rebuilt book page
@@ -269,6 +264,11 @@ class RebuildStats:
     #: Inserted fonts whose copied-text map was repaired (see
     #: :func:`_repair_tounicode`).
     repaired_maps: int = 0
+    #: Pages left exactly as the source drew them because their /Rotate is not
+    #: zero. Their text runs down the page, and re-flowing a translation into
+    #: the same quarter-turn is not safe enough to risk the original layout;
+    #: keeping the source is the readable choice.
+    rotated_pages: int = 0
     font: str = ""
     failures: list[str] = field(default_factory=list)
 
@@ -306,18 +306,13 @@ def _font_key(name: str) -> str:
 
 
 def _style_of(name: str) -> tuple[bool, bool]:
-    """``(bold, italic)`` read off a font's name."""
-    lowered = str(name or "").lower()
-    return "bold" in lowered, ("italic" in lowered or "oblique" in lowered)
+    """``(bold, italic)`` read off a font's name, TeX families included."""
+    return typography.font_style(name)
 
 
 def _kind_of(key: str) -> str:
     """``"mono"``, ``"serif"`` or ``"sans"`` for a family key."""
-    if any(marker in key for marker in _MONO_MARKERS):
-        return "mono"
-    if any(marker in key for marker in _SERIF_MARKERS):
-        return "serif"
-    return "sans"
+    return typography.font_kind(key)
 
 
 @lru_cache(maxsize=512)
@@ -488,6 +483,22 @@ _RUN_KINDS: frozenset[str] = frozenset({"body", "heading"})
 def _has_tokens(text: str) -> bool:
     """True when *text* carries at least one emphasis token."""
     return any(token in text for token in emphasis.TOKENS)
+
+
+#: Control characters that are not page structure: a Symbol-font mark the text
+#: layer could not name, or a stray byte copied out of one.
+_CONTROL_RE = re.compile(r"[\x00-\x08\x0b-\x1f\x7f-" + chr(0x9F) + "]")
+
+
+def printable_text(text: str) -> str:
+    """*text* with the control characters no face can print removed.
+
+    Ingest already turns a symbol font's byte into a bullet or a space (see
+    ``pdf_layout._strip_control_symbols``). This is the second line: a run saved
+    by an older build, or a model that echoed one back, must not reach the page,
+    where a control character prints as a missing-glyph box.
+    """
+    return _CONTROL_RE.sub("", text) if _CONTROL_RE.search(text) else text
 
 
 def _runs_without_heading_marker(
@@ -696,14 +707,19 @@ def _placement(
     # A little room under the last line: the translation is rarely the same
     # length, and a box that ends exactly on the baseline clips the last row.
     box = (x0, top, x1, bottom + max(size * 0.6, 4.0))
-    box = _stretched_box(
-        box,
-        occupied or [],
-        [(r[1], r[2], r[3], r[4]) for r in on_page],
-        column,
-        source_bottom=bottom,
-    )
-    box = _grown_down(box, occupied or [], source_bottom=bottom)
+    rotation = int(geo.get("rotation") or 0) % 360
+    if rotation not in (90, 270):
+        # Stretching and growing assume text runs left-to-right along x. On a
+        # rotated page it runs along y and lines stack along x, so the source
+        # rectangle already is the right shape for a rotated textbox.
+        box = _stretched_box(
+            box,
+            occupied or [],
+            [(r[1], r[2], r[3], r[4]) for r in on_page],
+            column,
+            source_bottom=bottom,
+        )
+        box = _grown_down(box, occupied or [], source_bottom=bottom)
     color = tuple(float(part) for part in geo.get("color") or ()) or None
     return _Placement(
         page=page,
@@ -765,6 +781,10 @@ def _sliver_box(geo: dict[str, Any]) -> bool:
     if not on_page:
         return True
     width = max(r[3] for r in on_page) - min(r[1] for r in on_page)
+    # On a rotated page the words run down the page, so their usable line
+    # length is the box's height, not its x-width.
+    if int(geo.get("rotation") or 0) % 180 == 90:
+        width = max(r[4] for r in on_page) - min(r[2] for r in on_page)
     size = max(float(geo.get("size") or 0.0), 6.0)
     return width < size * _MIN_BOX_WIDTH_FACTOR
 
@@ -971,7 +991,23 @@ def _marked_text(text: str, markers: list[str]) -> str:
         return text
     if len(glyphs) != len(lines):
         glyphs = [glyphs[0]] * len(lines)
-    return "\n".join(f"{glyph} {line}" for glyph, line in zip(glyphs, lines, strict=True))
+    return "\n".join(
+        line if _already_marked(line, glyph) else f"{glyph} {line}"
+        for glyph, line in zip(glyphs, lines, strict=True)
+    )
+
+
+def _already_marked(line: str, glyph: str) -> bool:
+    """Whether *line* still carries its own list mark.
+
+    A translation sometimes keeps the mark inside an emphasis token
+    (``⟦ITALIC⟧•⟦/ITALIC⟧ For …``), which :func:`plain_text` leaves at the head
+    of the line. Prepending the source marker as well printed the item twice
+    (``• • For …``), so a line that already starts with this mark keeps it.
+    """
+    stripped = line.lstrip()
+    return stripped.startswith(glyph)
+    
 
 
 def _toc_parts(text: str) -> tuple[str, str] | None:
@@ -995,6 +1031,9 @@ def placements(
     *match_style* looks for a local face that reproduces the source's typography
     (family, weight, slant); it is switched off when the caller pinned the font.
     """
+    #: What will be printed, cleaned of the bytes no face can draw. Done once,
+    #: here, so the run path and the one-face path cannot disagree about it.
+    texts = {index: printable_text(raw) if raw else raw for index, raw in texts.items()}
     built: list[_Placement] = []
     #: Placements that only clear lines on another page; joined at the end.
     clears: list[_Placement] = []
@@ -1148,15 +1187,33 @@ def _toc_line(item: _Placement, font_file: str, pymupdf: Any) -> str:
     return f"{title} " + "." * count + f" {number}"
 
 
+def _page_rotation(page: Any) -> int:
+    """The page's displayed quarter-turn, as PyMuPDF reports it."""
+    return int(getattr(page, "rotation", 0) or 0) % 360
+
+
+def _page_width(page: Any) -> float:
+    """The page's unrotated width: the frame its geometry is expressed in."""
+    box = getattr(page, "cropbox", None)
+    return float(box.width if box is not None else page.rect.width)
+
+
+def _page_height(page: Any) -> float:
+    """The page's unrotated height (see :func:`_page_width`)."""
+    box = getattr(page, "cropbox", None)
+    return float(box.height if box is not None else page.rect.height)
+
+
 def _heading_is_centred(page: Any, item: _Placement) -> bool:
     """Whether a heading sits clear of both margins and near the page's centre.
 
     Left-aligning a centred title is the one change a reader notices, so the
     decision lives in one place: the textbox path and the run path both ask here.
     Measured on the *source* box — a box stretched to the text column is centred
-    on the page whatever the source did.
+    on the page whatever the source did. A rotated page's geometry is in its
+    unrotated frame, so the usual horizontal test no longer describes the page.
     """
-    if item.kind != "heading":
+    if item.kind != "heading" or _page_rotation(page):
         return False
     sx0, _stop, sx1, _sbottom = item.source_box or item.box
     return (
@@ -1198,7 +1255,13 @@ def _insert_cell(page: Any, item: _Placement, pymupdf: Any, default_font: Path |
     fontname = _resource_name(font_file)
     align = _align_of(item, pymupdf)
     box = pymupdf.Rect(*item.box)
-    floor = max(item.size * _CELL_MIN_SCALE, 4.0)
+    # The source can set a cell's type larger than its row is tall (Debian's
+    # architecture table does exactly that). The usual scale floor then leaves
+    # no size that fits and every cell in the column would go blank; give a
+    # tight box a floor derived from its height, but never below the readable
+    # minimum.
+    floor = max(min(item.size * _CELL_MIN_SCALE, box.height / 1.7), 4.0)
+    rotate = _page_rotation(page)
 
     def fits(text: str) -> bool:
         size = item.size
@@ -1212,6 +1275,7 @@ def _insert_cell(page: Any, item: _Placement, pymupdf: Any, default_font: Path |
                 align=align,
                 lineheight=1.15,
                 color=item.color,
+                rotate=rotate,
             )
             if unused >= 0:
                 return True
@@ -1226,6 +1290,51 @@ def _insert_cell(page: Any, item: _Placement, pymupdf: Any, default_font: Path |
     if not source:
         return "source"
     return None
+
+
+def _cell_would_print(
+    item: _Placement, measurer: _Measurer, pymupdf: Any, page: Any
+) -> bool:
+    """Whether a cell can be reprinted at all — asked *before* it is redacted.
+
+    :func:`_insert_cell` falls back to the cell's own source text and answers
+    ``None`` only when neither that nor the translation fits the box at the
+    smallest readable size. By then the redaction has already removed the
+    source, so the cell becomes a hole in the page. A cell that cannot be
+    reprinted is therefore left exactly as the source drew it.
+    """
+    candidates = [(item.text or "").strip(), (item.source_text or "").strip()]
+    if not any(candidates):
+        return True  # an empty cell that stays empty has lost nothing
+    font_file = str(item.font_file or "")
+    if not font_file:
+        return True
+    fontname = _resource_name(font_file)
+    box = pymupdf.Rect(*item.box)
+    # The same ladder ``_insert_cell`` climbs: the translation at the source
+    # size, then down to the readable floor.
+    floor = max(min(item.size * _CELL_MIN_SCALE, box.height / 1.7), 4.0)
+    align = _align_of(item, pymupdf)
+    rotate = _page_rotation(page)
+    for candidate in candidates:
+        if not candidate:
+            continue
+        size = item.size
+        while size >= floor:
+            if measurer.fits(
+                box,
+                candidate,
+                fontname=fontname,
+                fontfile=font_file,
+                fontsize=size,
+                align=align,
+                lineheight=1.15,
+                color=item.color,
+                rotate=rotate,
+            ):
+                return True
+            size -= max(item.size * 0.05, 0.25)
+    return False
 
 
 @dataclass
@@ -1292,7 +1401,7 @@ class _Measurer:
         self._pymupdf = pymupdf
         self._document = pymupdf.open()
         self._page = self._document.new_page(
-            width=float(page.rect.width), height=float(page.rect.height)
+            width=_page_width(page), height=_page_height(page)
         )
 
     def fits(self, box: Any, text: str, **kwargs: Any) -> bool:
@@ -1443,6 +1552,7 @@ class _RunText:
                     fontfile=face,
                     fontsize=size,
                     color=item.color,
+                    rotate=_page_rotation(page),
                 )
                 x += self.advance(word, face, size)
                 printed += 1
@@ -1482,8 +1592,9 @@ def _insert(
         outcome = _insert_cell(page, item, pymupdf, default_font)
         return outcome, None, item.box[3] - item.box[1]
     x0, top, x1, bottom = item.box
-    limit = max(page.rect.height - _BOTTOM_MARGIN, bottom)
+    limit = max(_page_height(page) - _BOTTOM_MARGIN, bottom)
     box = (x0, top, x1, min(bottom, limit))
+    rotate = _page_rotation(page)
     if item.runs is not None:
         runs = _RunText(item, default_font, pymupdf)
         rest, used = runs.print(page, box, runs.words, item.size)
@@ -1510,6 +1621,7 @@ def _insert(
             align=align,
             lineheight=1.15,
             color=item.color,
+            rotate=rotate,
         )
 
     count = _head_that_fits(fits, tokens)
@@ -1526,6 +1638,7 @@ def _insert(
             fontfile=font_file,
             fontsize=item.size,
             color=item.color,
+            rotate=rotate,
         )
         return (
             "block",
@@ -1541,6 +1654,7 @@ def _insert(
         align=align,
         lineheight=1.15,
         color=item.color,
+        rotate=rotate,
     )
     rest = tokens[count:]
     if unused < 0:  # pragma: no cover - the probe and the page disagree
@@ -1551,6 +1665,7 @@ def _insert(
             fontfile=font_file,
             fontsize=item.size,
             color=item.color,
+            rotate=rotate,
         )
         return "block", _Overflow(item, text=_rejoin(rest)), item.size * _LINE_BAND
     return (
@@ -1580,6 +1695,7 @@ def _print_overflow(
         return (_Overflow(over.item, words=rest) if rest else None), used
     font_file = str(over.item.font_file or default_font)
     fontname = _resource_name(font_file)
+    rotate = _page_rotation(page)
     kwargs = {
         "fontname": fontname,
         "fontfile": font_file,
@@ -1587,6 +1703,7 @@ def _print_overflow(
         "align": _align_of(over.item, pymupdf),
         "lineheight": 1.15,
         "color": over.item.color,
+        "rotate": rotate,
     }
     tokens = _words_of(over.text)
     measurer = _Measurer(pymupdf, page)
@@ -1607,6 +1724,7 @@ def _print_overflow(
             fontfile=font_file,
             fontsize=size,
             color=over.item.color,
+            rotate=rotate,
         )
         # What was drawn up there cannot be measured, so the cursor skips the
         # whole box rather than risk printing over it.
@@ -1641,6 +1759,7 @@ class _Continuation:
         after: int,
         width: float,
         height: float,
+        rotation: int = 0,
     ) -> None:
         self._document = document
         self._pymupdf = pymupdf
@@ -1648,6 +1767,7 @@ class _Continuation:
         self._after = after
         self._width = width
         self._height = height
+        self._rotation = rotation % 360
         self._page: Any = None
         self._y = _TOP_MARGIN
 
@@ -1655,6 +1775,9 @@ class _Continuation:
         """Insert the page continuing the column below the last one."""
         index = self._after + 1 if self._page is None else self._page.number + 1
         self._page = self._document.new_page(pno=index, width=self._width, height=self._height)
+        # A continuation of a landscape page is landscape too: its geometry is
+        # in the same unrotated frame as the source's.
+        self._page.set_rotation(self._rotation)
         self._y = _TOP_MARGIN
 
     def carry(self, over: _Overflow) -> int:
@@ -1878,7 +2001,7 @@ def _carry_at_top(
             # where a reader expects the sentence to go on.
             start_at = max(start_at, resume[1])
         start, limit = _landing(
-            start_at, x0, x1, over.item.size, blockers, page.rect.height - _BOTTOM_MARGIN
+            start_at, x0, x1, over.item.size, blockers, _page_height(page) - _BOTTOM_MARGIN
         )
         if limit - start < over.item.size * _LINE_BAND:
             rest.extend(pending[index:])
@@ -1945,6 +2068,12 @@ def rebuild_pdf(
     shift = 0
     #: The tails this page could not hold, waiting for the top of the next one.
     pending: list[_Overflow] = []
+    #: The last page a translation was printed on, and that page's frame. A
+    #: tail still waiting at the end of the document continues there, *after*
+    #: the pages that follow it: those pages hold no translation, so a tail
+    #: printed past them (a rotated page kept as source, say) would land after
+    #: text that comes later in the book, in that page's quarter-turn.
+    carried: tuple[int, float, float, int] | None = None
     for page_no, page_items in sorted(by_page.items()):
         #: Where the source page stands now. Pages added to continue it go
         #: after, so this index never moves while the document grows.
@@ -1953,10 +2082,78 @@ def rebuild_pdf(
             stats.failures.append(f"page {page_no} is outside the document")
             continue
         page = document[src_index]
+        turn = _page_rotation(page)
+        if turn:
+            # A translated box for a rotated page needs the page's own quarter-
+            # turn to travel with the text: PyMuPDF lays a rotated textbox out
+            # along the unrotated axes, so a tight title box turns into one word
+            # per line and spills over dozens of pages. There is no silent
+            # fallback that keeps the table readable, so keep the source page.
+            # Read the turn first: inserting a page invalidates this handle.
+            if pending:
+                # A tail waiting for the top of this page cannot be printed on
+                # it — its source lines are exactly what this page keeps — and
+                # carrying it past the page would print it after text that comes
+                # later in the book. It takes the page before this one instead,
+                # in the frame of the page it started on.
+                shape = carried or (
+                    src_index - 1,
+                    _page_width(page),
+                    _page_height(page),
+                    0,
+                )
+                cont = _Continuation(
+                    document,
+                    pymupdf,
+                    font_file,
+                    after=src_index - 1,
+                    width=shape[1],
+                    height=shape[2],
+                    rotation=shape[3],
+                )
+                added = 0
+                for over in pending:
+                    added += cont.carry(over)
+                shift += added
+                stats.continued += added
+                stats.pages += added
+                pending = []
+            stats.kept += len(page_items)
+            stats.rotated_pages += 1
+            logger.warning(
+                "PDF rebuild: page {} is rotated {}°, kept its source layout",
+                page_no,
+                turn,
+            )
+            continue
         measurer = _Measurer(pymupdf, page)
+        carried = (src_index, _page_width(page), _page_height(page), turn)
         # The page's own fonts, so the ToUnicode repair below can tell them from
         # the ones our insertion adds.
         fonts_before = _font_xrefs(page)
+        # A cell neither its translation nor its own source can fit would be
+        # redacted into a hole. Decide against the scratch page first, and keep
+        # such a cell exactly as the source drew it.
+        printable_items = [
+            item
+            for item in page_items
+            if item.kind != "cell" or _cell_would_print(item, measurer, pymupdf, page)
+        ]
+        if len(printable_items) != len(page_items):
+            kept_cells = len(page_items) - len(printable_items)
+            stats.kept += kept_cells
+            logger.warning(
+                "PDF rebuild: {} cell(s) on page {} could not be reprinted at the "
+                "readable minimum; their source text is kept",
+                kept_cells,
+                page_no,
+            )
+            page_items = printable_items
+            if not page_items:
+                # Nothing left to replace on this page: its text, images and
+                # rules stay exactly as the source has them.
+                measurer.close()
+                continue
         for item in page_items:
             for x0, top, x1, bottom in item.redact:
                 page.add_redact_annot(pymupdf.Rect(x0, top, x1, bottom), fill=None, text=None)
@@ -1996,8 +2193,9 @@ def rebuild_pdf(
                     pymupdf,
                     font_file,
                     after=src_index - 1,
-                    width=float(page.rect.width),
-                    height=float(page.rect.height),
+                    width=_page_width(page),
+                    height=_page_height(page),
+                    rotation=_page_rotation(page),
                 )
                 added = 0
                 for over in pending:
@@ -2018,6 +2216,11 @@ def rebuild_pdf(
         for item in printable:
             used = 0.0
             start = item.box[1]
+            if _page_rotation(page) and item.runs is not None:
+                # The run path wraps words along x; on a rotated page its text
+                # runs along the unrotated y axis. The plain textbox path lets
+                # PyMuPDF lay the text out in the rotated frame instead.
+                item.runs = None
             if item.kind == "cell":
                 # A cell never moves: the grid the source drew is the layout,
                 # and its box is an anchor for the blocks around it.
@@ -2035,7 +2238,7 @@ def rebuild_pdf(
                     # otherwise have its last block cut shorter than the source
                     # set it — the rebuild must not refuse the room the page it
                     # rebuilds actually used.
-                    max(page.rect.height - _BOTTOM_MARGIN, bottom),
+                    max(_page_height(page) - _BOTTOM_MARGIN, bottom),
                 )
                 if limit - start < item.size * _LINE_BAND:
                     # Not one line of room before what stands below (or before
@@ -2073,16 +2276,23 @@ def rebuild_pdf(
         stats.repaired_maps += _repair_tounicode(document, page, fonts_before)
 
     if pending:
-        # The last page had more than it could hold: the tails still waiting get
-        # pages of their own, appended after the document's last page.
+        # The last page a translation reached had more than it could hold: the
+        # tails still waiting get pages of their own, right after it.
         last = document[document.page_count - 1]
+        after, width, height, rotation = carried or (
+            document.page_count - 1,
+            _page_width(last),
+            _page_height(last),
+            _page_rotation(last),
+        )
         cont = _Continuation(
             document,
             pymupdf,
             font_file,
-            after=document.page_count - 1,
-            width=float(last.rect.width),
-            height=float(last.rect.height),
+            after=after,
+            width=width,
+            height=height,
+            rotation=rotation,
         )
         added = 0
         for over in pending:
@@ -2097,7 +2307,8 @@ def rebuild_pdf(
     logger.info(
         "PDF rebuild: {} block(s) placed ({} cell(s) translated, {} kept in source), "
         "{} merged into the block above, {} kept as source, {} page(s) "
-        "({} added for text that continued overleaf), {} font map(s) repaired -> {}",
+        "({} added for text that continued overleaf), {} rotated page(s) kept "
+        "as source, {} font map(s) repaired -> {}",
         stats.placed,
         stats.cells,
         stats.cells_kept,
@@ -2105,6 +2316,7 @@ def rebuild_pdf(
         stats.kept,
         stats.pages,
         stats.continued,
+        stats.rotated_pages,
         stats.repaired_maps,
         out,
     )

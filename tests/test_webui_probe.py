@@ -8,10 +8,12 @@ a name that looks like a credential, and `--memory` never writes to the bank.
 
 from __future__ import annotations
 
+import io
 import json
 import os
 import subprocess
 import sys
+import urllib.error
 
 from webui.paths import REPO_ROOT
 
@@ -178,9 +180,7 @@ def test_plan_chunk_count_matches_the_real_chunker(tmp_path):
         ),
     )
 
-    proc = _run(
-        "--plan", str(doc), "--src", "vi", "--tgt", "en", "--max-tokens", "30", env=PLAN_ENV
-    )
+    proc = _run("--plan", str(doc), env={**PLAN_ENV, "CHUNK_MAX_TOKENS": "30"})
     assert proc.returncode == 0, proc.stderr
     plan = json.loads(proc.stdout)
 
@@ -190,14 +190,85 @@ def test_plan_chunk_count_matches_the_real_chunker(tmp_path):
     expected = len(chunk_document(load_document(doc), max_tokens=30, model="mock-model"))
     assert plan["chunks"] == expected > 1
     assert plan["model"] == "mock-model"
-    assert plan["output_path"].endswith("d.en.md")
+    assert plan["output_path"].endswith("d.vi.md")
 
 
 def test_plan_on_a_missing_file_exits_nonzero_with_stderr_only():
-    proc = _run("--plan", "does-not-exist.md", "--src", "vi", "--tgt", "en")
+    proc = _run("--plan", "does-not-exist.md")
     assert proc.returncode != 0
     assert proc.stdout.strip() == ""
     assert proc.stderr.strip()
     # Naming the input distinguishes probe's own error from the interpreter
     # merely failing to find probe.py itself.
     assert "does-not-exist.md" in proc.stderr
+
+
+def _fake_endpoint(monkeypatch, *, model="new-model", listed=None, chat_error=None):
+    """Point ``check_agent`` at a fake endpoint, recording every request made."""
+    calls: list[str] = []
+    configured = model
+
+    class Config:
+        base_url = "http://gw.local/v1"
+        model = configured
+        api_key = "sk-test"
+
+    class Response:
+        def __init__(self, payload):
+            self._payload = payload
+
+        def read(self):
+            return json.dumps(self._payload).encode("utf-8")
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+    def urlopen(request, timeout=None):
+        calls.append(request.full_url)
+        if request.full_url.endswith("/models"):
+            return Response({"data": [{"id": name} for name in (listed or [])]})
+        if chat_error is not None:
+            raise chat_error
+        return Response({"choices": []})
+
+    from webui import probe
+
+    monkeypatch.setattr("polyglot_lc.config.get_agent_config", lambda name: Config())
+    monkeypatch.setattr(probe.urllib.request, "urlopen", urlopen)
+    return calls
+
+
+def test_check_agent_trusts_the_model_list_and_pays_for_no_chat_call(monkeypatch):
+    """A resume used to spend two 8s chat timeouts proving a listed model exists."""
+    calls = _fake_endpoint(monkeypatch, listed=["old-model"])
+
+    from webui import probe
+
+    result = probe.check_agent("TRANSLATOR", "old-model")
+
+    assert result["test"]["ok"] is True
+    assert calls == ["http://gw.local/v1/models"]
+
+
+def test_check_agent_pings_once_when_the_list_does_not_carry_the_model(monkeypatch):
+    """The chat probe is the fallback, and a refusal is not retried twice."""
+    error = urllib.error.HTTPError(
+        "http://gw.local/v1/chat/completions",
+        404,
+        "not found",
+        {},
+        io.BytesIO(b'{"error":"model_not_found"}'),
+    )
+    calls = _fake_endpoint(monkeypatch, listed=[], chat_error=error)
+
+    from webui import probe
+
+    result = probe.check_agent("TRANSLATOR", "old-model")
+
+    assert result["test"]["ok"] is False
+    assert result["test"]["status"] == 404
+    chat_calls = [url for url in calls if url.endswith("/chat/completions")]
+    assert len(chat_calls) == 1

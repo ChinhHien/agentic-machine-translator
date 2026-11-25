@@ -13,6 +13,7 @@ from polyglot_lc.ingest.md import parse_markdown
 from polyglot_lc.ingest.model import Block, Document
 from polyglot_lc.ingest.pdf_layout import (
     _build_units,
+    _cell_text,
     _classify,
     _demote_continuation_headings,
     _line_spacing,
@@ -989,6 +990,27 @@ def test_bullet_lines_become_list_items_with_wrapped_continuation():
     ]
 
 
+def test_a_bullet_reported_as_a_control_byte_still_makes_a_list_item():
+    """The same shape in a Symbol-encoded face, whose glyph arrives as ``\x01``.
+
+    Nothing in the Markdown may carry the byte: it is not text, and the rebuild
+    prints it as a box.
+    """
+    lines = [
+        _line(["\x01", "Location", "of", "the", "source"], top=200.0),
+        _line(["\x7f", "Rough", "sketch", "of", "the", "flow", "sheet"], top=215.2),
+        _line(["\x08P", "=", "pressure", "drop"], top=240.0),
+    ]
+    md = pages_to_markdown([_page(lines)])
+    # A blank line separates the list from the paragraph that follows it.
+    assert [line for line in md.split("\n") if line] == [
+        "- Location of the source",
+        "- Rough sketch of the flow sheet",
+        "P = pressure drop",
+    ]
+    assert not any(ord(ch) < 32 and ch != "\n" for ch in md)
+
+
 # ------------------------------ glyph artefacts -----------------------------
 def test_normalize_glyphs_collapses_doubled_ligature_and_expands():
     """This PDF doubles the ligature glyph and writes it as one codepoint."""
@@ -1014,6 +1036,75 @@ def test_normalize_glyphs_leaves_legitimate_vietnamese_alone():
     """'Â' and 'â' are real Vietnamese letters; only the mojibake pairs go."""
     text = "Ấn phẩm này nói về chữ Â và â, ế, ơ, ư."
     assert normalize_glyphs(text) == text
+
+
+def test_a_line_with_no_space_glyphs_still_splits_its_words():
+    """Some faces set the word gap *tighter* than a font that writes spaces.
+
+    Page 32 of ``c_allchs.pdf`` spaces its words 0.098 em apart with no space
+    glyph anywhere on the line; the ordinary threshold read that as kerning and
+    glued the paragraph into ``however,netpresentvalueanalysishaslimitations``.
+    """
+    size = 12.0
+    tight = _chars(["However,", "net"], x0=56.0, size=size, font="Times-Roman", word_gap=1.18)
+    assert line_text(tight) == "However, net"
+
+
+def test_the_tighter_rule_does_not_split_a_word_in_a_line_that_writes_spaces():
+    """The looser ratio is only for a line with no space glyph to trust.
+
+    A face that does write spaces says where its words end, so a gap of 0.098 em
+    between two of its letters is kerning — putting a space there splits a word.
+    """
+    size = 12.0
+    chars = _chars(["net", "present"], x0=56.0, size=size, font="Times", word_gap=1.18)
+    chars.insert(3, {"text": " ", "x0": 74.0, "x1": 75.18, "size": size, "fontname": "Times"})
+    assert line_text(chars) == "net present"
+
+
+def test_a_symbol_font_bullet_becomes_a_bullet_not_a_control_byte():
+    """A Symbol-encoded bullet has no Unicode map, so pdfplumber reports its byte.
+
+    ``c_allchs.pdf`` sets bullets in ``MSTT31c71d`` (``\x01``) and in Times
+    (``\x7f``). The byte reached the translator, survived into the Markdown, and
+    printed as a missing-glyph box on the rebuilt page.
+    """
+    assert normalize_glyphs("\x01 Location of the source") == "• Location of the source"
+    assert normalize_glyphs("\x7f Identification of alternatives") == (
+        "• Identification of alternatives"
+    )
+    # This PDF writes the same bullet three or eight times before the item.
+    assert normalize_glyphs("\x01\x01\x01Constant time:") == "•Constant time:"
+    assert normalize_glyphs("\x03") == ""
+
+
+def test_a_table_cell_keeps_its_bullets_and_its_degrees():
+    """A cell never goes through the line path, so it needs its own normalising.
+
+    ``c_allchs.pdf`` uses that same byte for a bullet inside a cell and for the
+    degree sign of its temperature headings, and the line decides which: a byte
+    opening one of the cell's lines is a bullet, one before a unit letter is the
+    unit's degree sign.
+    """
+    assert _cell_text("\x01 Process selection\n\x01 Sizing") == "• Process selection • Sizing"
+    assert _cell_text("Valid Temperature Range (\x01F)") == "Valid Temperature Range (°F)"
+    assert _cell_text("(\x01R) (\x01F)") == "(°R) (°F)"
+    assert _cell_text("70\x01F") == "70°F"
+    # A byte before anything but a unit letter is not a degree sign.
+    assert _cell_text("(\x02h)") == "( h)"
+
+
+def test_a_control_byte_inside_a_line_is_not_mistaken_for_a_bullet():
+    """``\x08P`` is a Symbol-font 'Δ', and turning it into a bullet invents a list.
+
+    Anywhere but the start of a line the byte stood for an inline symbol, so it
+    goes: the words around it must not run together either.
+    """
+    assert normalize_glyphs("\x08P = total system pressure drop") == (
+        "P = total system pressure drop"
+    )
+    assert normalize_glyphs("a \x7f b") == "a b"
+    assert normalize_glyphs("\x01P = pressure drop") == "P = pressure drop"
 
 
 # ------------------------------- contents page -------------------------------
@@ -1183,4 +1274,14 @@ def test_geometry_and_block_font_are_unchanged():
     # `_face` reads the bare name (it drops the subset prefix), and the first
     # line of this block is the plain one, so the block stays regular.
     assert geo["font"] == BODY.split("+")[-1] and geo["bold"] is False
-    assert set(geo) == {"rects", "size", "kind", "font", "bold", "italic", "color", "markers"}
+    assert set(geo) == {
+        "rects",
+        "size",
+        "kind",
+        "font",
+        "bold",
+        "italic",
+        "color",
+        "markers",
+        "rotation",
+    }

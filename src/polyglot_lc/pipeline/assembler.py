@@ -8,6 +8,7 @@ import os
 import re
 import statistics
 import threading
+import time
 from pathlib import Path
 from typing import Any
 
@@ -692,6 +693,11 @@ def output_paths(
     base = Path(str(out)) if out else Path(f"{Path(file_path).stem}.{tgt}.md")
     if base.suffix.lower() == ".pdf":
         base = base.with_suffix(".md")
+    elif not base.suffix:
+        # ``--out report`` names the base of the pair; the Markdown half still
+        # needs its extension. Leaving it suffix-less wrote a file called
+        # ``report`` while help and the web UI expected ``report.md``.
+        base = base.with_suffix(".md")
     return base, base.with_suffix(".pdf")
 
 
@@ -713,5 +719,17 @@ def write_atomic(path: Path, text: str) -> None:
     """
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_name(f"{path.name}.{os.getpid()}.{threading.get_ident()}.tmp")
-    tmp.write_text(text, encoding="utf-8")
-    tmp.replace(path)
+    try:
+        tmp.write_text(text, encoding="utf-8")
+        # A reader (or an editor, or a sync client) can hold the target open on
+        # Windows; replacing it then fails with PermissionError. Retry briefly,
+        # then write in place rather than lose the assembled document.
+        for attempt in range(6):
+            try:
+                tmp.replace(path)
+                return
+            except PermissionError:
+                time.sleep(0.05 * (attempt + 1))
+        path.write_text(text, encoding="utf-8")
+    finally:
+        tmp.unlink(missing_ok=True)

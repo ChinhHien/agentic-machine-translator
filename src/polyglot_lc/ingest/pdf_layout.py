@@ -79,7 +79,7 @@ from typing import Any
 
 from loguru import logger
 
-from polyglot_lc import emphasis
+from polyglot_lc import emphasis, typography
 from polyglot_lc.ingest.md import markdown_table, parse_markdown
 from polyglot_lc.ingest.model import Document
 
@@ -88,6 +88,16 @@ _MONO_MARKERS = ("CMTT", "Courier", "Mono", "Consolas", "Menlo", "Typewriter")
 
 #: A horizontal glyph gap wider than this fraction of the font size is a space.
 _SPACE_GAP_RATIO = 0.10
+
+#: The same rule for a line that carries no space glyph at all. Some fonts emit
+#: inter-word spacing as positioning only, and set it *tighter* than a font that
+#: does write spaces: page 32 of ``c_allchs.pdf`` gaps its words by 0.098 em,
+#: which the ordinary threshold reads as kerning and glues the whole line into
+#: ``However,netpresentvalueanalysishaslimitations``. Where there is no space
+#: glyph to compare against, the gaps themselves are the only evidence, and the
+#: in-word kerning of these faces is negative — measured across the document, no
+#: gap between 0.05 and 0.10 em in a space-bearing line is ever a word gap.
+_SPACE_GAP_RATIO_TIGHT = 0.06
 
 #: Fraction of monospace glyphs that makes a line a line of code.
 _CODE_RATIO = 0.75
@@ -166,8 +176,31 @@ _LABEL_WIDTH_SHARE = 0.45
 #: Bullet glyphs: unmapped PDF bullets plus real bullet characters.  A dash or
 #: asterisk only counts when a space follows it, so a wrapped line is not
 #: mistaken for a list item.
-_BULLETS = ("(cid:136)", "(cid:127)", "(cid:149)", "•", "●", "◦", "·")
+#:
+#: The control characters are how a Symbol/Wingdings bullet arrives: the font is
+#: written with no usable Unicode map, so pdfplumber reports the glyph's byte
+#: (``\x01`` in ``MSTT31c71d``, ``\x7f`` in Times) instead of a bullet. They are
+#: bullets all the same, and a line that opens with one is a list item — see
+#: :func:`_starts_with_bullet` and :func:`_control_symbol`. The list holds the
+#: two this project's PDFs actually use; :data:`_CONTROL_SYMBOLS` accepts the
+#: rest of the range.
+_BULLETS = ("(cid:136)", "(cid:127)", "(cid:149)", "•", "●", "◦", "·", "\x01", "\x7f")
 _BULLET_CHARS = "-*"
+
+#: Characters that stand in for a symbol font's glyph, as one contiguous range.
+_CONTROL_SYMBOLS = "\x00-\x1f\x7f"
+#: A whole run of them: the same bullet is often repeated before an item.
+_CONTROL_SYMBOL_RE = re.compile(f"[{_CONTROL_SYMBOLS}]+")
+#: The same run where it opens a line — the item's bullet, before any text.
+_LEADING_SYMBOL_RE = re.compile(f"^[{_CONTROL_SYMBOLS}\\s]*[{_CONTROL_SYMBOLS}]")
+#: The bullet printed for a symbol-font bullet glyph.
+_BULLET_CHAR = "•"
+
+#: A degree sign the text layer lost. The property tables write the temperature
+#: headings as ``(\x01R)`` and ``(\x01F)`` and the values as ``70\x01F``, the
+#: byte standing for the ``°``; nothing else in this PDF puts one in front of a
+#: unit letter, so this is a narrow recovery rather than a guess.
+_DEGREE_RE = re.compile(f"[{_CONTROL_SYMBOLS}]\\s*(?=[FRCK](?:\\b|\\)))|(?<=\\()[{_CONTROL_SYMBOLS}]+(?=[FRCK])")
 
 #: Leading CMTT advance is 0.525 em; code indentation is restored from x-offset.
 _MONO_ADVANCE = 0.525
@@ -238,8 +271,8 @@ def normalize_toc_lines(markdown: str) -> str:
     return re.sub(r"\n{3,}", "\n\n", "\n".join(kept))
 
 
-def normalize_glyphs(text: str) -> str:
-    """Fix text-layer artifacts: ligature glyphs and UTF-8 mojibake.
+def normalize_glyphs(text: str, *, bullets: bool = True) -> str:
+    """Fix text-layer artifacts: ligature glyphs, mojibake and symbol glyphs.
 
     The PDF text layer repeats a ligature glyph where the font maps one glyph
     to a two-letter sequence, so ``effect`` arrives as ``e`` + ``ﬀ`` + ``ﬀ`` +
@@ -252,7 +285,46 @@ def normalize_glyphs(text: str) -> str:
     # Longest first: "â€™" must not be clipped to "â€" + a stray quote.
     for bad, good in sorted(_MOJIBAKE.items(), key=lambda item: -len(item[0])):
         text = text.replace(bad, good)
+    text = _strip_control_symbols(text, bullets=bullets)
     return text
+
+
+def _strip_control_symbols(text: str, *, bullets: bool = True) -> str:
+    """Replace a symbol font's control-character glyphs in *text*.
+
+    A Symbol-encoded mark has no Unicode mapping, so pdfplumber reports its byte
+    (``\x01`` in ``MSTT31c71d``, ``\x7f`` in Times). That byte is never text: it
+    reaches the translator as a stray control character, survives into the
+    Markdown, and prints as a missing-glyph box on the rebuilt page.
+
+    A run opening a line is that item's bullet, and becomes :data:`_BULLET_CHAR`
+    so the line is still recognised as a list item and the rebuild prints a real
+    bullet. Anywhere else the byte stood for an inline symbol the text no longer
+    carries (``ΔP`` arrives as ``\x08P``), so it becomes a space rather than
+    silently joining the words around it. A line that is *only* such bytes is a
+    stray mark with nothing to say, and becomes empty.
+
+    ``bullets=False`` switches that first rule off, for a table cell: a cell's
+    leading byte is not a list marker (the temperature headings of the property
+    tables are ``(\x01R)``, a degree sign), and printing a bullet into a cell
+    would put a mark there that the source never had.
+    """
+    if not _CONTROL_SYMBOL_RE.search(text):
+        return text
+    body = _LEADING_SYMBOL_RE.sub("", text)
+    if not body.strip():
+        return ""  # a stray mark with no words around it
+    # A bullet is a mark with nothing attached to it: a space follows the run, or
+    # the same byte is repeated (this PDF writes three or eight copies). A mark
+    # butted against a letter is an inline symbol instead (ΔP arrives as
+    # ``\x08P``), and is dropped so the words do not run together.
+    run = len(text) - len(body)
+    follows = text[run : run + 1]
+    bullet = bullets and (run > 1 or follows in {" ", "\t", ""})
+    body = _DEGREE_RE.sub("°", body)
+    body = _CONTROL_SYMBOL_RE.sub(" ", body)
+    text = f"{_BULLET_CHAR}{body}" if bullet else body
+    return re.sub(r" {2,}", " ", text).strip()
 
 
 #: Cheap language guess for the code fence (the book this was built for is Java).
@@ -284,9 +356,12 @@ def _is_mono(font: str) -> bool:
 
 
 def _font_style(font: str) -> tuple[bool, bool]:
-    """``(bold, italic)`` read off a font name (``Verdana-Bold`` -> bold)."""
-    lowered = font.lower()
-    return "bold" in lowered, ("italic" in lowered or "oblique" in lowered)
+    """``(bold, italic)`` read off a font name (``Verdana-Bold`` -> bold).
+
+    Shared with the rebuild (:mod:`polyglot_lc.typography`) so a heading the
+    extractor records as bold is the one the PDF prints in its bold face.
+    """
+    return typography.font_style(font)
 
 
 def _rgb(value: Any) -> tuple[float, ...] | None:
@@ -401,6 +476,18 @@ def _superscript(ch: dict[str, Any], size: float, baseline: float | None) -> str
     return mapped if mapped != str(ch["text"]) else None
 
 
+def _space_gap_ratio(chars: list[dict[str, Any]]) -> float:
+    """The gap that separates words on this line, in fractions of the size.
+
+    A line whose glyphs include space characters says where its words end, so
+    the ordinary ratio is enough. One without any is spacing by positioning
+    alone, and its word gaps may be tighter than a font that writes spaces.
+    """
+    if any(str(ch.get("text")) == " " for ch in chars):
+        return _SPACE_GAP_RATIO
+    return _SPACE_GAP_RATIO_TIGHT
+
+
 def line_spans(chars: Iterable[dict[str, Any]]) -> list[tuple[str, bool, bool]]:
     """A line's text split into runs of one style, in reading order.
 
@@ -415,6 +502,7 @@ def line_spans(chars: Iterable[dict[str, Any]]) -> list[tuple[str, bool, bool]]:
     """
     ordered = sorted(chars, key=lambda c: c["x0"])
     size, baseline = _baseline(ordered)
+    ratio = _space_gap_ratio(ordered)
     runs: list[tuple[str, bool, bool]] = []
     prev: dict[str, Any] | None = None
     for ch in ordered:
@@ -426,7 +514,7 @@ def line_spans(chars: Iterable[dict[str, Any]]) -> list[tuple[str, bool, bool]]:
             text = raised
         else:
             gap = ""
-            if prev is not None and float(ch["x0"]) - float(prev["x1"]) > _SPACE_GAP_RATIO * max(
+            if prev is not None and float(ch["x0"]) - float(prev["x1"]) > ratio * max(
                 float(prev["size"]), 1.0
             ):
                 gap = " "
@@ -534,6 +622,7 @@ def line_text(chars: Iterable[dict[str, Any]]) -> str:
     """
     ordered = sorted(chars, key=lambda c: c["x0"])
     size, baseline = _baseline(ordered)
+    ratio = _space_gap_ratio(ordered)
     out: list[str] = []
     prev: dict[str, Any] | None = None
     for ch in ordered:
@@ -544,7 +633,7 @@ def line_text(chars: Iterable[dict[str, Any]]) -> str:
             continue
         if prev is not None:
             gap = float(ch["x0"]) - float(prev["x1"])
-            if gap > _SPACE_GAP_RATIO * max(float(prev["size"]), 1.0):
+            if gap > ratio * max(float(prev["size"]), 1.0):
                 out.append(" ")
         out.append(str(ch["text"]))
         prev = ch
@@ -961,8 +1050,17 @@ _CELL_ALIGN_TOLERANCE = 2.0
 
 
 def _cell_text(value: Any) -> str:
-    """One table cell as a single line of text."""
-    return " ".join(str(value or "").split())
+    """One table cell as a single line of text.
+
+    A cell is read straight out of pdfplumber's table matrix, so it never goes
+    through :func:`line_text`, and a symbol font's bytes would otherwise reach
+    the translator and print as missing-glyph boxes. Normalising line by line is
+    what tells the two cases apart: a byte that opens one of the cell's own lines
+    is that line's bullet, while one inside a line is an inline symbol — the
+    property tables write ``(\x01R)`` for ``(°R)``.
+    """
+    lines = [normalize_glyphs(part) for part in str(value or "").splitlines()]
+    return " ".join(" ".join(lines).split())
 
 
 def _cell_box(value: Any) -> Cell | None:
@@ -1849,7 +1947,76 @@ def _units_for_block(
     return None
 
 
-def bind_page_geometry(doc: Document, units: list[_Unit]) -> int:
+#: ``(rotation, crop_x, crop_y, width, height)`` for one pdfplumber page.
+_PageTransform = tuple[int, float, float, float, float]
+
+
+def _page_transforms(pages: list[Any]) -> dict[int, _PageTransform]:
+    """Per-page map from pdfplumber's frame to PyMuPDF's display frame.
+
+    pdfplumber reports text at MediaBox coordinates and in the unrotated page
+    frame. PyMuPDF's page rectangles — and therefore every redaction and
+    insertion the rebuild makes — start at the CropBox origin and are already
+    rotated for display. An inset CropBox (many print-ready PDFs carry a 1 cm
+    bleed) or a page with ``/Rotate 90`` would otherwise have the translation
+    printed at the wrong place, over source text the redaction did not reach.
+    """
+    transforms: dict[int, _PageTransform] = {}
+    for page_no, page in enumerate(pages):
+        rotation = int(getattr(page, "rotation", 0) or 0) % 360
+        crop = getattr(page, "cropbox", None)
+        x0, y0 = (float(crop[0]), float(crop[1])) if crop else (0.0, 0.0)
+        if rotation == 0:
+            width = float(crop[2]) - x0 if crop else float(getattr(page, "width", 0.0))
+            height = float(crop[3]) - y0 if crop else float(getattr(page, "height", 0.0))
+        else:
+            # pdfplumber keeps the source coordinates in this orientation even
+            # though it reports the displayed width/height.
+            width = float(getattr(page, "width", 0.0))
+            height = float(getattr(page, "height", 0.0))
+        if rotation or x0 or y0:
+            transforms[page_no] = (rotation, x0, y0, width, height)
+    return transforms
+
+
+def _transform_rect(
+    rect: tuple[int, float, float, float, float],
+    transform: _PageTransform | None,
+) -> tuple[int, float, float, float, float]:
+    """A source rectangle in PyMuPDF's CropBox-relative, rotated page frame."""
+    if transform is None:
+        return rect
+    rotation, dx, dy, width, height = transform
+    page, x0, top, x1, bottom = rect
+    x0, x1 = x0 - dx, x1 - dx
+    top, bottom = top - dy, bottom - dy
+    if rotation == 0:
+        return (page, x0, top, x1, bottom)
+    if rotation == 90:
+        return (page, top, width - x1, bottom, width - x0)
+    if rotation == 180:
+        return (page, width - x1, height - bottom, width - x0, height - top)
+    if rotation == 270:
+        return (page, height - bottom, x0, height - top, x1)
+    return rect  # pragma: no cover - /Rotate is only defined in quarter turns
+
+
+def _transform_cell(cell: list[Any], transform: _PageTransform | None) -> list[Any]:
+    """A table cell's box in the same frame, leaving its style fields intact."""
+    if transform is None or len(cell) < 4:
+        return cell
+    x0, top, x1, bottom, *rest = cell
+    page, tx0, ttop, tx1, tbottom = _transform_rect(
+        (0, x0, top, x1, bottom), transform
+    )
+    return [tx0, ttop, tx1, tbottom, *rest]
+
+
+def bind_page_geometry(
+    doc: Document,
+    units: list[_Unit],
+    page_transforms: dict[int, _PageTransform] | None = None,
+) -> int:
     """Attach each block's source rectangles as ``block.meta["pdf"]``.
 
     Every block is matched to the units it was *parsed from*, by text (see
@@ -1862,6 +2029,11 @@ def bind_page_geometry(doc: Document, units: list[_Unit]) -> int:
     A block that cannot be verified is not rebuilt at all (its source text
     stays), which is the honest outcome: a mis-bound rectangle would print the
     translation over the wrong lines. Returns how many blocks were bound.
+
+    *page_transforms* converts pdfplumber's MediaBox coordinates into the frame
+    PyMuPDF uses for redaction and insertion (CropBox origin, displayed
+    rotation). It is optional so callers that already hold page-sized
+    coordinates stay valid.
     """
     keys = [_unit_key(unit.text, unit.kind) for unit in units]
     cursor = 0
@@ -1882,8 +2054,14 @@ def bind_page_geometry(doc: Document, units: list[_Unit]) -> int:
             )
         owned = units[index : index + span]
         markers = [mark for unit in owned for mark in unit.markers if mark]
+        page = owned[0].rects[0][0] if owned[0].rects else -1
+        transform = (page_transforms or {}).get(page)
         geometry: dict[str, Any] = {
-            "rects": [rect for unit in owned for rect in unit.rects],
+            "rects": [
+                _transform_rect(rect, (page_transforms or {}).get(rect[0]))
+                for unit in owned
+                for rect in unit.rects
+            ],
             "size": max((unit.size for unit in owned), default=0.0),
             "kind": owned[0].kind,
             # How the source set this block: the rebuild prints the translation
@@ -1894,11 +2072,19 @@ def bind_page_geometry(doc: Document, units: list[_Unit]) -> int:
             "color": owned[0].color,
             # The markers the list's items carried, item by item.
             "markers": markers,
+            # /Rotate of the source page. A rebuild has to lay text along the
+            # page's own axis and print it back upright.
+            "rotation": transform[0] if transform else 0,
         }
         # A table also carries where each of its cells is, so the rebuild can
         # print the translation of a cell inside that cell's own box.
         if owned[0].kind == "table" and owned[0].cells:
-            geometry["cells"] = owned[0].cells
+            # Tables live on one page, but a cell's page is not stored in it;
+            # use the table's own first rectangle for the page origin.
+            geometry["cells"] = [
+                [_transform_cell(cell, transform) if cell else cell for cell in row]
+                for row in owned[0].cells
+            ]
         block.meta["pdf"] = geometry
         cursor = index + span
         bound += 1
@@ -1924,6 +2110,7 @@ def load_pdf_layout(data: bytes) -> Document:
     with pdfplumber.open(io.BytesIO(data)) as pdf:
         pages = list(pdf.pages)
         units = _build_units(pages)
+        page_transforms = _page_transforms(pages)
         markdown = render_markdown(units)
     if not markdown.strip():
         raise ValueError("Layout extractor found no text in the PDF")
@@ -1933,6 +2120,6 @@ def load_pdf_layout(data: bytes) -> Document:
         source_format="pdf",
         extra_metadata={"converter": "layout", "pages": len(pages)},
     )
-    bind_page_geometry(doc, units)
+    bind_page_geometry(doc, units, page_transforms)
     logger.debug("Layout extractor: {} pages -> {} blocks", len(pages), len(doc.blocks))
     return doc

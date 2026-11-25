@@ -3,8 +3,8 @@
 The pipeline translates English into Vietnamese by default, and every document
 goes through the same Translator prompt, so there is one skill, not one per
 language pair: ``skills/skill.md`` is read by every run and promoted by every
-run. Its history and its version snapshots sit beside it (``history.jsonl``,
-``versions/v<N>.md``); an older per-pair file such as
+run. A promotion overwrites that one file; no old snapshots are kept. Its
+run history sits beside it (``history.jsonl``). An older per-pair file such as
 ``skills/en-vi/skill.md`` is still read when no global skill exists, and the
 next promotion writes the global one.
 
@@ -23,6 +23,7 @@ candidate has to beat. Schema 1 files (no ``schema`` line) still load: their
 
 from __future__ import annotations
 
+import functools
 import hashlib
 import json
 import math
@@ -30,6 +31,7 @@ import os
 import re
 import threading
 import time
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Iterable
 
@@ -133,29 +135,93 @@ def _clean_scores(values: Iterable[Any]) -> list[float]:
     return out
 
 
+def _promotion_locked(method):
+    """Serialize a whole promotion behind :meth:`SkillStore._promotion_lock`."""
+
+    @functools.wraps(method)
+    def wrapper(self, *args, **kwargs):
+        with self._promotion_lock():
+            return method(self, *args, **kwargs)
+
+    return wrapper
+
+
 class SkillStore:
     """Reads/writes the system's single ``skills/skill.md`` skill file."""
 
     def __init__(self, skills_dir: str | Path) -> None:
         self.dir = Path(skills_dir)
 
+    @contextmanager
+    def _promotion_lock(self):
+        """One promoter at a time, across processes sharing this directory.
+
+        A directory create is atomic on every platform; a stale lock (a crash
+        mid-promotion) is cleared after 30 seconds. Best-effort: if the lock
+        cannot be had within five seconds, promotion proceeds — a slightly
+        early overwrite is preferable to a skill that can never be promoted.
+        """
+        self.dir.mkdir(parents=True, exist_ok=True)
+        lock = self.dir / ".lock"
+        acquired = False
+        deadline = time.monotonic() + 5.0
+        while True:
+            try:
+                lock.mkdir()
+                acquired = True
+                break
+            except FileExistsError:
+                try:
+                    stale = time.time() - lock.stat().st_mtime > 30.0
+                except FileNotFoundError:
+                    continue
+                except OSError:
+                    stale = False
+                if stale:
+                    try:
+                        lock.rmdir()
+                    except OSError:
+                        pass
+                    continue
+                if time.monotonic() >= deadline:
+                    logger.warning("Skill: promotion lock busy; continuing without it")
+                    break
+                time.sleep(0.05)
+        try:
+            yield
+        finally:
+            if acquired:
+                try:
+                    lock.rmdir()
+                except OSError:
+                    pass
+
     @property
     def path(self) -> Path:
         return self.dir / "skill.md"
 
-    @property
-    def versions_dir(self) -> Path:
-        return self.dir / "versions"
-
     def _legacy_path(self) -> Path | None:
-        """A pre-global ``skills/<pair>/skill.md``, if one is still around."""
+        """A pre-global ``skills/<pair>/skill.md``, if one is still around.
+
+        With more than one legacy pair the right one cannot be inferred: the
+        old layout stored a different skill per language pair, and this store
+        has no pair of its own. Refuse to guess rather than load another pair's
+        skill into every prompt.
+        """
         if not self.dir.is_dir():
             return None
+        candidates: list[Path] = []
         for child in sorted(self.dir.iterdir()):
             candidate = child / "skill.md"
             if child.is_dir() and candidate.exists():
-                return candidate
-        return None
+                candidates.append(candidate)
+        if len(candidates) > 1:
+            logger.warning(
+                "Skill: {} legacy per-pair skills found; ignoring all of them",
+                len(candidates),
+            )
+            return None
+        return candidates[0] if candidates else None
 
     # ------------------------------------------------------------------ read
     @staticmethod
@@ -187,6 +253,9 @@ class SkillStore:
         same section: the file is meant to be readable and editable by hand,
         and a heading level is not content.
         """
+        # A hand editor disables a line by wrapping it in an HTML comment; a
+        # comment is not rendered, so it must not reach the prompt or the id.
+        body = re.sub(r"<!--.*?-->", "", body, flags=re.DOTALL)
         collected: dict[str, list[str]] = {name: [] for name in _SECTIONS}
         current: str | None = None
         for line in body.splitlines():
@@ -334,6 +403,7 @@ class SkillStore:
         parts.append(f"Rationale\n{rationale.strip()}")
         return "\n\n".join(parts)
 
+    @_promotion_locked
     def save(
         self,
         *,
@@ -346,12 +416,13 @@ class SkillStore:
         version: int | None = None,
         scope: str = "system",
     ) -> Path:
-        """Promote the system skill atomically, preserving scores and versions.
+        """Replace the one system skill file with this content.
 
-        *mean_score* is a measurement of **this** content, so a freshly
-        promoted skill leaves it unset; the run that uses it records the number.
-        *baseline_mean* is the score of the version being replaced and defaults
-        to its recorded measurement.
+        No old copy is written: ``skill.md`` is the source of truth, and the
+        next promotion overwrites it in place. *mean_score* is a measurement of
+        **this** content, so a freshly promoted skill leaves it unset; the run
+        that uses it records the number. *baseline_mean* is the score of the
+        content being replaced and defaults to its recorded measurement.
         """
         text = (instruction or "").strip()
         if not text:
@@ -372,7 +443,9 @@ class SkillStore:
 
         old = self.load()
         now = time.time()
-        number = version or ((old["version"] + 1) if old else 1)
+        highest = int(old.get("version", 0) or 0) if old is not None else 0
+        number = int(version) if version is not None else highest + 1
+        number = max(number, highest + 1)
         new_id = skill_id_for(text, examples)
         measured = None if mean_score is None else round(float(mean_score), 3)
         if baseline_mean is not None:
@@ -398,9 +471,6 @@ class SkillStore:
             meta["mean_score"] = measured
         body = self._body(text, examples, rationale)
         self._write(self.path, meta, body)
-        # A snapshot per version: promotion overwrites the file, and "what did
-        # v2 actually say" must stay answerable (and restorable).
-        self._write(self.versions_dir / f"v{number}.md", meta, body)
         return self.path
 
     @staticmethod
@@ -528,33 +598,6 @@ class SkillStore:
         }
         self.record_history(row)
         return row
-
-    # ------------------------------------------------------------ versions
-    def restore(self, version: int) -> Path:
-        """Put a stored version back as the current skill, recording that act."""
-        source = self.versions_dir / f"v{version}.md"
-        if not source.exists():
-            raise FileNotFoundError(f"no stored version v{version} in {self.dir}")
-        text = source.read_text(encoding="utf-8")
-        meta, body = self._parse(text)
-        if meta is None or not self._parse_body(body)["instruction"]:
-            raise ValueError(f"stored version v{version} is not a readable skill")
-        meta["updated_at"] = time.time()
-        self._write(self.path, meta, body)
-        self.record_history(
-            {
-                "run_id": "",
-                "doc": "",
-                "pair": "",
-                "skill_id": str(meta.get("skill_id", "")),
-                "version": version,
-                "n": 0,
-                "mean": None,
-                "promoted": False,
-                "reason": "restored",
-            }
-        )
-        return self.path
 
     def validate(self) -> list[str]:
         """Everything wrong with the system skill file, as readable sentences."""

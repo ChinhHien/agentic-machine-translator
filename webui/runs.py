@@ -20,6 +20,7 @@ import threading
 import time
 import uuid
 from collections.abc import Callable
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Any
 
@@ -47,6 +48,9 @@ _PROBE = Path(__file__).with_name("probe.py")
 
 #: Exit code that means the run finished its work.
 EXIT_OK = 0
+#: The run wrote its files, but at least one chunk never got a verified
+#: checkpoint. It is not a crash, and it is not a finished translation either.
+EXIT_INCOMPLETE = 2
 
 #: How long a stopped run may take to die before we escalate once.
 STOP_TIMEOUT = 5.0
@@ -124,9 +128,7 @@ PERMANENT_HINTS = (
 #: started, and a resumed run replays it verbatim so it keeps hitting the very
 #: same checkpoints. An option the CLI has since dropped would stop the child
 #: before it started, so a stored command is filtered down to these first.
-CLI_VALUE_OPTIONS = frozenset(
-    {"--file", "--src", "--tgt", "--glossary", "--max-tokens", "--out", "--format"}
-)
+CLI_VALUE_OPTIONS = frozenset({"--file", "--out", "--format"})
 CLI_FLAGS = frozenset({"--quiet", "--resume"})
 
 
@@ -175,6 +177,21 @@ def _current_options(argv: list[str]) -> list[str]:
         elif not separator and index < len(argv) and not argv[index].startswith("--"):
             index += 1
     return kept
+
+
+def _with_format(argv: list[str], fmt: str) -> list[str]:
+    """*argv* with ``--format`` set to *fmt* (added when the command has none)."""
+    out = list(argv)
+    try:
+        index = out.index("--format")
+    except ValueError:
+        out += ["--format", fmt]
+        return out
+    if index + 1 < len(out):
+        out[index + 1] = fmt
+    else:
+        out.append(fmt)
+    return out
 
 
 def _note(record: RunRecord, text: str) -> None:
@@ -356,43 +373,76 @@ class RunManager:
         # the field empty, so they track the config that is in effect now.
         if record.translator_model:
             env["TRANSLATOR_MODEL"] = record.translator_model
+        # The endpoint is the other half of the same identity, and it is set
+        # *after* the settings dialog's overrides: a model pinned on its own
+        # next to a URL the reader has since changed derives a different
+        # checkpoint key, which is exactly the "no checkpoint reused" message.
+        if record.translator_base_url:
+            env["TRANSLATOR_BASE_URL"] = record.translator_base_url
         return env
 
     # Settings overrides ---------------------------------------------------
     def _settings_env(self) -> tuple[dict[str, str], list[str]]:
         """The dialog's endpoint overrides as child env, re-tested right now.
 
-        Every stored override is probed at launch (a short timeout — a start
-        already spends a moment planning, and a resume must not hang on a
-        dead host either). One that answers is injected; one that does not is
+        Every stored override is probed at launch, all of them at once (a short
+        timeout — a start already spends a moment planning, and a resume must
+        not hang on a dead host either). One that answers is injected; one that does not is
         skipped, and the pipeline falls back to its ``.env`` value untouched.
+
+        An endpoint that answers also gets its declared limits read and kept, so
+        the run about to start does not have to rediscover them by being cut.
         """
         settings = self.settings.load()
-        ok = {
-            name: test_endpoint(
+        endpoints = dict(settings.agents)
+        if not endpoints:
+            return child_env(settings, {})
+
+        def test(item: tuple[str, Any]) -> tuple[str, dict[str, Any]]:
+            name, endpoint = item
+            return name, test_endpoint(
                 endpoint.base_url,
                 endpoint.model,
                 endpoint.api_key,
                 timeout=LAUNCH_TEST_TIMEOUT,
-            )["ok"]
-            for name, endpoint in settings.agents.items()
-        }
+            )
+
+        # In parallel: the endpoints are independent, and a host that hangs
+        # used to cost one full timeout per endpoint before the child started —
+        # so a resume could sit for a minute before spawning anything.
+        with ThreadPoolExecutor(max_workers=min(8, len(endpoints))) as pool:
+            results = dict(pool.map(test, endpoints.items()))
+        ok = {name: result["ok"] for name, result in results.items()}
         return child_env(settings, ok)
 
+    def _probe_env(self) -> dict[str, str]:
+        """The child's environment for a probe: the dialog's overrides applied.
+
+        Planning and endpoint checks must answer for the configuration the run
+        will actually use. Without them the plan counted the document with the
+        model in ``.env`` — or ``probe.py``'s own fallback — while the child ran
+        the dialog's: 78 chunks on the page, 76 in the run.
+        """
+        additions, removals = self._settings_env()
+        env = {key: value for key, value in os.environ.items() if key not in removals}
+        env.update(additions)
+        return env
+
     # Probing -----------------------------------------------------------
-    def probe(self, args: list[str]) -> dict[str, Any]:
+    def probe(self, args: list[str], *, extra_env: dict[str, str] | None = None) -> dict[str, Any]:
         """Run ``probe.py`` with *args* and return the JSON object it prints.
 
         The probe is the only thing that may observe the pipeline's real
         configuration, so planning goes through here; a failure becomes
         :class:`RunPlanError` carrying the reason the probe printed, never a
-        traceback.
+        traceback. *extra_env* carries values the child needs but the server must
+        not print — a credential for an admin route, for instance.
         """
         argv = [self.python, str(_PROBE), *args]
         # The probe prints non-ASCII (filenames, model ids) with
         # `ensure_ascii=False`, so both ends are pinned to UTF-8 rather than
         # left to whatever code page this console happens to use.
-        env = {**os.environ, "PYTHONIOENCODING": "utf-8"}
+        env = {**os.environ, "PYTHONIOENCODING": "utf-8", **(extra_env or {})}
         try:
             proc = subprocess.run(
                 argv,
@@ -416,27 +466,25 @@ class RunManager:
         return data
 
     # Planning ----------------------------------------------------------
-    def plan(self, file: Path, max_tokens: int | None = None) -> dict[str, Any]:
+    def plan(self, file: Path) -> dict[str, Any]:
         """Ask ``probe.py`` how the document would be split.
+
+        The probe runs with the dialog's endpoint overrides, exactly like the
+        child it is predicting for: the chunk count depends on the model's
+        tokenizer, so planning on a different configuration made the page
+        disagree with the run about how many chunks the document has.
 
         ``probe.py`` reports the default output path for its own default target
         language; the caller writes to ``--out`` explicitly, so only ``chunks``
         is consumed here.
         """
-        args = ["--plan", str(file)]
-        if max_tokens:
-            args += ["--max-tokens", str(max_tokens)]
-        return self.probe(args)
+        return self.probe(["--plan", str(file)], extra_env=self._probe_env())
 
     # Launch ------------------------------------------------------------
     def start(
         self,
         *,
         file: str,
-        src: str,
-        tgt: str,
-        glossary: str | None,
-        max_tokens: int | None,
         mock: bool,
         output_format: str = "md",
     ) -> RunRecord:
@@ -455,27 +503,27 @@ class RunManager:
             raise RunPlanError(f"input file not found: {file}")
 
         # Before any side effect: a bad document must not leave an empty run dir.
-        plan = self.plan(source, max_tokens)
+        plan = self.plan(source)
 
         run_id = _new_run_id()
         # The Markdown path is always the base name: a run asked for the PDF
         # alone writes `<stem>.<tgt>.pdf` right next to it (see
         # `polyglot_lc.pipeline.assembler.output_paths`).
-        output_path = self.output_dir(run_id) / f"{source.stem}.{tgt}.md"
+        output_path = self.output_dir(run_id) / f"{source.stem}.vi.md"
 
         record = RunRecord(
             run_id=run_id,
             started=time.time(),
             status="running",
             file=Path(file).name,
-            src=src,
-            tgt=tgt,
+            src="en",
+            tgt="vi",
             chunks=int(plan.get("chunks") or 0),
             exit_code=None,
             output_path=str(output_path),
             mock=mock,
             pid=None,
-            command=self._argv(source, src, tgt, glossary, max_tokens, output_path, output_format),
+            command=self._argv(source, output_path, output_format),
         )
         return self._launch(record)
 
@@ -485,13 +533,21 @@ class RunManager:
         "Tiếp tục" is not a new translation. The chunks the stopped attempt
         already finished are the work left to continue, and the checkpoint
         store keys them by the command that produced them — file, languages,
-        glossary, token budget — plus the Translator model. So the
+        token budget — plus the Translator model. So the
         command the run actually ran is relaunched verbatim with ``--resume``
         (rebuilding flags from today's settings would re-chunk the document
         under another token budget and miss every checkpoint), the model the
         run itself reported is pinned into the child's env, and the run keeps
         its id, log directory, output path and start time. The page goes on
         watching one run instead of gaining a second one for the same document.
+
+        Before pinning, the old model is checked against the Translator
+        endpoint configured now. Only an explicit 404 / model-not-found drops
+        the pin and continues this same run on today's configuration; its old
+        checkpoints cannot match that identity, so the document is translated
+        again (the old Markdown/PDF are archived first). A timeout, network
+        error or 5xx keeps the pin, and the child reports the provider failure
+        normally instead of paying for a full retranslation.
 
         One thing is not replayed: an option the CLI has since dropped is
         removed from the stored command (see :func:`_current_options`), or the
@@ -517,16 +573,191 @@ class RunManager:
         # it picks), so a resumed attempt that fell back to the server's
         # current `.env` would derive a different key and re-translate every
         # chunk it was meant to reuse.
-        record.translator_model = record.translator_model or self.translator_model(run_id)
+        pinned, stale = self._pinned_or_current(record, run_id)
+        archived = self._archive_outputs(record) if stale else None
+        record.translator_model = pinned
+        record.translator_base_url = record.translator_base_url or self.translator_endpoint(run_id)
         record.status = "running"
         record.exit_code = None
         record.note = ""
+        if stale:
+            self._note_stale(record, archived)
         # An attempt is starting now, whoever asked for it: a wait the supervisor
         # had scheduled no longer means anything. The attempt count is kept — it
         # is the run's, not the reader's, and handing it back would let a manual
         # click buy a fresh budget of automatic attempts.
         record.retry_at = 0.0
         return self._launch(record, keep_logs=True)
+
+    def rebuild_pdf(self, run_id: str) -> RunRecord:
+        """Re-assemble a finished run's PDF from its own checkpoints.
+
+        "Ghép lại PDF" is not a second translation: every chunk is already on
+        disk, so the resumed child replays them without asking the model and
+        only reruns the assembly step, this time writing the PDF beside the
+        Markdown. The run keeps its id, log and output path, so the page goes on
+        watching the same row.
+
+        The button is refused unless every chunk has a checkpoint — without them
+        a resumed run would silently pay to translate the document again, which
+        is not what "ghép lại" promises. ``KeyError`` for an unknown run;
+        ``RuntimeError`` when the run is still going, has no stored command, or
+        has not finished writing its chunks.
+        """
+        record = self.store.read_record(run_id)
+        if record is None:
+            raise KeyError(run_id)
+        if self._alive(record):
+            raise RuntimeError(f"run {run_id} is still running")
+        if not record.command:
+            raise RuntimeError(f"run {run_id} has no stored command to rebuild from")
+        if record.retry_at:
+            raise RuntimeError("the run is waiting to continue automatically")
+        if not self.rebuildable(run_id):
+            raise RuntimeError(
+                "this run has not checkpointed all of its chunks; continue the run before "
+                "rebuilding its PDF"
+            )
+        argv = _current_options(list(record.command))
+        if "--resume" not in argv:
+            argv.append("--resume")
+        # Both, not the format it originally ran with: a Markdown-only run has
+        # no PDF to serve, and the Markdown it already wrote is rewritten from
+        # the same chunks with the same text.
+        record.command = _with_format(argv, "both")
+        record.translator_model = record.translator_model or self.translator_model(run_id)
+        record.status = "running"
+        record.exit_code = None
+        record.note = ""
+        record.retry_at = 0.0
+        return self._launch(record, keep_logs=True)
+
+    def finish(self, run_id: str) -> RunRecord:
+        """Finish an unfinished run and write both the Markdown and the PDF.
+
+        This is the way back for a run that stopped short of its last chunks
+        (including runs made before the pipeline recorded a completion verdict).
+        It resumes the run in place, so every checkpointed chunk is reused, and
+        forces ``--format both`` so the finished run can be merged into a PDF in
+        the same attempt. No chunk that already has a checkpoint is translated
+        again; the ones that are missing are the work being paid for.
+        """
+        record = self.store.read_record(run_id)
+        if record is None:
+            raise KeyError(run_id)
+        if self._alive(record):
+            raise RuntimeError(f"run {run_id} is still running")
+        if not record.command:
+            raise RuntimeError(f"run {run_id} has no stored command to continue")
+        if record.retry_at:
+            raise RuntimeError("the run is waiting to continue automatically")
+        argv = _current_options(list(record.command))
+        if "--resume" not in argv:
+            argv.append("--resume")
+        record.command = _with_format(argv, "both")
+        pinned, stale = self._pinned_or_current(record, run_id)
+        archived = self._archive_outputs(record) if stale else None
+        record.translator_model = pinned
+        record.translator_base_url = record.translator_base_url or self.translator_endpoint(run_id)
+        record.status = "running"
+        record.exit_code = None
+        record.note = ""
+        if stale:
+            self._note_stale(record, archived)
+        record.retry_at = 0.0
+        return self._launch(record, keep_logs=True)
+
+    def _note_stale(self, record: RunRecord, archived: Path | None) -> None:
+        """Explain the fallback, naming the preserved copy when there was one."""
+        text = "provider báo model cũ không còn tồn tại — dùng cấu hình hiện tại"
+        if archived is not None:
+            text += f"; bản cũ đã lưu tại {archived}"
+        _note(record, text)
+
+    def _archive_outputs(self, record: RunRecord) -> Path | None:
+        """Move this run's current Markdown/PDF aside before retranslating.
+
+        Switching models makes every old checkpoint unusable, so the resumed
+        child translates from scratch and writes over the output path. The old
+        deliverable is still worth keeping: it is moved, not copied, into
+        ``output/webui/<run>/archive/<timestamp>/`` first. A failure here stops
+        the attempt rather than silently destroying the previous translation.
+        """
+        if not record.output_path:
+            return None
+        markdown = Path(record.output_path)
+        files = [
+            path
+            for path in (markdown, markdown.with_suffix(".pdf"))
+            if is_within(self.root, path) and path.is_file()
+        ]
+        if not files:
+            return None
+        stamp = time.strftime("%Y%m%d_%H%M%S")
+        archive_root = self.output_dir(record.run_id) / "archive"
+        target = archive_root / stamp
+        suffix = 1
+        while target.exists():
+            suffix += 1
+            target = archive_root / f"{stamp}_{suffix}"
+        try:
+            target.mkdir(parents=True, exist_ok=False)
+            for path in files:
+                shutil.move(str(path), str(target / path.name))
+        except OSError as exc:
+            raise RuntimeError(
+                f"cannot preserve the previous translation before retranslating: {exc}"
+            ) from exc
+        return target
+
+    def _pinned_or_current(self, record: RunRecord, run_id: str) -> tuple[str, bool]:
+        """Return the model to pin for the next attempt and whether a pin was stale.
+
+        A live old model keeps the checkpoint identity. Only a model the
+        provider explicitly reports as missing is dropped, so the attempt
+        follows today's configuration instead of failing forever against a name
+        that no longer exists. Ambiguous failures keep the pin.
+        """
+        pinned = record.translator_model or self.translator_model(run_id)
+        if pinned and self._model_missing(pinned):
+            return "", True
+        return pinned, False
+
+    def checkpoint_count(self, run_id: str) -> int:
+        """How many of this run's chunks finished and were written to disk."""
+        directory = self._checkpoint_dir(run_id)
+        return len(list(directory.glob("chunk-*.json"))) if directory is not None else 0
+
+    def unfinished_chunks(self, run_id: str) -> int:
+        """How many chunks still need work, for old and new runs alike.
+
+        New runs say so in their completion verdict. A run from before that
+        verdict existed only has the record's chunk count and the checkpoint
+        files on disk, so the gap between them is the honest answer.
+        """
+        record = self.store.read_record(run_id)
+        if record is None or record.chunks <= 0:
+            return 0
+        completion = self.store.last_run_end(run_id).get("completion") or {}
+        listed = len(completion.get("incomplete") or [])
+        on_disk = self.checkpoint_count(run_id)
+        return max(listed, record.chunks - on_disk)
+
+    def rebuildable(self, run_id: str) -> bool:
+        """Whether every chunk was verified, so a rebuild costs no requests.
+
+        The run's own completion record is the verdict when it has one: counting
+        checkpoint files alone cannot tell a verified chunk from one whose
+        verification never arrived. Older runs have no completion record, so
+        the file count remains their fallback.
+        """
+        record = self.store.read_record(run_id)
+        if record is None or record.chunks <= 0:
+            return False
+        completion = self.store.last_run_end(run_id).get("completion") or {}
+        if completion:
+            return not completion.get("incomplete")
+        return self.checkpoint_count(run_id) >= record.chunks
 
     def _alive(self, record: RunRecord) -> bool:
         """Whether this run still has a child process running.
@@ -580,10 +811,6 @@ class RunManager:
     def _argv(
         self,
         source: Path,
-        src: str,
-        tgt: str,
-        glossary: str | None,
-        max_tokens: int | None,
         output_path: Path,
         output_format: str = "md",
     ) -> list[str]:
@@ -595,20 +822,12 @@ class RunManager:
             "translate",
             "--file",
             str(source),
-            "--src",
-            src,
-            "--tgt",
-            tgt,
             "--out",
             str(output_path),
             "--format",
             output_format,
             "--quiet",
         ]
-        if glossary:
-            argv += ["--glossary", str(glossary)]
-        if max_tokens:
-            argv += ["--max-tokens", str(max_tokens)]
         return argv
 
     # Observation and control -------------------------------------------
@@ -720,18 +939,54 @@ class RunManager:
         record = self.store.read_record(run_id)
         if record is None:
             raise KeyError(run_id)
-        before = (record.status, record.exit_code, record.note)
+        before = (record.status, record.exit_code, record.note, record.chunks)
         if record.status == "running":
+            # The child's own run_start is authoritative for the chunk count: it
+            # is written by the process that actually chunks the document, while
+            # run.json starts from the plan's estimate in another process.
+            reported = self._reported_chunks(run_id)
+            if reported > 0 and reported != record.chunks:
+                record.chunks = reported
             proc = self.procs.get(run_id)
             if proc is not None:
                 code = proc.poll()
                 if code is not None:
                     record.exit_code = int(code)
-                    record.status = "done" if record.exit_code == EXIT_OK else "failed"
+                    if record.exit_code == EXIT_OK:
+                        record.status = "done"
+                    elif record.exit_code == EXIT_INCOMPLETE:
+                        record.status = "incomplete"
+                    else:
+                        record.status = "failed"
                     self.procs.pop(run_id, None)
             elif record.pid is not None and not pid_alive(record.pid):
-                record.status = "failed"
-                _note(record, "server đã khởi động lại khi lượt chạy đang chạy")
+                # The child may have written its verdict and exited between
+                # this read and the previous poll (the server's sweeper polls
+                # the same run on its own thread). In that race ``procs`` is
+                # already empty and the pid is already gone, but the run did
+                # finish — typically a successful PDF rebuild. Trust its own
+                # newest ``run_end`` over the missing process handle.
+                end = self.store.last_run_end(run_id)
+                if end:
+                    code = end.get("exit_code")
+                    if code is not None:
+                        record.exit_code = int(code)
+                        record.status = (
+                            "done"
+                            if record.exit_code == EXIT_OK
+                            else "incomplete"
+                            if record.exit_code == EXIT_INCOMPLETE
+                            else "failed"
+                        )
+                    else:
+                        record.status = (
+                            str(end.get("status"))
+                            if str(end.get("status")) in {"done", "incomplete", "failed"}
+                            else "failed"
+                        )
+                else:
+                    record.status = "failed"
+                    _note(record, "server đã khởi động lại khi lượt chạy đang chạy")
         if self.has_events(run_id):
             # The log exists after all: a note written in the first second, when
             # the child had not opened it yet, is no longer true — and neither is
@@ -740,39 +995,114 @@ class RunManager:
                 _un_note(record, wording)
         else:
             _note(record, NO_LOG_NOTE)
-        if (record.status, record.exit_code, record.note) != before:
+        if (record.status, record.exit_code, record.note, record.chunks) != before:
             self.store.write_record(record)
         return record
+
+    def _reported_chunks(self, run_id: str) -> int:
+        """The chunk count the child's newest ``run_start`` reported, or 0."""
+        start = self.store.last_run_start(run_id)
+        try:
+            return int(start.get("chunks") or 0)
+        except (TypeError, ValueError):
+            return 0
 
     def translator_model(self, run_id: str) -> str:
         """The translator model the run actually ran under, or ``""``.
 
-        Read from the child's own ``run_start`` event: the record only gains
-        the field lazily, so the model is known from the first poll onward and
-        survives a server restart. A run that died before its first event has
-        no checkpoint to reuse, so an empty answer is the right one for it.
+        Read from the child's own latest ``run_start`` event: the record only
+        gains the field lazily, so the model is known from the first poll
+        onward and survives a server restart. A run that died before its
+        first event has no checkpoint to reuse, so an empty answer is right.
         """
         record = self.store.read_record(run_id)
         if record is not None and record.translator_model:
             return record.translator_model
-        model = ""
-        events, _next, _malformed = self.events(run_id, 0)
-        for event in events:
-            if str(event.get("type") or "") != "run_start":
-                continue
-            agents = event.get("agents") or []
-            for agent in agents:
-                if isinstance(agent, dict) and str(agent.get("name")) == "translator":
-                    model = str(agent.get("model") or "")
-                    break
-            if model:
-                break
+        model = self._latest_translator_model(run_id)
         if record is None:
             return model
         if model and model != record.translator_model:
             record.translator_model = model
             self.store.write_record(record)
         return model
+
+    def translator_endpoint(self, run_id: str) -> str:
+        """The Translator endpoint the run actually talked to, or ``""``.
+
+        Read exactly like :meth:`translator_model`, from the child's own
+        ``run_start`` record: the endpoint is part of the checkpoint identity,
+        so a resume has to pin the URL that produced the checkpoints rather
+        than whatever the settings dialog points at today.
+        """
+        record = self.store.read_record(run_id)
+        if record is not None and record.translator_base_url:
+            return record.translator_base_url
+        endpoint = self._latest_translator_field(run_id, "endpoint")
+        if record is not None and endpoint and endpoint != record.translator_base_url:
+            record.translator_base_url = endpoint
+            self.store.write_record(record)
+        return endpoint
+
+    def _latest_translator_model(self, run_id: str) -> str:
+        """The model of the newest attempt that recorded a translator."""
+        return self._latest_translator_field(run_id, "model")
+
+    def _latest_translator_field(self, run_id: str, field: str) -> str:
+        """One field of the translator summary in the newest ``run_start``."""
+        events, _next, _malformed = self.events(run_id, 0)
+        for event in reversed(events):
+            if str(event.get("type") or "") != "run_start":
+                continue
+            for agent in event.get("agents") or []:
+                if isinstance(agent, dict) and str(agent.get("name")) == "translator":
+                    return str(agent.get(field) or "")
+        return ""
+
+    def _endpoint_check(self, model: str) -> dict[str, Any]:
+        """Ask a child what Translator is configured now, and test *model* there."""
+        return self.probe(
+            ["--check-agent", "TRANSLATOR", "--check-model", model],
+            extra_env=self._probe_env(),
+        )
+
+    def _model_missing(self, model: str) -> bool:
+        """Whether the provider explicitly says *model* no longer exists.
+
+        Only a 404 / model-not-found answer drops the pin. A timeout, a
+        connection failure, a 5xx or a rate limit proves nothing about the
+        model: the run keeps its old configuration and fails (or retries) the
+        normal way instead of paying to translate the whole document again.
+        """
+        try:
+            check = self._endpoint_check(model)
+        except RunPlanError:
+            return False  # could not ask: never guess that the model is gone
+        current_model = str(check.get("model") or "")
+        if current_model == model:
+            return False  # this is exactly the configuration in effect now
+        test = check.get("test") or {}
+        if test.get("ok"):
+            return False
+        try:
+            status = int(test.get("status") or 0)
+        except (TypeError, ValueError):
+            status = 0
+        if status == 404:
+            return True
+        text = str(test.get("error") or "").lower()
+        if re.search(r"\b404\b", text):
+            return True
+        return any(
+            marker in text
+            for marker in (
+                "model_not_found",
+                "model not found",
+                "no such model",
+                "unknown model",
+                "model does not exist",
+                "invalid model",
+            )
+        )
 
     # Automatic continue ------------------------------------------------
     def sweep(self, now: float | None = None) -> list[RunRecord]:
@@ -807,7 +1137,7 @@ class RunManager:
             # case where the record still says "running" over a dead pid, and
             # that is exactly the run this feature is for.
             record = self.status(record.run_id)
-        interrupted = record.status == "failed" or (
+        interrupted = record.status in {"failed", "incomplete"} or (
             record.status == "done" and self._missing_chunks(record)
         )
         if not interrupted:
@@ -878,6 +1208,16 @@ class RunManager:
         """Classify the latest failure without treating quality rejection as an outage."""
         run_end = self.store.last_run_end(record.run_id)
         fatal_error = str(run_end.get("fatal_error") or "")
+        if record.status == "incomplete":
+            reasons = [
+                str(item.get("reason") or "").lower()
+                for item in (run_end.get("completion") or {}).get("incomplete") or []
+            ]
+            if any("unavailable" in reason for reason in reasons):
+                # A provider outage may clear; retry those chunks automatically.
+                return True
+            if any("rejected" in reason or "missing translation" in reason for reason in reasons):
+                return False
         if fatal_error:
             text = fatal_error.lower()
         elif int(run_end.get("chunks_rejected") or 0) > 0:
@@ -930,10 +1270,14 @@ class RunManager:
         pid = record.pid if record.pid is not None else getattr(proc, "pid", None)
         if pid:
             kill_tree(pid)
-        _reap(proc)
         record.status = "stopped"
         _note(record, f"đã dừng từ web UI (pid {pid})" if pid else "đã dừng từ web UI")
         self.store.write_record(record)
+        if proc is not None:
+            # Collect the child off the request thread. The signal has already
+            # been delivered above; waiting for the exit here is what made
+            # "Dừng" hang for up to STOP_TIMEOUT before the page was answered.
+            threading.Thread(target=_reap, args=(proc,), daemon=True).start()
         return record
 
     def delete(self, run_id: str) -> None:

@@ -1,4 +1,13 @@
-"""Long-context segmenter: token-aware chunks at paragraph/heading boundaries."""
+"""Long-context segmenter: token-aware chunks at paragraph/heading boundaries.
+
+The chunk budget is ``CHUNK_MAX_TOKENS`` and nothing else, and it is counted with
+one pinned tokenizer (:data:`CHUNK_ENCODING`). That is deliberate: the split is
+part of the checkpoint identity, so it has to be a property of the document and
+the budget, not of whichever model happens to be configured. A budget derived
+from a model's context window was removed for the same reason — it needs a
+trustworthy per-model window (this project has none), and it would have moved
+every boundary, and every checkpoint with it, whenever the model changed.
+"""
 
 from __future__ import annotations
 
@@ -12,6 +21,13 @@ from polyglot_lc.ingest.model import Block, Document
 
 _FALLBACK_ENCODING = "cl100k_base"
 
+#: The tokenizer every chunk boundary is counted with, whatever model the run
+#: translates with. tiktoken only approximates a non-OpenAI tokenizer, so this
+#: count was never the model's own: taking it from the model name split the same
+#: document into 74, 76 or 78 chunks depending on which name was configured, and
+#: moving a boundary also moves the chunk hashes that checkpoints are keyed by.
+#: Pinned, the split is a property of the document and the budget alone.
+CHUNK_ENCODING = _FALLBACK_ENCODING
 
 def get_encoding(model: str) -> tiktoken.Encoding:
     """Return a tiktoken encoding for *model* (falls back to cl100k_base)."""
@@ -19,6 +35,16 @@ def get_encoding(model: str) -> tiktoken.Encoding:
         return tiktoken.encoding_for_model(model)
     except KeyError:
         return tiktoken.get_encoding(_FALLBACK_ENCODING)
+
+
+def chunk_encoding() -> tiktoken.Encoding:
+    """The encoding chunk boundaries are counted with (see :data:`CHUNK_ENCODING`).
+
+    Deliberately not the translated model's tokenizer: it is a proxy either way,
+    and letting the model name choose it made the split — and the checkpoint
+    identity that rides on it — change when only the model was switched.
+    """
+    return tiktoken.get_encoding(CHUNK_ENCODING)
 
 
 def count_tokens(text: str, model: str = "gpt-4o") -> int:
@@ -66,8 +92,7 @@ def _chunk_profile(blocks: list[tuple[int, Block, str]], section_path: str) -> s
     headings = " ".join(block.text for _, block, _ in blocks if block.kind == "heading")
     path = (section_path + " " + headings).casefold()
     if any(
-        word in path
-        for word in ("reference", "bibliograph", "tham khảo", "tài liệu tham khảo")
+        word in path for word in ("reference", "bibliograph", "tham khảo", "tài liệu tham khảo")
     ):
         return "references"
     if any(word in path for word in ("glossary", "thuật ngữ", "định nghĩa")):
@@ -85,11 +110,18 @@ def chunk_document(
     max_tokens: int | None = None,
     overlap_tokens: int | None = None,
     model: str = "gpt-4o",
+    *,
+    base_url: str = "",
 ) -> list[Chunk]:
     """Split *doc* into chunks <= max_tokens at paragraph/heading boundaries.
 
     Never splits inside a block; an oversized block becomes its own chunk
     (protected from endless splitting by the hard truncation guard below).
+
+    The split depends only on the configured budget and the pinned tokenizer
+    (:func:`chunk_encoding`), never on *model*: chunk hashes are part of the
+    checkpoint identity, so boundaries must not move when only the model does.
+    *model* and *base_url* stay in the signature for call-site compatibility.
     """
     app = get_app_config()
     max_tokens = max_tokens or app.chunk_max_tokens
@@ -97,7 +129,12 @@ def chunk_document(
 
     numbered = list(enumerate(doc.blocks))
     texts = [(idx, b, _block_text(b)) for idx, b in numbered]
-    enc = get_encoding(model)
+    enc = chunk_encoding()
+    #: Token counts by block index. A block's text never changes during the
+    #: split, but the body flush and the overlap replay would otherwise encode
+    #: it again — two extra passes over the whole document, and the overlap
+    #: loop re-encodes the tail of every chunk.
+    block_tokens = {idx: len(enc.encode(text)) for idx, _, text in texts}
 
     chunks: list[Chunk] = []
     current: list[tuple[int, Block, str]] = []
@@ -134,7 +171,7 @@ def chunk_document(
             tail: list[tuple[int, Block, str]] = []
             tail_tokens = 0
             for item in reversed(current):
-                t = len(enc.encode(item[2]))
+                t = block_tokens[item[0]]
                 if t > overlap_tokens:
                     # A block bigger than the whole overlap window is not
                     # context: replaying it carries its full size into the next
@@ -151,7 +188,7 @@ def chunk_document(
         tail_only = bool(current)
 
     for idx, block, text in texts:
-        t = len(enc.encode(text))
+        t = block_tokens[idx]
         if current_tokens + t > max_tokens and current:
             if not tail_only:
                 flush()  # the chunk that just filled up keeps its own content

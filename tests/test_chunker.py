@@ -3,15 +3,21 @@
 from __future__ import annotations
 
 from polyglot_lc.segment.chunker import chunk_document, count_tokens, get_encoding
-from polyglot_lc.segment.glossary import extract_glossary, glossary_to_md, load_glossary_csv
+from polyglot_lc.segment.glossary import extract_glossary, glossary_to_md
 
 
 def test_chunk_respects_token_budget(mock_env, sample_doc):
-    chunks = chunk_document(sample_doc, max_tokens=60, overlap_tokens=0)
+    """Boundaries are counted with the pinned tokenizer, so the budget is fixed.
+
+    The fixture is 63 cl100k tokens: a 60-token budget only crosses a boundary
+    under the model tokenizer this used to pick, which is exactly the dependence
+    :func:`chunk_encoding` removes. 25 forces a real split.
+    """
+    chunks = chunk_document(sample_doc, max_tokens=25, overlap_tokens=0)
     assert len(chunks) > 1
     # No chunk (except a single oversized block) exceeds the budget.
     for c in chunks[:-1]:
-        assert c.token_count <= 60
+        assert c.token_count <= 25
 
 
 def test_chunk_ids_sequential(mock_env, sample_doc):
@@ -111,6 +117,40 @@ def test_section_path_tracked(mock_env, sample_doc):
     assert any(c.section_path for c in chunks)
 
 
+def test_chunk_boundaries_do_not_depend_on_the_model(mock_env, sample_doc):
+    """The same document must split the same way under any model name.
+
+    The count was tiktoken's approximation of the model's tokenizer, so switching
+    the model moved every boundary — and with it the chunk hashes checkpoints are
+    keyed by, which is why a model change looked like a document that grew.
+    """
+    counts = {
+        len(chunk_document(sample_doc, max_tokens=60, overlap_tokens=0, model=name))
+        for name in ("gpt-4o", "logfare/auto", "totally-unknown-model")
+    }
+    assert len(counts) == 1
+
+
+def test_the_plan_fingerprint_is_pinned(mock_env, sample_doc):
+    """Changing a chunk boundary changes the run's identity: do it on purpose.
+
+    ``CheckpointStore.doc_key`` carries these hashes, so a silent change here
+    throws away every finished chunk of a half-translated document — exactly
+    what happened when chunking moved 74 → 76 on the same book. Update these
+    constants only together with a note saying what moved the split.
+    """
+    from polyglot_lc.ui.trace import plan_hash
+
+    chunks = chunk_document(sample_doc, max_tokens=25, overlap_tokens=0)
+    assert [c.hash() for c in chunks] == [
+        "1fca66b3a4",
+        "88aa31194d",
+        "291d211b16",
+        "210376aac3",
+    ]
+    assert plan_hash(chunks) == "ac5e40050ff5"
+
+
 def test_count_tokens():
     n = count_tokens("hello world", model="gpt-4o")
     assert 1 <= n <= 5
@@ -139,10 +179,3 @@ def test_glossary_md_render():
 
     md = glossary_to_md([GlossaryTerm(term="NMT", count=3, reason="proper_noun")])
     assert "- NMT (x3)" in md
-
-
-def test_glossary_csv(tmp_path):
-    csv = tmp_path / "g.csv"
-    csv.write_text("NMT,Dịch máy神经\nBerlin,Berlin\n", encoding="utf-8")
-    mapping = load_glossary_csv(str(csv))
-    assert mapping["NMT"].startswith("Dịch máy")

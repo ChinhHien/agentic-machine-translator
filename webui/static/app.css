@@ -42,6 +42,8 @@
  *   .chunk[data-recovered=true]  a chunk whose failure the run walked past
  *   .log-line[data-status=start|ok|retry|fail|info|patched|note]  one log line
  *   .log-line[data-expanded=true|false]  a log line opened to its own detail
+ *   .log-line[data-attempt=true]  the first line of a new attempt of the run
+ *   .log-conclusion[data-tone=ok|incomplete|fail|stopped]  the verdict the log ends on
  *   .chip[aria-pressed=true]            the filter in force
  *   .view-switch button[aria-pressed=true]   the layout in force
  *   .tab[aria-selected=true]            the detail tab in force
@@ -380,16 +382,6 @@ code { font-family: var(--font-data); font-size: 0.92em; }
   text-overflow: ellipsis;
   white-space: nowrap;
 }
-
-.crumb-meta {
-  flex: none;
-  font-family: var(--font-data);
-  font-size: var(--fs-xs);
-  color: var(--muted);
-  white-space: nowrap;
-}
-
-.crumb-meta:empty { display: none; }
 
 /* -------------------------------------------------- start a translation */
 
@@ -1328,8 +1320,10 @@ code { font-family: var(--font-data); font-size: 0.92em; }
 .job[data-state="running"] .job-head { border-bottom-color: var(--accent); }
 .job[data-state="done"] .job-head { border-bottom-color: var(--accent); }
 .job[data-state="failed"] .job-head { border-bottom-color: var(--danger); }
+.job[data-state="incomplete"] .job-head { border-bottom-color: var(--warn); }
 .job[data-state="stopped"] .job-head { border-bottom-color: var(--warn); }
 .job[data-state="failed"] .job-title { color: var(--danger); }
+.job[data-state="incomplete"] .job-title { color: var(--warn); }
 .job[data-state="stopped"] .job-title { color: var(--warn); }
 
 .job-heading { min-width: 0; }
@@ -1360,6 +1354,7 @@ code { font-family: var(--font-data); font-size: 0.92em; }
 .badge[data-state="running"] { color: var(--accent); background: var(--accent-weak); border-color: var(--accent); }
 .badge[data-state="done"] { color: var(--accent); background: var(--accent-weak); }
 .badge[data-state="failed"] { color: var(--danger); background: var(--danger-weak); }
+.badge[data-state="incomplete"] { color: var(--warn); background: var(--warn-weak); border-color: var(--warn); }
 .badge[data-state="stopped"] { color: var(--warn); background: var(--warn-weak); }
 
 /* The header's right-hand corner: the badge that names the run's state and, on
@@ -1457,7 +1452,62 @@ code { font-family: var(--font-data); font-size: 0.92em; }
   box-shadow: inset 0 0 0 1px var(--warn);
 }
 
-.job-actions { display: flex; flex-wrap: wrap; gap: var(--sp-2); }
+/* The run's files and actions, on the badge's own line: three marks, each 32px
+   like the rest of the sheet's icon controls. */
+.job-tools { display: flex; align-items: center; gap: var(--sp-1); }
+.job-tools:empty { display: none; }
+
+.tool { position: relative; }
+
+/* A list folded under its own mark, hung from the button's bottom-right corner
+   so it stays inside the panel rather than widening the header. */
+.menu {
+  position: absolute;
+  top: calc(100% + 6px);
+  right: 0;
+  z-index: 20;
+  min-width: 232px;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  padding: var(--sp-1);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: var(--surface);
+  box-shadow: var(--shadow);
+}
+
+.menu-item {
+  display: block;
+  width: 100%;
+  padding: 7px 10px;
+  border: 0;
+  border-radius: 5px;
+  background: transparent;
+  color: var(--text);
+  font: inherit;
+  font-size: var(--fs-sm);
+  line-height: 1.4;
+  text-align: left;
+  text-decoration: none;
+  white-space: nowrap;
+  cursor: pointer;
+}
+
+.menu-item:hover:not([aria-disabled="true"]),
+.menu-item:focus-visible {
+  background: var(--sunken);
+}
+
+.menu-item[aria-disabled="true"] {
+  color: var(--muted);
+  cursor: default;
+}
+
+.menu-item--danger { color: var(--danger); }
+.menu-item--danger:hover:not([aria-disabled="true"]) { background: var(--danger-weak); }
+
+.menu-sep { height: 1px; margin: 3px 2px; background: var(--border); }
 
 .alert {
   margin: 0;
@@ -1650,7 +1700,7 @@ code { font-family: var(--font-data); font-size: 0.92em; }
      on, how it ended, and the run's own words about it. The subject column is a
      fixed width so the verdicts line up all the way down the log, and the
      message takes what is left and wraps there rather than widening the row. */
-  grid-template-columns: max-content max-content 14rem max-content minmax(0, 1fr);
+  grid-template-columns: max-content max-content max-content 16rem minmax(0, 1fr);
   gap: var(--sp-2) var(--sp-3);
   align-items: baseline;
   padding: var(--sp-1) var(--sp-3);
@@ -1726,24 +1776,199 @@ code { font-family: var(--font-data); font-size: 0.92em; }
   white-space: nowrap;
 }
 
-.log-word { font-size: var(--fs-xs); white-space: nowrap; }
+/* The verdict, as a pill: a glyph and a word, so the column of outcomes can be
+   scanned down without reading every message. */
+.log-badge {
+  display: inline-flex;
+  gap: 4px;
+  align-items: baseline;
+  padding: 1px 7px;
+  border: 1px solid transparent;
+  border-radius: 999px;
+  font-size: var(--fs-xs);
+  white-space: nowrap;
+  color: var(--soft);
+}
 
 .log-text {
   min-width: 0;
-  color: var(--soft);
+  color: var(--text);
+  line-height: 1.5;
   white-space: pre-wrap;
   overflow-wrap: anywhere;
 }
 
-.log-line[data-status="start"] .log-word,
-.log-line[data-status="ok"] .log-word,
-.log-line[data-status="patched"] .log-word { color: var(--accent); }
-.log-line[data-status="retry"] .log-word { color: var(--warn); }
+/* A pause between two lines, on the clock: the log's own measure of how long a
+   wait was, without a row of its own. */
+.log-gap {
+  margin-left: var(--sp-2);
+  color: var(--muted);
+  font-size: var(--fs-xs);
+}
+
+/* The log's controls: two chips above the list. */
+.log-tools {
+  display: flex;
+  gap: var(--sp-2);
+  margin-bottom: var(--sp-2);
+}
+
+/* `hidden` on a log line has to beat `.log-line { display: grid }`. */
+.log-line[hidden] { display: none; }
+
+/* The library's one-phrase explanation of an unfinished run. */
+.job-row-why {
+  color: var(--muted);
+  font-size: var(--fs-xs);
+}
+
+/* A new attempt of the same run (a resume) starts a fresh page of the log. */
+.log-line[data-attempt="true"] {
+  border-top: 2px solid var(--border-strong);
+  background: var(--surface);
+}
+
+.log-line[data-status="start"] .log-badge,
+.log-line[data-status="ok"] .log-badge,
+.log-line[data-status="patched"] .log-badge {
+  color: var(--accent);
+  background: var(--accent-weak);
+}
+.log-line[data-status="retry"] .log-badge {
+  color: var(--warn);
+  background: var(--warn-weak);
+}
 .log-line[data-status="fail"] { background: var(--danger-weak); }
-.log-line[data-status="fail"] .log-word,
+.log-line[data-status="fail"] .log-badge {
+  color: var(--danger);
+  background: transparent;
+}
 .log-line[data-status="fail"] .log-where { color: var(--danger); }
-.log-line[data-status="info"] .log-word,
-.log-line[data-status="note"] .log-word { color: var(--muted); }
+.log-line[data-status="info"] .log-badge,
+.log-line[data-status="note"] .log-badge { color: var(--muted); }
+
+/* ------------------------------------------------------- the log's ending */
+
+/* The verdict the log ends on. A finished run's real question is "did it
+   finish, and if not why" — the answer sits under the timeline, in the
+   reader's words: the verdict, the reason, the next move, and the figures that
+   explain them. */
+.log-conclusion {
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-2);
+  padding: var(--sp-3) var(--sp-3) var(--sp-4);
+  background: var(--sunken);
+  border-top: 2px solid var(--border-strong);
+}
+
+.conclusion-head {
+  display: flex;
+  gap: var(--sp-2);
+  align-items: baseline;
+}
+
+.conclusion-mark {
+  font-family: var(--font-data);
+  font-size: var(--fs-md);
+  color: var(--muted);
+}
+
+.conclusion-title {
+  margin: 0;
+  font-size: var(--fs-md);
+  font-weight: 600;
+  color: var(--text);
+}
+
+.log-conclusion[data-tone="ok"] .conclusion-mark,
+.log-conclusion[data-tone="ok"] .conclusion-title { color: var(--ok); }
+.log-conclusion[data-tone="incomplete"] .conclusion-mark,
+.log-conclusion[data-tone="incomplete"] .conclusion-title { color: var(--warn); }
+.log-conclusion[data-tone="fail"] .conclusion-mark,
+.log-conclusion[data-tone="fail"] .conclusion-title { color: var(--danger); }
+.log-conclusion[data-tone="stopped"] .conclusion-mark,
+.log-conclusion[data-tone="stopped"] .conclusion-title { color: var(--muted); }
+
+.conclusion-reason {
+  margin: 0;
+  color: var(--text);
+  line-height: 1.55;
+}
+
+.conclusion-next {
+  margin: 0;
+  color: var(--soft);
+  line-height: 1.55;
+}
+
+.conclusion-reasons {
+  margin: 0;
+  padding-left: var(--sp-4);
+  color: var(--soft);
+}
+
+.conclusion-reasons li {
+  display: flex;
+  gap: var(--sp-2);
+  margin: 2px 0;
+}
+
+.conclusion-count {
+  min-width: 2.5rem;
+  font-family: var(--font-data);
+  color: var(--muted);
+  text-align: right;
+}
+
+.conclusion-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: var(--fs-sm);
+}
+
+.conclusion-table th {
+  padding: var(--sp-1) var(--sp-2);
+  border-bottom: 1px solid var(--border);
+  color: var(--muted);
+  font-weight: 500;
+  text-align: left;
+}
+
+.conclusion-table td {
+  padding: var(--sp-1) var(--sp-2);
+  border-bottom: 1px solid var(--border);
+  color: var(--soft);
+  overflow-wrap: anywhere;
+}
+
+.conclusion-chunk {
+  font-family: var(--font-data);
+  white-space: nowrap;
+}
+
+.conclusion-more {
+  margin: 0;
+  color: var(--muted);
+  font-size: var(--fs-xs);
+}
+
+.conclusion-facts {
+  display: grid;
+  grid-template-columns: max-content minmax(0, 1fr);
+  gap: 2px var(--sp-3);
+  margin: 0;
+  font-size: var(--fs-sm);
+}
+
+.conclusion-facts dt { color: var(--muted); }
+
+.conclusion-facts dd {
+  margin: 0;
+  color: var(--soft);
+  font-family: var(--font-data);
+  overflow-wrap: anywhere;
+}
 
 /* ---------------------------------------------------------------- report */
 
@@ -1962,29 +2187,6 @@ code { font-family: var(--font-data); font-size: 0.92em; }
   border-bottom: 1px solid var(--border);
 }
 
-/* The source column's own downloads, on the line its count is on: the text a
-   reader is comparing against is the one they may want to keep, so the way to
-   keep it sits with that text rather than in a row of buttons above the
-   columns. Two quiet links, the action named by their place in the column. */
-.pane-gets {
-  display: flex;
-  align-items: baseline;
-  gap: var(--sp-3);
-  margin: 0 0 0 auto;
-}
-
-.pane-gets a {
-  color: var(--muted);
-  text-decoration: none;
-  white-space: nowrap;
-}
-
-/* A line under a word in a header reads as a box around it at this size; the
-   colour change is enough to say the word is something to press, and the
-   underline arrives only under the pointer, once the reader is already there. */
-.pane-gets a:hover,
-.pane-gets a:focus-visible { color: var(--text); text-decoration: underline; }
-
 .pane-text {
   flex: 1;
   min-height: 0;
@@ -2056,10 +2258,9 @@ code { font-family: var(--font-data); font-size: 0.92em; }
 
 /* ------------------------------------------------------------ settings */
 
-/* Seven endpoint cards in two columns — wider than the other dialogs, since
-   the cards, not the prose, are the content. Everything else keeps the same
-   skin so the dialog reads as the same place. */
-.dialog--settings { width: min(880px, calc(100vw - 2 * var(--sp-5))); }
+/* One endpoint card per row: the agent on the left, its fields on the
+   right. Wider than the other dialogs, since the cards are the content. */
+.dialog--settings { width: min(900px, calc(100vw - 2 * var(--sp-5))); }
 
 .settings-note { font-size: var(--fs-sm); line-height: 1.55; color: var(--muted); }
 .settings-note strong { color: var(--soft); }
@@ -2070,15 +2271,15 @@ code { font-family: var(--font-data); font-size: 0.92em; }
 
 .settings-cards {
   display: grid;
-  grid-template-columns: repeat(2, minmax(0, 1fr));
-  gap: var(--sp-3);
+  grid-template-columns: minmax(0, 1fr);
+  gap: var(--sp-2);
   align-items: start;
 }
 
 .settings-card {
-  display: flex;
-  flex-direction: column;
-  gap: var(--sp-2);
+  display: grid;
+  grid-template-columns: 190px minmax(0, 1fr);
+  gap: var(--sp-3);
   padding: var(--sp-3);
   border: 1px solid var(--border);
   border-radius: var(--radius);
@@ -2086,22 +2287,104 @@ code { font-family: var(--font-data); font-size: 0.92em; }
   transition: opacity var(--dur-1) var(--ease);
 }
 
+.settings-card-side {
+  position: relative;
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-2);
+  min-width: 0;
+  padding-right: var(--sp-3);
+  border-right: 1px solid var(--border);
+}
+
+.settings-card-heading {
+  display: flex;
+  flex: 1;
+  align-items: center;
+  justify-content: center;
+  gap: var(--sp-1);
+}
+
+.settings-gear {
+  flex: none;
+  width: 28px;
+  height: 28px;
+  color: var(--muted);
+  border-radius: 50%;
+}
+
+.settings-gear:hover { color: var(--accent); background: var(--surface); }
+
+.settings-group-choice {
+  justify-self: start;
+  margin: 2px 0;
+  font-size: var(--fs-xs);
+}
+
+.settings-backup { display: flex; flex-direction: column; gap: 2px; }
+
+.settings-backup-toggle {
+  align-self: flex-end;
+  margin-right: var(--sp-2);
+  padding: 2px 4px;
+  border: 0;
+  background: transparent;
+  color: var(--soft);
+  font-size: var(--fs-xs);
+  cursor: pointer;
+}
+
+.settings-backup-toggle:hover { color: var(--accent); }
+
+.settings-backup[data-collapsed="true"] .settings-fields,
+.settings-backup[data-collapsed="true"] .settings-gear { display: none; }
+.settings-backup[data-collapsed="true"] .settings-card-heading { flex: 0 0 auto; }
+.settings-backup[data-collapsed="true"] .settings-card-footer {
+  position: static;
+  right: auto;
+}
+.settings-backup[data-collapsed="true"] .settings-card { padding-bottom: var(--sp-2); }
+
+.settings-fields {
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-2);
+}
+
 /* The mode the checkbox is not in: still showing what was typed — nothing is
    lost when the reader flips back — but clearly out of the picture. */
 .settings-card--off { opacity: 0.45; }
 .settings-card--off .input { pointer-events: none; }
 
-.settings-card-head { display: flex; align-items: center; gap: var(--sp-2); }
-.settings-card-naming { flex: 1; min-width: 0; }
-.settings-card-title { font-size: var(--fs-md); font-weight: 600; }
-.settings-card-hint { font-size: var(--fs-xs); line-height: 1.4; color: var(--muted); }
+.settings-card-title {
+  margin: 0;
+  text-align: center;
+  font-size: var(--fs-md);
+  font-weight: 600;
+  letter-spacing: -0.01em;
+}
+
+/* The footer stays on the card's floor while the identity block takes the rest
+   of the column, so the name is centred on the card rather than pushed up by
+   the status line. */
+.settings-card-footer {
+  position: absolute;
+  left: 0;
+  right: var(--sp-3);
+  bottom: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: var(--sp-1);
+  min-height: 24px;
+  padding-top: var(--sp-2);
+  border-top: 1px solid var(--border);
+}
 
 /* The card that has the reader's cursor in it says so, so a column of seven
    look-alike outlines still answers "which one am I typing in?". */
 .settings-card:focus-within { border-color: var(--accent); }
 
-/* URL and model share one row — the two halves of an address — so a card is
-   two lines instead of three and the grid reads as a list, not a wall. */
 .settings-card-pair {
   display: grid;
   grid-template-columns: minmax(0, 1.2fr) minmax(0, 1fr);
@@ -2110,10 +2393,12 @@ code { font-family: var(--font-data); font-size: 0.92em; }
 
 .settings-card .input { font-size: var(--fs-sm); }
 
-.settings-clear { width: 28px; height: 28px; color: var(--muted); }
-.settings-clear:hover { color: var(--danger); }
-
-.settings-line { display: flex; flex-direction: column; gap: 2px; }
+.settings-line {
+  display: grid;
+  grid-template-columns: 96px minmax(0, 1fr);
+  align-items: center;
+  gap: var(--sp-2);
+}
 .settings-line .label { font-size: var(--fs-xs); color: var(--muted); }
 
 /* The test's verdict, one glyph where the title names it exactly: a quiet dot
@@ -2121,9 +2406,8 @@ code { font-family: var(--font-data); font-size: 0.92em; }
    the cross once it has answered. */
 .settings-status {
   flex: none;
-  width: 18px;
-  height: 18px;
-  margin-top: 2px;
+  width: 16px;
+  height: 16px;
   display: grid;
   place-items: center;
   font-size: 12px;
@@ -2153,7 +2437,7 @@ code { font-family: var(--font-data); font-size: 0.92em; }
   50% { opacity: 0.3; }
 }
 
-.settings-card-note { font-size: var(--fs-xs); color: var(--muted); }
+.settings-card-note { font-size: var(--fs-xs); color: var(--muted); text-align: center; }
 .settings-card[data-state="ok"] .settings-card-note { color: var(--ok); }
 .settings-card[data-state="fail"] .settings-card-note { color: var(--danger); }
 
@@ -2186,6 +2470,53 @@ code { font-family: var(--font-data); font-size: 0.92em; }
 
 .settings-limits .settings-legend { margin-top: var(--sp-2); }
 
+/* A toast is outermost: above the dialog's top layer, pinned to the top
+   edge so a reader looking at the document cannot miss it. */
+.toasts {
+  position: fixed;
+  top: var(--sp-3);
+  left: 50%;
+  transform: translateX(-50%);
+  width: min(560px, calc(100vw - 2 * var(--sp-4)));
+  margin: 0;
+  padding: 0;
+  border: 0;
+  background: transparent;
+  overflow: visible;
+  z-index: 2147483000;
+}
+
+.toast {
+  margin-bottom: var(--sp-2);
+  padding: var(--sp-2) var(--sp-3);
+  border: 1px solid var(--border);
+  border-left: 4px solid var(--ok);
+  border-radius: var(--radius);
+  background: var(--surface);
+  color: var(--text);
+  font-size: var(--fs-sm);
+  line-height: 1.5;
+  box-shadow: var(--shadow);
+  cursor: pointer;
+  animation: toast-in var(--dur-2) var(--ease);
+}
+
+.toast[data-kind="error"] { border-left-color: var(--danger); }
+.toast[data-kind="warn"] { border-left-color: var(--warn); }
+
+@keyframes toast-in {
+  from { opacity: 0; transform: translateY(-8px); }
+  to { opacity: 1; transform: translateY(0); }
+}
+
+.dialog--agent-config { width: min(430px, calc(100vw - 2 * var(--sp-5))); }
+
+.settings-config-fields {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: var(--sp-4);
+}
+
 /* The save row keeps its own edge, so the scrolling cards never touch it. */
 .dialog--settings .dialog-actions {
   padding-top: var(--sp-3);
@@ -2193,8 +2524,17 @@ code { font-family: var(--font-data); font-size: 0.92em; }
 }
 
 @media (max-width: 719px) {
-  .settings-cards { grid-template-columns: 1fr; }
-  .settings-card-pair { grid-template-columns: 1fr; }
+  .settings-card { grid-template-columns: 1fr; }
+  .settings-card-side {
+    padding-right: 0;
+    padding-bottom: var(--sp-2);
+    border-right: 0;
+    border-bottom: 1px solid var(--border);
+  }
+  .settings-card-heading { flex: 0 0 auto; justify-content: space-between; }
+  .settings-card-footer { position: static; right: auto; }
+  .settings-group-choice { margin-right: 0; }
+  .settings-card-pair, .settings-config-fields { grid-template-columns: 1fr; }
   .settings-limits-grid { grid-template-columns: 1fr; gap: var(--sp-3); }
 }
 
@@ -2347,6 +2687,10 @@ code { font-family: var(--font-data); font-size: 0.92em; }
   .chunks, .log, .tab-panel--list .chunks, .tab-panel--list .log { max-height: 60vh; }
   .topbar { padding: 0 var(--sp-2) 0 var(--sp-3); }
   .crumb-root, .crumb-sep, .panes-note-label { display: none; }
+  /* On a phone the title keeps the first line and the state with its tools
+     wraps under it, right-aligned, rather than squeezing the file name. */
+  .job-head { flex-wrap: wrap; }
+  .job-head-side { flex-wrap: wrap; justify-content: flex-end; gap: var(--sp-2); }
   .seg { padding: 8px 12px; }
   .icon-btn { width: 40px; height: 40px; }
   /* The tools wrap on a phone, so the field gives back some of its width. */

@@ -28,6 +28,14 @@ def test_sink_writes_jsonl(tmp_path):
     assert lines[1]["step"] == "translate"
 
 
+def test_two_sinks_started_in_the_same_second_do_not_share_a_file(tmp_path):
+    first = EventSink(tmp_path, enabled=True, run_id="run_aaa111")
+    second = EventSink(tmp_path, enabled=True, run_id="run_bbb222")
+    assert first.path != second.path
+    assert first.path.name.startswith("run_")
+    assert second.path.name.startswith("run_")
+
+
 def test_sink_disabled_no_file(tmp_path):
     sink = EventSink(tmp_path, enabled=False)
     sink.info("x")

@@ -145,8 +145,21 @@ class AgentConfig(BaseModel):
 
     @property
     def has_backup(self) -> bool:
-        """True when a complete backup endpoint is configured."""
-        return bool(self.backup_base_url and self.backup_model)
+        """True when a *different* backup endpoint is configured.
+
+        A backup that names the same ``base_url`` and model as the primary is
+        not a fallback: it is the same request to the same deployment, which
+        has just said no. Retrying it there spends another full deadline (and
+        another retry ladder) before failing anyway, and — worse — it keeps
+        ``NoBackupError`` from ever firing, so the chunk layer never learns it
+        is out of options. Treating it as no backup makes the run stop and say
+        why instead of spinning for hours.
+        """
+        if not (self.backup_base_url and self.backup_model):
+            return False
+        return not (
+            self.backup_base_url == self.base_url and self.backup_model == self.model
+        )
 
     @property
     def is_mock(self) -> bool:
@@ -392,7 +405,21 @@ class AppConfig(BaseModel):
     #: means "pick the first available font with Vietnamese coverage".
     pdf_font_path: str = ""
     #: Rewrite the output file as chunks complete (long runs only).
-    partial_output: bool = False
+    #: Write the output file as chunks finish, so hours of work are not lost
+    #: when a run is stopped or a document never completes. Off means the file
+    #: appears only at the end — which is how a 5-hour run left an empty folder.
+    partial_output: bool = True
+    #: Optional AI repair of suspicious blocks after the layout extractor ran.
+    #: Off by default: the extractor remains the source of truth, and the review
+    #: only ever sees one block at a time. See ``ingest/ai_review.py``.
+    ingest_ai_review: bool = False
+    #: How many suspicious blocks one document may send for review. This is a
+    #: hard cost bound, not a page count: a long document is never sent whole.
+    ingest_ai_review_max_blocks: int = Field(default=20, ge=1, le=200)
+    #: Longest block offered to the review model. Longer blocks are skipped, not
+    #: truncated, because a partial block would change the question and could
+    #: lose its tail.
+    ingest_ai_review_max_chars: int = Field(default=2000, ge=100, le=20000)
     #: Cross-chunk terminology consistency pass after translation.
     consistency_check: bool = True
     #: Upper bound on consistency patch requests per document.
@@ -400,9 +427,38 @@ class AppConfig(BaseModel):
     #: How long to wait before a chunk whose step hit provider errors is run
     #: again; doubles with each attempt (see ``CHUNK_RETRY_MAX_DELAY``).
     chunk_retry_base_delay: float = Field(default=5.0, gt=0)
-    #: Ceiling on that wait. A chunk is never abandoned, so this is the pace at
-    #: which an outage is waited out rather than a deadline for giving up.
+    #: Ceiling on that wait. A chunk is retried at this pace to wait an outage
+    #: out, but not forever: ``CHUNK_MAX_ATTEMPTS`` is its attempt budget.
     chunk_retry_max_delay: float = Field(default=120.0, gt=0)
+    #: Attempts one chunk gets before it is abandoned for this run (its words
+    #: stay out of the checkpoint, so a later ``--resume`` asks again). Without
+    #: a ceiling a saturation loop on one chunk held a whole 74-chunk run for
+    #: hours and never wrote an output file.
+    chunk_max_attempts: int = Field(default=6, ge=1, le=100)
+    #: Consecutive chunks that may fail with "the provider is gone" before the
+    #: run stops asking. One dead endpoint must not be retried 76 times, but a
+    #: few scattered failures are holes in the document, not an outage.
+    chunk_stop_after_failures: int = Field(default=3, ge=1, le=100)
+    #: One short call per agent before a document is translated. A wrong key, a
+    #: model that does not exist or a dead endpoint costs seconds here instead
+    #: of hours into a long run (chunk-073 discovered a bad model name).
+    preflight: bool = True
+    #: How many times one chunk asks the Verifier again after the Verifier could
+    #: not answer at all (timeout/429). The draft is reused, so these cost
+    #: verification calls, never a second translation.
+    verify_unavailable_retries: int = Field(default=2, ge=0, le=10)
+    #: Base wait between those attempts; doubles each time and is capped at 60s.
+    verify_retry_delay: float = Field(default=5.0, ge=0)
+    #: Document-level sweeps over chunks still without a verified checkpoint.
+    #: Each sweep re-verifies the draft and only re-translates a rejection.
+    completion_rounds: int = Field(default=2, ge=0, le=5)
+    #: Wait before a sweep, so a provider outage has time to clear.
+    completion_retry_delay: float = Field(default=20.0, ge=0)
+    #: Wall-clock budget for all completion sweeps together. A verifier outage
+    #: can make one pending chunk wait through several 300s calls; without a
+    #: document-level deadline, a long pending list keeps the run alive for
+    #: hours after every translation is already on disk. ``0`` disables it.
+    completion_deadline: float = Field(default=900.0, ge=0)
 
     @field_validator("output_format")
     @classmethod
@@ -450,8 +506,8 @@ class RetryConfig(BaseModel):
 
     Env vars: ``LLM_MAX_RETRIES``, ``LLM_RETRY_BASE_DELAY``,
     ``LLM_RETRY_MAX_DELAY``, ``LLM_RETRY_BUFFER_SECONDS``, ``LLM_RETRY_JITTER``,
-    ``LLM_RETRY_CONCURRENCY_WAIT``, ``LLM_RETRY_SLOT_REBUILD_AFTER`` and
-    ``LLM_PROVIDER_CONCURRENCY``.
+    ``LLM_RETRY_CONCURRENCY_WAIT``, ``LLM_RETRY_SLOT_REBUILD_AFTER``,
+    ``LLM_PROVIDER_CONCURRENCY`` and ``LLM_PROVIDER_CONCURRENCY_MAX``.
     """
 
     max_retries: int = Field(default=3, ge=0, le=10)
@@ -476,6 +532,12 @@ class RetryConfig(BaseModel):
     #: raise it to the provider's real limit. This is a queue, not a throttle:
     #: queued calls wait their turn instead of failing.
     provider_concurrency: int = Field(default=1, ge=1, le=32)
+    #: Ceiling for a *moving* concurrency limit; ``0`` keeps it static at
+    #: ``provider_concurrency``. A higher value lets the queue grow one slot per
+    #: run of successes, so a paid account's real limit is found by probing it
+    #: instead of guessing — and every slot rejection halves it again, which is
+    #: what stops the probe from turning into a 429 storm.
+    provider_concurrency_max: int = Field(default=0, ge=0, le=32)
 
 
 def get_retry_config() -> RetryConfig:
@@ -490,9 +552,15 @@ def get_retry_config() -> RetryConfig:
             concurrency_wait=_get_float_env("LLM_RETRY_CONCURRENCY_WAIT", 10.0),
             slot_rebuild_after=_get_int_env("LLM_RETRY_SLOT_REBUILD_AFTER", 3),
             provider_concurrency=_get_int_env("LLM_PROVIDER_CONCURRENCY", 1),
+            provider_concurrency_max=_get_int_env("LLM_PROVIDER_CONCURRENCY_MAX", 0),
         )
     except ValidationError as exc:
         raise ConfigError(format_validation_error(exc, "retry config")) from exc
+    if cfg.provider_concurrency_max and cfg.provider_concurrency_max < cfg.provider_concurrency:
+        raise ConfigError(
+            f"LLM_PROVIDER_CONCURRENCY_MAX ({cfg.provider_concurrency_max}) must be >= "
+            f"LLM_PROVIDER_CONCURRENCY ({cfg.provider_concurrency})"
+        )
     if cfg.base_delay > cfg.max_delay:
         raise ConfigError(
             f"LLM_RETRY_BASE_DELAY ({cfg.base_delay}) must be <= "
@@ -618,7 +686,15 @@ def get_app_config() -> AppConfig:
     if os.getenv("PDF_FONT_PATH"):
         kwargs["pdf_font_path"] = _get_str_env("PDF_FONT_PATH", "")
     if os.getenv("PARTIAL_OUTPUT"):
-        kwargs["partial_output"] = _get_bool_env("PARTIAL_OUTPUT", False)
+        kwargs["partial_output"] = _get_bool_env("PARTIAL_OUTPUT", True)
+    if os.getenv("INGEST_AI_REVIEW"):
+        kwargs["ingest_ai_review"] = _get_bool_env("INGEST_AI_REVIEW", False)
+    if os.getenv("INGEST_AI_REVIEW_MAX_BLOCKS"):
+        kwargs["ingest_ai_review_max_blocks"] = _get_int_env("INGEST_AI_REVIEW_MAX_BLOCKS", 20)
+    if os.getenv("INGEST_AI_REVIEW_MAX_CHARS"):
+        kwargs["ingest_ai_review_max_chars"] = _get_int_env(
+            "INGEST_AI_REVIEW_MAX_CHARS", 2000
+        )
     if os.getenv("CONSISTENCY_CHECK"):
         kwargs["consistency_check"] = _get_bool_env("CONSISTENCY_CHECK", True)
     if os.getenv("CONSISTENCY_MAX_PATCHES"):
@@ -627,6 +703,27 @@ def get_app_config() -> AppConfig:
         kwargs["chunk_retry_base_delay"] = _get_float_env("CHUNK_RETRY_BASE_DELAY", 5.0)
     if os.getenv("CHUNK_RETRY_MAX_DELAY"):
         kwargs["chunk_retry_max_delay"] = _get_float_env("CHUNK_RETRY_MAX_DELAY", 120.0)
+    if os.getenv("CHUNK_MAX_ATTEMPTS"):
+        kwargs["chunk_max_attempts"] = _get_int_env("CHUNK_MAX_ATTEMPTS", 6)
+    if os.getenv("CHUNK_STOP_AFTER_FAILURES"):
+        kwargs["chunk_stop_after_failures"] = _get_int_env("CHUNK_STOP_AFTER_FAILURES", 3)
+    if os.getenv("PREFLIGHT"):
+        kwargs["preflight"] = os.getenv("PREFLIGHT", "1").strip().lower() not in {
+            "0",
+            "false",
+            "off",
+            "no",
+        }
+    if os.getenv("VERIFY_UNAVAILABLE_RETRIES"):
+        kwargs["verify_unavailable_retries"] = _get_int_env("VERIFY_UNAVAILABLE_RETRIES", 2)
+    if os.getenv("VERIFY_RETRY_DELAY"):
+        kwargs["verify_retry_delay"] = _get_float_env("VERIFY_RETRY_DELAY", 5.0)
+    if os.getenv("COMPLETION_ROUNDS"):
+        kwargs["completion_rounds"] = _get_int_env("COMPLETION_ROUNDS", 2)
+    if os.getenv("COMPLETION_RETRY_DELAY"):
+        kwargs["completion_retry_delay"] = _get_float_env("COMPLETION_RETRY_DELAY", 20.0)
+    if os.getenv("COMPLETION_DEADLINE_SECONDS"):
+        kwargs["completion_deadline"] = _get_float_env("COMPLETION_DEADLINE_SECONDS", 900.0)
     try:
         return AppConfig(**kwargs)
     except ValidationError as exc:

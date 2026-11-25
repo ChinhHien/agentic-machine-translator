@@ -22,7 +22,18 @@ def _write(tmp_path, text: str = DOC, name: str = "doc.pdf"):
     return write_pdf(tmp_path / name, text)
 
 
-def _key(path, *, src="en", tgt="vi", model="mock-model", hashes=("h0", "h1"), glossary=""):
+def _key(
+    path,
+    *,
+    src="en",
+    tgt="vi",
+    model="mock-model",
+    hashes=("h0", "h1"),
+    glossary="",
+    base_url="",
+    skill_id="",
+    skill_applied=False,
+):
     return CheckpointStore.doc_key(
         path,
         src=src,
@@ -30,6 +41,9 @@ def _key(path, *, src="en", tgt="vi", model="mock-model", hashes=("h0", "h1"), g
         model=model,
         chunk_hashes=list(hashes),
         glossary=glossary,
+        base_url=base_url,
+        skill_id=skill_id,
+        skill_applied=skill_applied,
     )
 
 
@@ -71,17 +85,24 @@ def test_verification_failure_preserves_only_completed_checkpoints(mock_env, tmp
 
     store = CheckpointStore(tmp_path / "cp")
     pipeline = TranslationPipeline(quiet=True)
-    with pytest.raises(VerificationError):
-        pipeline._run_chunks(
-            SimpleNamespace(invoke=invoke),
-            chunks,
-            {},
-            SimpleNamespace(advance=lambda: None),
-            store=store,
-            doc_key="document",
-        )
-    assert asked == ["c0", "c1"]
-    assert set(store.completed("document")) == {"c0"}
+    states = pipeline._run_chunks(
+        SimpleNamespace(invoke=invoke),
+        chunks,
+        {},
+        SimpleNamespace(advance=lambda: None),
+        store=store,
+        doc_key="document",
+    )
+    # The unavailable chunk does not stop the next one: it is flagged and left
+    # out of the checkpoint, while the rest of the document continues.
+    assert asked[:3] == ["c0", "c1", "c2"]
+    # The unavailable chunk is re-checked by the completion sweeps; the ones
+    # that already have their checkpoint are not touched again.
+    assert asked.count("c1") == 3
+    assert asked.count("c0") == asked.count("c2") == 1
+    assert states[0]["translated"] and states[2]["translated"]
+    assert states[1]["verify_unavailable"] is True
+    assert set(store.completed("document")) == {"c0", "c2"}
 
 
 def test_get_ignores_a_stale_chunk_hash(tmp_path):
@@ -96,8 +117,100 @@ def test_missing_checkpoint_and_clear(tmp_path):
     assert store.get("nope", "chunk-000") is None
     assert store.completed("nope") == {}
     store.put("key1", ChunkCheckpoint("chunk-000", "h0", "x"))
+    store.save_stats("key1", {"attempts": 2})
     store.clear("key1")
     assert store.get("key1", "chunk-000", "h0") is None
+    assert store.load_stats("key1") == {}
+
+
+def test_stats_sidecar_is_not_a_chunk_checkpoint(tmp_path):
+    store = CheckpointStore(tmp_path / "cp")
+    store.put("key1", ChunkCheckpoint("chunk-000", "h0", "x"))
+    store.save_stats("key1", {"attempts": 2, "tokens": {"sent": 10}})
+    assert store.load_stats("key1")["attempts"] == 2
+    # stats.json lives beside the chunks but must never be read as one.
+    assert set(store.completed("key1")) == {"chunk-000"}
+
+
+def test_cached_plan_must_match_the_job(tmp_path):
+    from polyglot_lc.analysis.unified_planner import (
+        PLAN_CACHE_SCHEMA,
+        DocumentPlan,
+        GlossaryPair,
+        plan_to_dict,
+    )
+    from polyglot_lc.pipeline.coordinator import _load_cached_plan
+    from polyglot_lc.segment.chunker import Chunk
+    from polyglot_lc.ui.trace import plan_hash
+
+    chunks = [Chunk(id="c0", text="Source.", token_count=2, section_path=[], index=0)]
+    plan = DocumentPlan(
+        summary="Tóm tắt",
+        strategy="giữ thuật ngữ",
+        glossary_pairs=[GlossaryPair("beam", "chùm tia")],
+        section_notes={"1": "giữ giọng"},
+        complexity=0.7,
+        section_count=1,
+    )
+    meta = {
+        "plan": {
+            "schema": PLAN_CACHE_SCHEMA,
+            "plan_hash": plan_hash(chunks),
+            "src": "en",
+            "tgt": "vi",
+            "glossary": "glossary-fingerprint",
+            "data": plan_to_dict(plan),
+        }
+    }
+    loaded = _load_cached_plan(meta, chunks, "en", "vi", "glossary-fingerprint")
+    assert loaded is not None
+    assert loaded.strategy == plan.strategy
+    assert loaded.glossary_pairs[0].translation == "chùm tia"
+    assert loaded.section_notes == {"1": "giữ giọng"}
+    # A changed document, language, glossary or cache schema must replan.
+    assert _load_cached_plan(meta, chunks, "en", "vi", "other") is None
+    assert _load_cached_plan(meta, chunks, "en", "fr", "glossary-fingerprint") is None
+    assert _load_cached_plan(meta, chunks, "en", "vi", "glossary-fingerprint")
+    meta["plan"]["schema"] = PLAN_CACHE_SCHEMA + 1
+    assert _load_cached_plan(meta, chunks, "en", "vi", "glossary-fingerprint") is None
+
+
+def test_cumulative_metrics_merge_attempts_without_double_counting_scores():
+    from polyglot_lc.pipeline.coordinator import PipelineResult, _merge_cumulative
+
+    result = PipelineResult()
+    result.retries = 2
+    result.chunk_retries = 1
+    result.planner_calls = 0
+    result.chunks = 3
+    result.chunks_failed = 0
+    result.verify_skipped = 1
+    # c1 is retried in this attempt and must replace, not add to, its old score.
+    result.skill_scores = {"c1": 10.0, "c2": 6.0}
+    previous = {
+        "attempts": 1,
+        "tokens": {"sent": 100, "received": 50, "cached": 10},
+        "calls": 3,
+        "cache_hits": 1,
+        "cache_misses": 2,
+        "retries": 4,
+        "chunk_retries": 2,
+        "fallbacks": 1,
+        "duration_ms": 1000,
+        "planner_calls": 1,
+        "skill_scores": {"c0": 4.0, "c1": 8.0},
+    }
+    usage = {"sent": 30, "received": 20, "cached": 5, "calls": 2, "cache_hits": 1, "cache_misses": 1}
+    merged = _merge_cumulative(previous, result, usage, {"fallbacks": 2}, 500)
+    assert merged["attempts"] == 2
+    assert merged["tokens"] == {"sent": 130, "received": 70, "cached": 15}
+    assert merged["calls"] == 5
+    assert merged["retries"] == 6
+    assert merged["fallbacks"] == 3
+    assert merged["duration_ms"] == 1500
+    assert merged["planner_calls"] == 1
+    assert merged["skill"] == {"mean": 6.667, "samples": 3}
+    assert merged["skill_scores"] == {"c0": 4.0, "c1": 10.0, "c2": 6.0}
 
 
 def test_disabled_store_is_inert(tmp_path):
@@ -128,6 +241,9 @@ def test_doc_key_changes_when_the_job_changes(tmp_path):
     assert base != _key(path, model="other-model")
     assert base != _key(path, tgt="fr")
     assert base != _key(path, hashes=("h0", "different"))  # re-chunked
+    assert base != _key(path, base_url="http://other.local/v1")
+    assert base != _key(path, skill_id="abc12345", skill_applied=True)
+    assert base != _key(path, skill_applied=True)
     _write(tmp_path, DOC + "\nOne more paragraph.\n")
     assert base != _key(path)  # edited document
 
@@ -166,8 +282,15 @@ def test_doc_key_ignores_a_rewrite_that_changes_no_bytes(tmp_path):
 
 # -------------------------------- end to end --------------------------------
 def _run(path, **kw):
+    import os
+
     from polyglot_lc.pipeline import TranslationPipeline
 
+    # The chunk budget is configuration now, not a per-run argument: a test that
+    # needs many chunks asks for it the way a user would.
+    budget = kw.pop("max_tokens", None)
+    if budget is not None:
+        os.environ["CHUNK_MAX_TOKENS"] = str(budget)
     return TranslationPipeline(quiet=True).run(path, src="en", tgt="vi", **kw)
 
 
@@ -182,10 +305,41 @@ def test_full_resume_translates_nothing_again(mock_env, tmp_path):
     second = _run(path, out=str(tmp_path / "b.md"), resume=True)
 
     assert second.resumed_chunks == second.chunks
+    assert second.plan_reused is True
+    assert second.cumulative["attempts"] == 2
     assert TokenUsage.snapshot()["calls"] == 0  # zero new requests
     assert (tmp_path / "a.md").read_text(encoding="utf-8") == (tmp_path / "b.md").read_text(
         encoding="utf-8"
     )
+
+
+def test_a_fresh_run_does_not_accumulate_old_stats(mock_env, tmp_path):
+    clear_mock_replies()
+    path = _write(tmp_path)
+    _run(path, out=str(tmp_path / "a.md"))
+    TokenUsage.reset()
+
+    fresh = _run(path, out=str(tmp_path / "b.md"))
+
+    # No --resume means the old translation job, including its counters, is gone.
+    assert fresh.cumulative["attempts"] == 1
+
+
+def test_a_corrupt_stats_file_does_not_break_resume(mock_env, tmp_path):
+    clear_mock_replies()
+    path = _write(tmp_path)
+    first = _run(path, out=str(tmp_path / "a.md"))
+    assert first.cumulative["attempts"] == 1
+    stats_path = next((tmp_path / "checkpoints").glob("*/stats.json"))
+    stats_path.write_text("not json", encoding="utf-8")
+
+    TokenUsage.reset()
+    second = _run(path, out=str(tmp_path / "b.md"), resume=True)
+
+    # The counters restart rather than fail the resume; the translation itself
+    # still comes from the checkpoints.
+    assert second.resumed_chunks == second.chunks
+    assert second.cumulative["attempts"] == 1
 
 
 def test_resume_does_not_trust_legacy_checkpoints(mock_env, tmp_path, monkeypatch):
@@ -237,6 +391,69 @@ def test_enabling_full_verification_invalidates_fast_skip_checkpoints(
     assert checked.resumed_chunks == 0
 
 
+def test_a_checkpoint_is_also_banked_by_its_chunk_text(tmp_path):
+    """The bank is content addressed: another job can find it by chunk hash."""
+    store = CheckpointStore(tmp_path / "cp")
+    store.model = "model-a"
+    store.content_key = "content"
+    store.put("job-a", ChunkCheckpoint("chunk-000", "h0", "bản dịch"))
+
+    other = CheckpointStore(tmp_path / "cp")
+    other.content_key = "content"
+    other.model = "model-b"
+    found = other.bank_get("h0")
+
+    assert found is not None
+    assert found.translated == "bản dịch"
+    assert found.model == "model-a"  # provenance survives the hand-off
+    assert found.source_doc_key == "job-a"
+
+
+def test_the_bank_refuses_another_job_identity(tmp_path):
+    """Another glossary or verification policy is another deliverable."""
+    store = CheckpointStore(tmp_path / "cp")
+    store.model = "model-a"
+    store.content_key = "content"
+    store.put("job-a", ChunkCheckpoint("chunk-000", "h0", "bản dịch"))
+
+    other = CheckpointStore(tmp_path / "cp")
+    other.content_key = "another-glossary"
+    assert other.bank_get("h0") is None
+    assert other.bank_get("h0", "content") is not None
+
+
+def test_a_resume_after_a_model_switch_reuses_the_banked_translations(
+    mock_env, tmp_path, monkeypatch
+):
+    """Changing the Translator must not throw away what is already translated."""
+    clear_mock_replies()
+    path = _write(tmp_path)
+    first = _run(path, out=str(tmp_path / "a.md"))
+    assert first.chunks >= 1
+
+    # Another model: same document, same glossary, a different checkpoint key.
+    monkeypatch.setenv("TRANSLATOR_MODEL", "mock-other-model")
+    TokenUsage.reset()
+    again = _run(path, out=str(tmp_path / "b.md"), resume=True)
+
+    assert again.resumed_chunks == again.chunks
+    assert again.reused_foreign == again.chunks
+    assert TokenUsage.snapshot()["calls"] == 0
+
+
+def test_no_reuse_foreign_translates_every_chunk_again(mock_env, tmp_path, monkeypatch):
+    """The escape hatch: a reader may want a clean run with the new model."""
+    clear_mock_replies()
+    path = _write(tmp_path)
+    _run(path, out=str(tmp_path / "a.md"))
+
+    monkeypatch.setenv("TRANSLATOR_MODEL", "mock-other-model")
+    again = _run(path, out=str(tmp_path / "b.md"), resume=True, reuse_foreign=False)
+
+    assert again.reused_foreign == 0
+    assert again.resumed_chunks == 0
+
+
 def test_verification_failure_records_finished_chunks_and_can_resume(
     mock_env, tmp_path, monkeypatch
 ):
@@ -262,23 +479,62 @@ def test_verification_failure_records_finished_chunks_and_can_resume(
         return VerifyResult(ok=True, reasons=[])
 
     monkeypatch.setattr(VerifierAgent, "verify", verify)
+    monkeypatch.setenv("CHUNK_MAX_TOKENS", "15")
     pipeline = TranslationPipeline(quiet=True)
-    with pytest.raises(VerificationError):
-        pipeline.run(path, src="en", tgt="vi", out=str(tmp_path / "stopped.md"), max_tokens=15)
+    result = pipeline.run(path, src="en", tgt="vi", out=str(tmp_path / "kept.md"))
 
     end = _records_of(pipeline.sink.path, "run_end")[-1]
-    assert end["status"] == "failed"
-    assert end["chunks_done"] == 1
-    assert end["chunks_failed"] == len(chunks) - 1
+    assert end["status"] == "incomplete"
+    assert end["exit_code"] == 2
+    assert end["chunks_done"] == len(chunks)
+    assert end["chunks_failed"] == 0
     assert end["verify_skipped"] == 1
+    assert [item["chunk"] for item in end["completion"]["incomplete"]] == [chunks[1].id]
+    assert result.verify_skipped == 1
     named = _records_of(pipeline.sink.path, "checkpoint")[0]
     stored = CheckpointStore(tmp_path / "checkpoints").completed(named["doc_key"])
-    assert set(stored) == {chunks[0].id}
+    # The unverified chunk is kept in the output but not replayed on resume.
+    assert set(stored) == {c.id for c in chunks if c.id != chunks[1].id}
 
     monkeypatch.setattr(VerifierAgent, "verify", lambda *a, **kw: VerifyResult(ok=True, reasons=[]))
     resumed = _run(path, out=str(tmp_path / "resumed.md"), max_tokens=15, resume=True)
-    assert resumed.resumed_chunks == 1
+    assert resumed.resumed_chunks == len(chunks) - 1
     assert resumed.chunks_failed == 0
+
+
+def test_a_verifier_outage_that_clears_is_retried_until_verified(
+    mock_env, tmp_path, monkeypatch
+):
+    """A timeout is not a verdict: re-checking the same draft can finish the run."""
+    from polyglot_lc.agents.context import extract_source
+    from polyglot_lc.agents.translator import TranslatorAgent
+    from polyglot_lc.agents.verifier import VerificationError, VerifierAgent, VerifyResult
+
+    monkeypatch.setenv("MAX_CONCURRENCY", "1")
+    monkeypatch.setenv("CHUNK_OVERLAP_TOKENS", "0")
+    monkeypatch.setenv("LOG_JSONL", "1")
+    clear_mock_replies()
+    path = _write(tmp_path)
+    monkeypatch.setattr(
+        TranslatorAgent, "translate", lambda self, prompt, **kw: extract_source(prompt)
+    )
+    attempts: dict[str, int] = {}
+
+    def verify(self, source, *args, **kwargs):
+        attempts[source] = attempts.get(source, 0) + 1
+        if attempts[source] == 1:
+            raise VerificationError("verification unavailable")
+        return VerifyResult(ok=True, reasons=[])
+
+    monkeypatch.setattr(VerifierAgent, "verify", verify)
+    result = _run(path, out=str(tmp_path / "retried.md"), max_tokens=15)
+
+    assert result.incomplete_chunks == []
+    assert result.verify_skipped == 0
+    end = _records_of(Path(result.log_path), "run_end")[-1]
+    assert end["status"] == "done"
+    assert end["exit_code"] == 0
+    assert end["completion"]["verified"] == end["completion"]["expected"]
 
 
 @pytest.mark.parametrize("workers", [1, 4])
@@ -325,7 +581,7 @@ def test_quality_rejections_are_isolated_and_resume_only_missing_chunks(
     target = tmp_path / "incomplete.md"
     result = _run(path, out=str(target), max_tokens=15)
 
-    assert Counter(asked) == Counter({c.id: 2 if c.id in rejected else 1 for c in chunks})
+    assert Counter(asked) == Counter({c.id: 3 if c.id in rejected else 1 for c in chunks})
     # Best-effort output: every chunk has text; rejected chunks carry a review
     # note instead of a hole and are not checkpointed for resume.
     assert result.chunks_failed == 0
@@ -343,11 +599,12 @@ def test_quality_rejections_are_isolated_and_resume_only_missing_chunks(
     # the run summary, never written into the document itself.
     assert "needs review" not in text
     end = _records_of(Path(result.log_path), "run_end")[-1]
-    assert end["status"] == "done_with_warnings"
-    assert end["exit_code"] == 0
+    assert end["status"] == "incomplete"
+    assert end["exit_code"] == 2
     assert end["chunks_done"] == len(chunks)
     assert end["chunks_failed"] == 0
     assert end["chunks_rejected"] == len(rejected)
+    assert len(end["completion"]["incomplete"]) == len(rejected)
     assert end["fatal_error"] == ""
     named = _records_of(Path(result.log_path), "checkpoint")[0]
     store = CheckpointStore(tmp_path / "checkpoints")
@@ -415,113 +672,6 @@ def test_a_passing_verdict_with_praise_reasons_accepts_every_chunk(mock_env, tmp
         assert "DRAFT " + chunk.text in text
 
 
-def test_a_glossary_term_hidden_inside_longer_words_costs_no_retranslation(
-    mock_env, tmp_path, monkeypatch
-):
-    """A real 609-chunk run rejected 27 chunks demanding 'thấp' for 'low'.
-
-    The source only ever said 'below'/'allow'/'flow'. The verdict on record was
-    ``pass=true`` with no defects; the deterministic glossary check invented the
-    failure, every chunk burned its single retranslate on a term it did not
-    contain, and the run logged "verification failed" quoting the verifier's
-    praise instead of a fault.
-    """
-    from polyglot_lc.agents.context import extract_source
-    from polyglot_lc.agents.translator import TranslatorAgent
-    from polyglot_lc.agents.verifier import VerifierAgent
-
-    monkeypatch.setenv("MAX_CONCURRENCY", "1")
-    monkeypatch.setenv("CHUNK_OVERLAP_TOKENS", "0")
-    monkeypatch.setenv("CONSISTENCY_CHECK", "0")
-    monkeypatch.setenv("FAST_PATH_SKIP_LLM_VERIFY", "0")
-    monkeypatch.setenv("LOG_JSONL", "1")
-    clear_mock_replies()
-    path = _write(
-        tmp_path,
-        "The values below are listed in the table. " * 6
-        + "\n\nAllow the flow to continue and update the candidate list. " * 6
-        + "\n\nA higher value follows the same rule. " * 6,
-    )
-    csv = tmp_path / "glossary.csv"
-    csv.write_text("low,thấp\ndate,ngày\nhigh,cao\n", encoding="utf-8")
-
-    monkeypatch.setattr(
-        TranslatorAgent,
-        "translate",
-        lambda self, prompt, chunk_id="": "DRAFT " + extract_source(prompt),
-    )
-    monkeypatch.setattr(
-        VerifierAgent,
-        "chat_json",
-        lambda *a, **kw: {"pass": True, "defects": [], "reasons": ["All checks passed."]},
-    )
-    target = tmp_path / "glossary.md"
-    result = _run(path, out=str(target), max_tokens=15, glossary=str(csv))
-
-    assert result.chunks >= 1
-    assert result.chunks_rejected == 0
-    assert result.chunks_failed == 0
-    assert not any("verification failed" in error for error in result.errors)
-    decisions = _records_of(Path(result.log_path), "decision")
-    assert not [
-        d for d in decisions if d.get("kind") == "retranslate" and d.get("chosen")
-    ], "no chunk may be sent back for a term its source does not contain"
-    assert "DRAFT The values below" in target.read_text(encoding="utf-8")
-
-
-def test_a_real_glossary_miss_is_logged_as_the_miss_not_as_praise(
-    mock_env, tmp_path, monkeypatch
-):
-    """When a chunk genuinely is rejected, the log must say what is wrong.
-
-    The run's error record used to read "verification failed after
-    retranslation: All source segments are present..." — the verifier's own
-    summary of the checks it cleared, with the actual fault buried past the
-    three reasons the graph quotes.
-    """
-    from polyglot_lc.agents.context import extract_source
-    from polyglot_lc.agents.translator import TranslatorAgent
-    from polyglot_lc.agents.verifier import VerifierAgent
-
-    monkeypatch.setenv("MAX_CONCURRENCY", "1")
-    monkeypatch.setenv("CHUNK_OVERLAP_TOKENS", "0")
-    monkeypatch.setenv("CONSISTENCY_CHECK", "0")
-    monkeypatch.setenv("FAST_PATH_SKIP_LLM_VERIFY", "0")
-    monkeypatch.setenv("LOG_JSONL", "1")
-    clear_mock_replies()
-    path = _write(tmp_path, "The impact level is low. " * 12)
-    csv = tmp_path / "glossary.csv"
-    csv.write_text("low,thấp\n", encoding="utf-8")
-
-    monkeypatch.setattr(
-        TranslatorAgent,
-        "translate",
-        lambda self, prompt, chunk_id="": "DRAFT " + extract_source(prompt),
-    )
-    monkeypatch.setattr(
-        VerifierAgent,
-        "chat_json",
-        lambda *a, **kw: {
-            "pass": True,
-            "defects": [],
-            "reasons": [
-                "Completeness: all source sentences are represented.",
-                "No additions: no invented content detected.",
-                "Language: reads naturally.",
-            ],
-        },
-    )
-    result = _run(path, out=str(tmp_path / "miss.md"), max_tokens=15, glossary=str(csv))
-
-    assert result.chunks_rejected >= 1
-    records = _records_of(Path(result.log_path), "error")
-    failures = [
-        str(r.get("message")) for r in records if "verification failed" in str(r.get("message"))
-    ]
-    assert failures, records
-    assert "thấp" in failures[0]
-    head = failures[0].split("retranslation:", 1)[-1].lstrip()
-    assert head.startswith("glossary term"), head
 
 
 def test_resume_without_checkpoints_re_translates(mock_env, tmp_path):
@@ -532,29 +682,6 @@ def test_resume_without_checkpoints_re_translates(mock_env, tmp_path):
     assert result.resumed_chunks == 0
     assert TokenUsage.snapshot()["calls"] > 0
 
-
-def test_resuming_with_a_new_glossary_asks_the_chunks_again(mock_env, tmp_path):
-    """A changed CSV must not be papered over by a checkpoint hit.
-
-    The terminology is part of the checkpoint's identity, so the chunks
-    translated without the new term are asked again instead of being replayed
-    and leaving that term out of the file.
-    """
-    clear_mock_replies()
-    path = _write(tmp_path)
-    csv_a = tmp_path / "a.csv"
-    csv_a.write_text("NMT,Dịch máy neural\n", encoding="utf-8")
-    csv_b = tmp_path / "b.csv"
-    csv_b.write_text("NMT,Dịch máy nơ-ron\n", encoding="utf-8")
-
-    first = _run(path, out=str(tmp_path / "a.md"), glossary=str(csv_a))
-    assert first.chunks >= 1
-
-    same = _run(path, out=str(tmp_path / "b.md"), resume=True, glossary=str(csv_a))
-    assert same.resumed_chunks == same.chunks
-
-    changed = _run(path, out=str(tmp_path / "c.md"), resume=True, glossary=str(csv_b))
-    assert changed.resumed_chunks == 0
 
 
 def test_the_resume_record_makes_a_replay_visible_early(mock_env, tmp_path):
@@ -632,7 +759,9 @@ def test_the_run_names_the_directory_its_chunks_are_written_to(mock_env, tmp_pat
     assert len(named) == 1, "one attempt names its directory once"
     directory = Path(named[0]["path"])
     assert directory.is_dir() and named[0]["doc_key"] == directory.name
-    written = {item.stem for item in directory.glob("*.json") if item.name != "meta.json"}
+    written = {
+        item.stem for item in directory.glob("*.json") if item.name not in {"meta.json", "stats.json"}
+    }
     assert written == {f"chunk-{index:03d}" for index in range(result.chunks)}
 
 
@@ -740,7 +869,11 @@ def test_a_crashed_run_resumes_the_chunks_it_finished(mock_env, tmp_path, monkey
     second = _run(path, out=str(tmp_path / "resumed.md"), max_tokens=15, resume=True)
 
     assert second.resumed_chunks == len(chunks) - 1
-    assert second.planner_calls == 1
+    # The plan saved by the crashed attempt is reused, so resume pays no Planner
+    # request and keeps the same glossary/section notes for the remaining chunk.
+    assert second.planner_calls == 0
+    assert second.plan_reused is True
+    assert second.cumulative["attempts"] == 2
     # Exactly one chunk re-ran its graph. Its draft literally repeats the source
     # text, so the leakage signal must refuse the fast path for it.
     by_agent = TokenUsage.snapshot_by_agent()
@@ -819,14 +952,17 @@ def test_a_rate_limited_chunk_is_waited_out_not_left_behind(mock_env, tmp_path, 
     assert end["chunk_retries"] == 5
 
 
-def test_a_chunk_with_no_backup_left_stops_the_run_instead_of_waiting_forever(
+def test_a_chunk_with_no_backup_left_is_a_hole_not_a_dead_run(
     mock_env, tmp_path, monkeypatch
 ):
-    """The attempts are spent and there is no backup: the run ends and says so.
+    """One chunk out of endpoints is a hole in the file, not a failed run.
 
     Waiting on an endpoint that has already said no is how a run used to sit at
-    "0/38" for an hour. The chunk is asked once, the run stops, the chunks
-    after it are not asked at all, and the record says what happened.
+    "0/38" for an hour — so the chunk is asked once and never waited on. But
+    another 75 good chunks were being thrown away with it: a single lost race is
+    now reported as incomplete (exit 2) and left out of the checkpoint, and the
+    run continues. ``CHUNK_STOP_AFTER_FAILURES`` consecutive such failures is
+    what an outage looks like (see the test below).
     """
     import json
 
@@ -856,15 +992,59 @@ def test_a_chunk_with_no_backup_left_stops_the_run_instead_of_waiting_forever(
     out = tmp_path / "stopped.md"
     result = _run(path, out=str(out), max_tokens=15)  # must not raise
 
-    # One attempt, not a wait: the chunk was asked once and the run gave up.
+    # One attempt, not a wait: the chunk was asked once and never retried.
     assert attempts["n"] == 1
-    assert result.chunks_failed >= 1
+    assert result.chunks_failed == 0
+    assert result.chunks_permanently_failed == 1
+    assert [item["chunk"] for item in result.incomplete_chunks] == [doomed]
     assert any("no backup endpoint" in error for error in result.errors), result.errors
     records = [
         json.loads(line) for line in Path(result.log_path).read_text(encoding="utf-8").splitlines()
     ]
     # No chunk was waited out: the run did not sit on the dead endpoint.
     assert not [record for record in records if record.get("type") == "retry_wait"]
+    end = [record for record in records if record.get("type") == "run_end"][-1]
+    assert (end["status"], end["exit_code"]) == ("incomplete", 2)
+    assert end["chunks_permanently_failed"] == 1
+    assert out.is_file() and out.read_text(encoding="utf-8").strip()
+
+
+def test_a_provider_that_keeps_failing_stops_the_run(mock_env, tmp_path, monkeypatch):
+    """Two chunks in a row with no endpoint left is an outage, not two holes.
+
+    Without this the "keep going" rule would ask a dead provider once per chunk
+    for the whole document and file every chunk as a hole, spending the run's
+    time to produce nothing. The streak is what tells the two apart.
+    """
+    import json
+
+    from polyglot_lc.agents.translator import TranslatorAgent
+    from polyglot_lc.llm.resilience import NoBackupError
+
+    monkeypatch.setenv("MAX_CONCURRENCY", "1")
+    monkeypatch.setenv("CHUNK_OVERLAP_TOKENS", "0")
+    monkeypatch.setenv("CHUNK_STOP_AFTER_FAILURES", "2")
+    monkeypatch.setenv("CHUNK_RETRY_BASE_DELAY", "0.01")
+    monkeypatch.setenv("CHUNK_RETRY_MAX_DELAY", "0.02")
+    monkeypatch.setenv("LOG_JSONL", "1")
+    clear_mock_replies()
+    path = _write(tmp_path, DOC + "\nA third paragraph to translate as well.\n")
+    chunks = _chunks_of(path)
+    assert len(chunks) >= 3
+    asked: list[str] = []
+
+    def dying_translate(self, prompt, chunk_id=""):
+        asked.append(chunk_id)
+        raise NoBackupError("no backup endpoint is configured: 429")
+
+    monkeypatch.setattr(TranslatorAgent, "translate", dying_translate)
+    result = _run(path, out=str(tmp_path / "stopped.md"), max_tokens=15)
+
+    assert len(asked) == 2, asked  # the third chunk is never asked
+    assert result.chunks_failed >= 1
+    records = [
+        json.loads(line) for line in Path(result.log_path).read_text(encoding="utf-8").splitlines()
+    ]
     end = [record for record in records if record.get("type") == "run_end"][-1]
     assert (end["status"], end["exit_code"]) == ("failed", 1)
 

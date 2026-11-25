@@ -40,8 +40,8 @@ def test_skill_md_round_trip(store):
     assert loaded["schema"] == 2 and loaded["version"] == 1
     assert loaded["measured_runs"] == 1
     assert len(loaded["skill_id"]) == 8
-    # A version is stored as it was promoted: overwriting must stay auditable.
-    assert (store.versions_dir / "v1.md").exists()
+    # There is exactly one skill file; no old snapshot is written beside it.
+    assert not (store.dir / "versions").exists()
 
 
 def test_schema_one_file_still_loads(store):
@@ -72,6 +72,24 @@ def test_heading_levels_and_bullets_are_content_free(store):
     assert loaded["instruction"] == "Keep placeholders."
     assert loaded["few_shot"] == ["a => b", "c => d"]
     assert loaded["rationale"] == "because"
+
+
+def test_commented_lines_are_not_content(store):
+    """A line wrapped in an HTML comment is switched off, not one more rule."""
+    import hashlib
+
+    folder = store.dir
+    folder.mkdir(parents=True)
+    (folder / "skill.md").write_text(
+        "---\nschema: 2\n---\nInstruction\nKeep placeholders.\n\n"
+        "Few-shot\na => b\n<!-- c => d -->\n\nRationale\nbecause\n",
+        encoding="utf-8",
+    )
+    loaded = store.load()
+    assert loaded["few_shot"] == ["a => b"]
+    expected = hashlib.sha1("Keep placeholders.\na => b".encode("utf-8")).hexdigest()[:8]
+    assert loaded["skill_id"] == expected
+    assert store.validate() == []
 
 
 def test_save_flattens_and_caps_few_shot(store):
@@ -135,8 +153,8 @@ def test_a_locked_skill_is_replaced_after_a_brief_retry(store, monkeypatch):
 
     monkeypatch.setattr(Path, "replace", flaky)
     store.save(instruction="Be terse.", few_shot=[], rationale="r", mean_score=8.0)
-    # The skill and its version snapshot both go through ``replace``: the
-    # retries belong to each write, not to the save as a whole.
+    # The single skill file goes through ``replace``; the retries belong to
+    # that write, not to the save as a whole.
     assert calls["n"] >= 3
     assert store.load()["instruction"] == "Be terse."
     assert not list(store.dir.rglob("*.tmp"))
@@ -247,7 +265,8 @@ def test_improvement_promotes_new_skill(optimizer, store):
     assert second["baseline_mean"] == pytest.approx(4.0)
     assert second["mean_score"] is None
     assert store.load()["mean_score"] is None
-    assert (store.versions_dir / "v2.md").exists()
+    assert store.load()["version"] == 2
+    assert not (store.dir / "versions").exists()
 
 
 def test_min_samples_blocks_promotion(optimizer, store, monkeypatch):
@@ -323,14 +342,14 @@ def test_promoting_run_does_not_measure_the_new_version(store):
     assert store.load() is None  # no skill was written: only measured
 
 
-def test_restore_brings_a_version_back(store):
+def test_a_promotion_overwrites_the_single_skill_file(store):
+    """There is no old-version archive: the next update replaces skill.md."""
     store.save(instruction="first", few_shot=[], rationale="r")
     store.save(instruction="second", few_shot=[], rationale="r")
-    store.restore(1)
-    assert store.load()["instruction"] == "first"
-    assert store.history()[-1]["reason"] == "restored"
-    with pytest.raises(FileNotFoundError):
-        store.restore(9)
+
+    assert store.load()["instruction"] == "second"
+    assert store.load()["version"] == 2
+    assert [p.name for p in store.dir.glob("*.md")] == ["skill.md"]
 
 
 def test_the_repository_skill_is_valid(store):

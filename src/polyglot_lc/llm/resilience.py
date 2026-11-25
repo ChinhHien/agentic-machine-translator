@@ -5,8 +5,9 @@ Classification rules
 * :class:`RateLimitError`   — HTTP 429 / ``rate_limit_exceeded``: retry with
   the provider-supplied wait when parseable (``try again in 47.4s``), else
   exponential backoff (base * 2^n capped at max).
-* :class:`TransientError`   — timeouts, connection errors, HTTP 408/409/425/
-  429-free 5xx: retry with exponential backoff.
+* :class:`TransientError`   — timeouts, connection errors, HTTP 408/409/425 and
+  the CDN 5xx codes (520-525, 527, 529): retry with exponential backoff, or with
+  the provider's own ``retry_after`` hint when the body carries one.
 * :class:`PermanentError`   — 400/401/403/404/422, bad replies, anything a
   different endpoint cannot fix: fail fast, no retry, no fallback.
 * :class:`NoBackupError`    — raised once the attempts are spent and there was
@@ -35,7 +36,19 @@ from polyglot_lc.config import RetryConfig
 VERBOSE_RESILIENCE = os.getenv("LLM_VERBOSE_RESILIENCE", "0").lower() in {"1", "true", "yes", "on"}
 
 #: HTTP status codes worth retrying (transient server/network trouble).
-RETRYABLE_STATUS = frozenset({408, 409, 425, 500, 502, 503, 504})
+#: The CDN codes are here because Cloudflare reports a slow origin, not a
+#: broken request: its 524 is a 120 s proxy read timeout, and the body says
+#: ``"retryable": true, "retry_after": 120``. Classifying it as permanent ended
+#: a whole 76-chunk run after a single chunk timed out.
+RETRYABLE_STATUS = frozenset(
+    {408, 409, 425, 500, 502, 503, 504, 520, 521, 522, 523, 524, 525, 527, 529}
+)
+
+#: Ceiling for a provider wait hint, in seconds. A CDN body may legitimately ask
+#: for longer than ``max_delay`` (Cloudflare's 524 asks for 120 s, and retrying
+#: earlier only gets the same timeout), so the hint is not capped by it — but a
+#: nonsense value must not park the run for an hour either.
+MAX_HINT_WAIT = 300.0
 
 
 class LLMError(RuntimeError):
@@ -54,11 +67,18 @@ class RateLimitError(LLMError):
 
 
 class TransientError(LLMError):
-    """Timeout / connection error / retryable HTTP status."""
+    """Timeout / connection error / retryable HTTP status.
 
-    def __init__(self, message: str, status: int | None = None) -> None:
+    ``retry_after`` is the wait the provider itself asked for, when the body
+    carries one (a CDN's 5xx says how long its origin needs).
+    """
+
+    def __init__(
+        self, message: str, status: int | None = None, retry_after: float | None = None
+    ) -> None:
         super().__init__(message)
         self.status = status
+        self.retry_after = retry_after
 
 
 class PermanentError(LLMError):
@@ -88,7 +108,7 @@ class NoBackupError(LLMError):
 #: doubles from. Sized for a plain model's answer, NOT for a reasoning one: a
 #: reasoning model charges its thinking to the same budget, and a real run's
 #: verdicts thought a median of ~4200 tokens — more than this entire cap. The
-#: ladder and the per-endpoint learned cap are what recover those calls. The
+#: ladder is what recovers those calls. The
 #: Translator sets no cap on its first ask and uses its own larger recovery
 #: budget (see :mod:`polyglot_lc.agents.translator`).
 RAISED_OUTPUT_CAP = 4096
@@ -177,6 +197,41 @@ def _extract_status(text: str) -> int | None:
     return int(m.group(1)) if m else None
 
 
+#: When the provider itself says it has no free slot, every worker waits on
+#: this shared deadline. Without it a pool of chunk workers all retry at once
+#: and collide again, spending their own retry budgets on one outage.
+_PAUSE_LOCK = threading.Lock()
+_PAUSE_UNTIL = 0.0
+
+
+def note_provider_pause(seconds: float) -> None:
+    """Hold every LLM call for *seconds* from now (concurrency outages only)."""
+    global _PAUSE_UNTIL
+    if seconds <= 0:
+        return
+    with _PAUSE_LOCK:
+        _PAUSE_UNTIL = max(_PAUSE_UNTIL, time.monotonic() + seconds)
+
+
+def reset_provider_pause() -> None:
+    global _PAUSE_UNTIL
+    with _PAUSE_LOCK:
+        _PAUSE_UNTIL = 0.0
+
+
+def _wait_for_provider() -> None:
+    with _PAUSE_LOCK:
+        remaining = _PAUSE_UNTIL - time.monotonic()
+    if remaining > 0:
+        time.sleep(min(remaining, 300.0))
+
+
+def _provider_wide_outage(err: RateLimitError) -> bool:
+    """A 429 about the account's own slots/deployments, not one request's quota."""
+    text = str(err).lower()
+    return is_concurrency_limit(err) or "no deployments available" in text
+
+
 def parse_retry_seconds(text: str) -> float | None:
     """Best-effort parse of a provider wait hint, in seconds.
 
@@ -233,7 +288,7 @@ def normalize_provider_error(exc: BaseException) -> LLMError:
         if status == 429:
             return RateLimitError(text, retry_after=parse_retry_seconds(text), status=status)
         if status in RETRYABLE_STATUS:
-            return TransientError(text, status=status)
+            return TransientError(text, status=status, retry_after=parse_retry_seconds(text))
         return PermanentError(text, status=status)
     if _looks_like_rate_limit(text):
         return RateLimitError(
@@ -348,6 +403,7 @@ class RetryStats:
             cls._transient_retries = 0
             cls._fallbacks = 0
             cls._chunk_retries = 0
+        reset_provider_pause()
 
 
 def _sleep(seconds: float) -> None:
@@ -373,14 +429,18 @@ def call_with_resilience(
     given, receives the same ``(*args, **kwargs)``).
 
     Flow: rate limit -> wait (provider hint + buffer, else exponential
-    backoff) and retry; transient errors -> backoff and retry; retries
-    exhausted (or unrecoverable error) -> switch to *backup* when configured.
+    backoff) and retry; transient errors -> the body's ``retry_after`` when it
+    gives one, else backoff, and retry; retries exhausted (or unrecoverable
+    error) -> switch to *backup* when configured.
     Permanent errors never retry and never fall back.
     """
     cfg = retry_cfg or RetryConfig()
     kwargs = kwargs or {}
 
     def _call(fn: Any) -> Any:
+        # A provider that just told the whole account to wait is obeyed by every
+        # worker, not only by the request that happened to receive the 429.
+        _wait_for_provider()
         return fn(*args, **kwargs)
 
     def _log(err: LLMError, attempt: int, wait: float, reason: str) -> None:
@@ -418,6 +478,8 @@ def call_with_resilience(
                 reason = "rate limit: another request still holds the slot"
             _log(err, attempt, wait, reason)
             RetryStats.add_rate_limit_retry()
+            if _provider_wide_outage(err):
+                note_provider_pause(wait)
             if on_retry is not None:
                 on_retry(str(err))
             _sleep(wait)
@@ -446,7 +508,15 @@ def call_with_resilience(
         last = err
         for attempt in range(cfg.max_retries):
             wait = jittered_delay(cfg, attempt)
-            _log(err, attempt, wait, "transient error: exponential backoff")
+            reason = "transient error: exponential backoff"
+            hinted = getattr(err, "retry_after", None)
+            if hinted is not None:
+                # The provider said how long its side needs. For a CDN timeout
+                # that is longer than max_delay, and ignoring it only re-asks
+                # mid-timeout; backoff stays the floor, the hint the wait.
+                wait = min(MAX_HINT_WAIT, max(wait, hinted + cfg.buffer_seconds))
+                reason = "transient error: provider hint"
+            _log(err, attempt, wait, reason)
             RetryStats.add_transient_retry()
             if on_retry is not None:
                 on_retry(str(err))
@@ -460,6 +530,7 @@ def call_with_resilience(
                     # the truncation reaches the caller, which raises the cap
                     # and re-asks, instead of spending the backup endpoint.
                     raise retry_err from None
+                err = retry_err  # a fresh body may carry a fresh hint
         return _fallback_or_raise(
             backup, args, kwargs, last, provider, model, backup_provider, backup_model
         )

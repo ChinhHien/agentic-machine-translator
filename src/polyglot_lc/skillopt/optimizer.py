@@ -27,8 +27,6 @@ from polyglot_lc.agents import PlannerAgent
 from polyglot_lc.config import get_app_config
 from polyglot_lc.skillopt.skill_store import SkillStore
 
-WINDOW = 20
-
 _DEFAULT_INSTRUCTION = "Translate faithfully and fluently."
 
 
@@ -191,7 +189,6 @@ class SkillOptimizer:
             return None
 
         assert gradient is not None
-        number = (current["version"] + 1) if current else 1
         self.store.save(
             instruction=gradient["instruction"],
             few_shot=gradient["few_shot"],
@@ -199,9 +196,10 @@ class SkillOptimizer:
             baseline_mean=baseline,
             mean_score=None,
             promoted_from_run=run_id,
-            version=number,
         )
         skill = self.store.load()
+        # The store owns revision numbering; report the version it actually wrote.
+        number = int((skill or {}).get("version", 0) or 0)
         self.store.record_run(
             run_id=run_id,
             doc=doc,

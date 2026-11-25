@@ -174,13 +174,23 @@ def test_cli_token_report_shows_cache_and_models():
 
     TokenUsage.reset()
     TokenUsage.add(
-        1000, 200, agent="TRANSLATOR", cached_tokens=600, model="m1", provider="http://a/v1"
+        1000,
+        200,
+        agent="TRANSLATOR",
+        cached_tokens=600,
+        model="m1",
+        provider="http://a/v1",
+        cache_status="HIT",
     )
-    TokenUsage.add(500, 100, agent="VERIFIER", model="m2", provider="http://b/v1")
+    TokenUsage.add(
+        500, 100, agent="VERIFIER", model="m2", provider="http://b/v1", cache_status="MISS"
+    )
     report = _token_report()
     assert "Cached input:   600" in report
     assert "Uncached input: 900" in report
     assert "Requests: 2" in report
+    assert "hit rate: 50% of 2 reported" in report
+    assert "by agent (hits/reported): TRANSLATOR 1/1, VERIFIER 0/1" in report
     assert "By provider / model:" in report
     assert "http://a/v1 / m1" in report
     TokenUsage.reset()

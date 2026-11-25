@@ -154,6 +154,10 @@ class ConsistencyReport:
     #: True when the pass stopped early because consecutive patches were refused.
     stopped_early: bool = False
     unresolved: list[str] = field(default_factory=list)
+    #: Why each refused patch was refused, ``chunk: reason``. The log carried
+    #: these only as lines among hundreds, so a run that applied 0 of 21 patches
+    #: could not say what the editor had done wrong.
+    refusals: list[str] = field(default_factory=list)
 
     def as_run_fields(self) -> dict[str, Any]:
         """The pass as the counters a run reports, including what it could *not* fix.
@@ -439,9 +443,11 @@ class ConsistencyChecker:
             """Count one refused patch; two in a row end the pass's spending."""
             nonlocal consecutive_refusals
             report.unresolved.append(chunk_id)
+            report.refusals.append(f"{chunk_id}: {reason}")
             consecutive_refusals += 1
             if self.sink is not None:
                 self.sink.info("consistency", chunk_id, f"patch rejected: {reason}")
+
 
         for index, chunk in enumerate(ordered):
             wanted = fixes[chunk.id]
@@ -506,4 +512,11 @@ class ConsistencyChecker:
                 rendered[chunk.id] = patched
                 report.patched_chunks += 1
                 consecutive_refusals = 0
+        if report.refusals:
+            # One summary line, so the record says *why* the pass kept its hands
+            # in its pockets instead of patching the drifting chunks it found.
+            summary = "; ".join(report.refusals[:5])
+            logger.info("Consistency refusals | {}", summary)
+            if self.sink is not None:
+                self.sink.info("consistency", "", f"{len(report.refusals)} patch(es) refused: {summary}")
         return rendered, report

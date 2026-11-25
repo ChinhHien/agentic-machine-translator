@@ -382,46 +382,6 @@ def test_a_complete_verdict_survives_a_reply_flagged_as_cut(mock_env, monkeypatc
     assert len(calls) == 1
 
 
-def test_a_cut_reply_teaches_the_cap_to_the_next_chunk(mock_env, monkeypatch):
-    """One cut at 4096 must not cost the same failed call on every chunk.
-
-    The endpoint and model that cut the verdict are remembered with the cap
-    that recovered it, and the next verifier call starts there.
-    """
-    from polyglot_lc.agents.verifier import reset_learned_caps
-    from polyglot_lc.llm.resilience import TruncatedError
-
-    reset_learned_caps()
-    verifier = VerifierAgent()
-    caps: list[int | None] = []
-
-    def chat_json(messages, **kw):
-        caps.append(kw.get("max_tokens"))
-        if len(caps) == 1:
-            raise TruncatedError(
-                "cut at 4096 with an empty answer",
-                completion_tokens=4096,
-                reasoning_tokens=4096,
-                answer_tokens=0,
-            )
-        return {"pass": True, "reasons": []}
-
-    monkeypatch.setattr(verifier, "chat_json", chat_json)
-    assert verifier.verify("NMT is fast.", "Dịch máy neural rất nhanh.", "en", "vi").ok
-    assert caps == [4096, 8192]
-
-    later = VerifierAgent()
-    later_caps: list[int | None] = []
-
-    def later_chat_json(messages, **kw):
-        later_caps.append(kw.get("max_tokens"))
-        return {"pass": True, "reasons": []}
-
-    monkeypatch.setattr(later, "chat_json", later_chat_json)
-    assert later.verify("NMT is fast.", "Dịch máy neural rất nhanh.", "en", "vi").ok
-    assert later_caps == [8192]
-
-
 def test_verifier_preserves_a_negative_verdict(mock_env, monkeypatch):
     verifier = VerifierAgent()
     monkeypatch.setattr(
@@ -935,7 +895,7 @@ def test_mock_dispatcher_still_recognises_the_live_prompts(mock_env):
         src_lang="en",
         tgt_lang="vi",
         glossary_candidates="(none)",
-        user_glossary_md="(none)",
+        core_glossary_md="(none)",
         trace_lines=[],
     )
     assert "glossary_terms" in _mock_json_reply(planner)

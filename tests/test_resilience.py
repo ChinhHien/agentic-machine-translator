@@ -16,6 +16,7 @@ from openai import (
 from polyglot_lc.config import AgentConfig, ConfigError, RetryConfig, get_retry_config
 from polyglot_lc.llm.client import LLMClient
 from polyglot_lc.llm.resilience import (
+    MAX_HINT_WAIT,
     LLMError,
     NoBackupError,
     PermanentError,
@@ -133,6 +134,73 @@ def test_normalize_status_codes():
     assert isinstance(e429, RateLimitError)
     e401 = normalize_provider_error(RuntimeError("status 401 unauthorized"))
     assert isinstance(e401, PermanentError)
+
+
+class _ProviderError(Exception):
+    """A provider/SDK exception carrying an HTTP status and its raw body."""
+
+    def __init__(self, status: int, body: str) -> None:
+        super().__init__(body)
+        self.status_code = status
+
+
+#: The body Cloudflare attaches to a 524: the origin was slow, not the request
+#: wrong, and it states both that the failure is retryable and how long to wait.
+CLOUDFLARE_524 = (
+    "Error code: 524 - {'title': 'Error 524: A timeout occurred', 'status': 524, "
+    "'retryable': True, 'retry_after': 120}"
+)
+
+
+@pytest.mark.parametrize("status", [520, 521, 522, 523, 524, 525, 527, 529])
+def test_cdn_5xx_codes_are_transient(status):
+    """A CDN reports a slow origin; retrying is what fixes it.
+
+    These were permanent, so one 524 from Cloudflare stopped a 76-chunk run.
+    """
+    err = normalize_provider_error(_ProviderError(status, f"Error code: {status}"))
+    assert isinstance(err, TransientError)
+    assert err.status == status
+
+
+def test_a_524_body_hint_becomes_the_wait(_fast_resilience):
+    """The 120 s hint is longer than max_delay, so it may not be truncated."""
+    calls: list[int] = []
+
+    def flaky():
+        calls.append(1)
+        if len(calls) == 1:
+            raise normalize_provider_error(_ProviderError(524, CLOUDFLARE_524))
+        return "ok"
+
+    cfg = RetryConfig(max_retries=1, base_delay=2.0, max_delay=60.0, buffer_seconds=2.0)
+    assert call_with_resilience(flaky, None, retry_cfg=cfg) == "ok"
+    assert _fast_resilience == [122.0]
+    assert RetryStats.snapshot()["transient_retries"] == 1
+
+
+def test_an_absurd_hint_is_capped(_fast_resilience):
+    """A nonsense body must not park the run for an hour."""
+
+    def always():
+        raise TransientError("origin timeout", status=524, retry_after=99_999.0)
+
+    cfg = RetryConfig(max_retries=1, base_delay=2.0, max_delay=60.0, buffer_seconds=2.0)
+    with pytest.raises(NoBackupError):
+        call_with_resilience(always, None, retry_cfg=cfg)
+    assert _fast_resilience == [MAX_HINT_WAIT]
+
+
+def test_a_transient_error_without_a_hint_still_backs_off(_fast_resilience):
+    """A plain 503 keeps the exponential backoff."""
+
+    def always():
+        raise TransientError("service unavailable", status=503)
+
+    cfg = RetryConfig(max_retries=1, base_delay=2.0, max_delay=60.0, buffer_seconds=2.0)
+    with pytest.raises(NoBackupError):
+        call_with_resilience(always, None, retry_cfg=cfg)
+    assert _fast_resilience == [2.0]
 
 
 def test_permanent_error_fallback_class():
